@@ -144,7 +144,6 @@ async function main() {
       break;
     }
   }
-
   if (elementsMismatch) {
     console.log('❌ FAIL - Elements do not match reference');
     process.exit(6);

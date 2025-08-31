@@ -14,6 +14,38 @@ const __WGPU_SORT_CACHE__ = (globalThis.__WGPU_SORT_CACHE__ ||= {
  */
 // ----------------------------------------------------------------------
 
+// Flip to true while debugging; or pass ?validate=1 in the URL; or set config.validateChunks=true
+const DBG_VALIDATE_DEFAULT = true;
+function isValidateEnabled(config){
+  const urlFlag = (typeof location !== 'undefined')
+    ? new URLSearchParams(location.search).get('validate')
+    : null;
+  const urlEnabled = urlFlag != null && urlFlag !== '0' && urlFlag !== 'false';
+  return Boolean(DBG_VALIDATE_DEFAULT || urlEnabled || config?.validateChunks);
+}
+
+function validateChunkOrder({ buffer, length, ascending, label = '' }){
+  // buffer: ArrayBuffer with exactly "length" elements (u32)
+  const v = new Uint32Array(buffer, 0, length);
+  console.log(JSON.stringify(v));
+  for (let i = 1; i < v.length; i++) {
+    const bad = ascending ? (v[i - 1] > v[i]) : (v[i - 1] < v[i]);
+    if (bad) {
+      const a = v[i-1], b = v[i];
+      const ctxStart = Math.max(0, i - 5);
+      const ctxEnd   = Math.min(v.length, i + 5);
+      const ctx = Array.from(v.slice(ctxStart, ctxEnd));
+      console.error(
+        `[CHUNK VERIFY FAIL] ${label} at index ${i-1} => ${i}:`,
+        `${a} ${ascending?'>':'<'} ${b} (should be ${ascending?'<=':'>='})`
+      );
+      console.error(`Context [${ctxStart}:${ctxEnd}]:`, ctx);
+      throw new Error('chunk-verify-failed');
+    }
+  }
+  // console.debug(`[CHUNK VERIFY OK] ${label} length=${v.length}, ascending=${ascending}`);
+}
+
 function nextPow2(x) {
   x = x >>> 0;
   if (x <= 1) return 1;
@@ -121,41 +153,60 @@ export function createExecutor({ kernels, config, inputArgs }) {
   async function runChunk({ payload, meta }) {
     const tClientRecv = performance.now();
 
-    // Accept either raw ArrayBuffer or the payload object { data, originalSize, paddedSize, ascending }
+    // Accept either raw ArrayBuffer or the payload object
     const srcData = (payload && payload.data != null) ? payload.data : payload;
     const payloadBuf = toArrayBuffer(srcData);
 
     // Extract sizes and flags
     const originalSize = (payload && payload.originalSize) ?? (meta?.originalSize) ?? (payloadBuf.byteLength >>> 2);
-    const paddedSize  = (payload && payload.paddedSize)  ?? (meta?.paddedSize)  ?? nextPow2(originalSize);
-    const ascending   = (payload && 'ascending' in payload) ? !!payload.ascending : !!(meta?.ascending ?? true);
+    const paddedSize = (payload && payload.paddedSize) ?? (meta?.paddedSize) ?? nextPow2(originalSize);
+    const ascending = (payload && 'ascending' in payload) ? !!payload.ascending : !!(meta?.ascending ?? true);
 
     const dev = await getDevice();
     const { pipeline, bgl } = getPipeline(dev, kernelCode);
 
-    // Debug line to mirror your logs
     console.log(`Processing chunk: ${originalSize} integers (padded to ${paddedSize}) with device ${__WGPU_SORT_CACHE__.deviceId}`);
 
-    // --- Create per-run resources ---
-    // Storage buffer sized to the provided (already padded) data
-    const dataSize = payloadBuf.byteLength;
+    // --- Prepare properly padded data ---
+    let paddedData;
+    const srcArray = new Uint32Array(payloadBuf);
+
+    if (originalSize < paddedSize) {
+      // Need to pad with sentinel values
+      paddedData = new Uint32Array(paddedSize);
+      // Copy original data
+      paddedData.set(srcArray.subarray(0, originalSize));
+      // Fill padding with appropriate sentinel values
+      // For ascending sort: use MAX_UINT32 so padded values stay at the end
+      // For descending sort: use 0 so padded values stay at the end
+      const sentinel = ascending ? 0xFFFFFFFF : 0;
+      for (let i = originalSize; i < paddedSize; i++) {
+        paddedData[i] = sentinel;
+      }
+    } else {
+      // Data is already the right size
+      paddedData = srcArray;
+    }
+
+    // --- Create GPU resources ---
+    const dataSize = paddedSize * 4; // Size in bytes
     const dataBuf = dev.createBuffer({
       label: 'bitonic-sort-data',
       size: dataSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
 
-    // Upload the entire (padded) payload
-    dev.queue.writeBuffer(dataBuf, 0, new Uint8Array(payloadBuf));
+    // Upload padded data
+    dev.queue.writeBuffer(dataBuf, 0, paddedData);
 
-    // Per-run uniform buffer (16 bytes)
+    // Uniform buffer for stage parameters
     const uniformBuf = dev.createBuffer({
       label: 'bitonic-sort-uniforms',
       size: 16,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
 
-    // Bind group (rebuilt per run due to unique data buffer)
+    // Create bind group
     const bindGroup = dev.createBindGroup({
       label: 'bitonic-sort-bindgroup',
       layout: bgl,
@@ -165,25 +216,39 @@ export function createExecutor({ kernels, config, inputArgs }) {
       ],
     });
 
-    // --- Encode passes ---
-    const encoder = dev.createCommandEncoder({ label: 'sort-encoder' });
-    const pass = encoder.beginComputePass({ label: 'sort-pass' });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-
+    // --- Execute bitonic sort with proper synchronization ---
     const workgroupSize = 256;
     const numGroups = Math.ceil(paddedSize / workgroupSize);
 
-    // Bitonic sort staging: k is the global stage, j is the sub-stage
+    // CRITICAL: Execute each stage separately and wait for completion
     for (let k = 2; k <= paddedSize; k <<= 1) {
       for (let j = k >> 1; j > 0; j >>= 1) {
+        // Update uniforms for this specific stage
         const params = new Uint32Array([paddedSize, k, j, ascending ? 1 : 0]);
         dev.queue.writeBuffer(uniformBuf, 0, params);
+
+        // Create a new command encoder for each stage
+        // This ensures each stage is submitted separately
+        const encoder = dev.createCommandEncoder({
+          label: `sort-stage-${k}-step-${j}`
+        });
+
+        const pass = encoder.beginComputePass({
+          label: `sort-pass-${k}-${j}`
+        });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
         pass.dispatchWorkgroups(numGroups);
+        pass.end();
+
+        // Submit this stage immediately
+        dev.queue.submit([encoder.finish()]);
+
+        // CRITICAL: Wait for this stage to complete before proceeding
+        // This ensures sequential execution of stages
+        await dev.queue.onSubmittedWorkDone();
       }
     }
-
-    pass.end();
 
     // --- Readback only the original (unpadded) portion ---
     const readBytes = originalSize * 4;
@@ -193,19 +258,32 @@ export function createExecutor({ kernels, config, inputArgs }) {
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
 
-    encoder.copyBufferToBuffer(dataBuf, 0, readBuf, 0, readBytes);
-    dev.queue.submit([encoder.finish()]);
+    // Create final encoder for readback
+    const readbackEncoder = dev.createCommandEncoder({ label: 'readback-encoder' });
+    readbackEncoder.copyBufferToBuffer(dataBuf, 0, readBuf, 0, readBytes);
+    dev.queue.submit([readbackEncoder.finish()]);
 
+    // Map and read results
     await readBuf.mapAsync(GPUMapMode.READ);
     const result = readBuf.getMappedRange().slice(0);
     readBuf.unmap();
 
-    // Cleanup transient buffers (optional)
+    // Cleanup
     try { dataBuf.destroy?.(); } catch {}
     try { uniformBuf.destroy?.(); } catch {}
     try { readBuf.destroy?.(); } catch {}
 
     const tClientDone = performance.now();
+
+    // Validate if enabled
+    if (isValidateEnabled(config)) {
+      validateChunkOrder({
+        buffer: result,
+        length: originalSize,
+        ascending,
+        label: `task:${meta?.taskId || ''} chunk:${meta?.chunkIndex ?? ''}`
+      });
+    }
 
     return {
       status: 'ok',

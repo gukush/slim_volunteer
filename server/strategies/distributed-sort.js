@@ -102,22 +102,27 @@ export function buildAssembler({ taskId, taskDir, config }) {
     integrate({ chunkId, result, meta }) {
       const { chunkIndex, originalSize } = meta;
 
-      // Convert result back to Uint32Array
-      //const sortedData = new Uint32Array(result);
-      let sortedData;
+      let u8;
       if (result instanceof ArrayBuffer) {
-        sortedData = new Uint32Array(result);
+        u8 = new Uint8Array(result);                       // aligned at 0
       } else if (ArrayBuffer.isView(result)) {
-        sortedData = new Uint32Array(result.buffer, result.byteOffset, Math.floor(result.byteLength/4));
-      } else if (result && result.type==='Buffer' && Array.isArray(result.data)) {
-        const u8 = Uint8Array.from(result.data);
-        sortedData = new Uint32Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength/4));
+        // copy bytes so the new view starts at offset 0
+        u8 = new Uint8Array(result.byteLength);
+        u8.set(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
+      } else if (Buffer.isBuffer?.(result)) {
+        u8 = Uint8Array.from(result);                      // copy from Node Buffer
+      } else if (result && result.type === 'Buffer' && Array.isArray(result.data)) {
+        u8 = Uint8Array.from(result.data);                 // JSON-ified Buffer
       } else {
-        const u8 = Uint8Array.from(result);
-        sortedData = new Uint32Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength/4));
+        u8 = Uint8Array.from(result);
       }
-      // Only take the original size (ignore padding)
-      const actualData = sortedData.slice(0, originalSize);
+
+      if (u8.byteLength % 4 !== 0) {
+        throw new Error(`Result byteLength ${u8.byteLength} not multiple of 4`);
+      }
+      const sortedData = new Uint32Array(u8.buffer, 0, u8.byteLength >>> 2);
+      // keep only real values (drop padding)
+      const actualData = sortedData.subarray(0, originalSize);
 
       sortedChunks.push({
         chunkIndex,

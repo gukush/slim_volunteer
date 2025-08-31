@@ -1,0 +1,11 @@
+server/certificates/*
+server/storage/*
+!server/certificates/.gitkeep
+
+server/custom_tasks.json
+.env
+remove_emojis.sh
+server/custom_chunks.json
+server/matrix_16.bin/
+server/test_matrices/
+server/workload1_bigger_matrix_input.txt
