@@ -20,7 +20,8 @@ socket.on('connect', ()=>{
   log('info', 'Connected', socket.id);
   const frameworks = [];
   if('gpu' in navigator) frameworks.push('webgpu');
-  socket.emit('hello', { workerId: qs.workerId || socket.id, frameworks });
+  const capacity = Number(qs.cap || qs.capacity || 1);
+  socket.emit('hello', { workerId: qs.workerId || socket.id, frameworks, capacity });
 });
 
 socket.on('disconnect', ()=>{
@@ -39,6 +40,7 @@ socket.on('task:init', async (msg)=>{
   const mod = await import(modUrl);
   const exec = mod.createExecutor({ kernels: msg.kernels, config: msg.config, schema: msg.schema, inputArgs: msg.inputArgs });
   executors.set(msg.taskId, exec);
+  if (typeof exec.prewarm === 'function') { try { exec.prewarm(); } catch(_){} }
 });
 
 socket.on('chunk:assign', async (job)=>{

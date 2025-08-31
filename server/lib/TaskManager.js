@@ -18,9 +18,14 @@ export class TaskManager{
   }
 
   registerClient(socket, hello){
-    const info = { socket, busy: false, tasks: new Set(), ...hello };
+    const capacity = Number(hello?.capacity ?? 1) || 1;
+    const info = { socket, busy: false, tasks: new Set(), capacity, inFlight: 0, ...hello };
     this.clients.set(socket.id, info);
     logger.info('Client connected', socket.id, hello);
+    // Try to schedule pending work now that capacity increased
+    for(const task of this.tasks.values()){
+      if(task.status==='running') this._drainTaskQueue(task);
+    }
   }
 
   removeClient(socketId){
@@ -127,24 +132,35 @@ export class TaskManager{
   }
 
   _eligibleClients(task){
-    return Array.from(this.clients.values()).filter(c=>{
+    // Only clients that support the framework
+    const list = Array.from(this.clients.values()).filter(c=>{
       if(task.framework && c.frameworks){
         return c.frameworks.includes(task.framework);
       }
       return true;
     });
+    // Prefer clients with available capacity and lower load
+    return list.sort((a,b)=>{
+      const la = a.inFlight / (a.capacity||1);
+      const lb = b.inFlight / (b.capacity||1);
+      return la - lb;
+    });
   }
 
   _assignChunkReplica(task, chunkId){
+    let assigned = false;
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) return;
     if(entry.replicas >= task.K) return;
     for(const c of this._eligibleClients(task)){
       if(entry.assignedTo.has(c.socket.id)) continue;
+      if((c.inFlight||0) >= (c.capacity||1)) continue; // respect client capacity
       const replica = entry.replicas;
       entry.assignedTo.add(c.socket.id);
       entry.replicas++;
+      c.inFlight = (c.inFlight||0) + 1;
       c.tasks.add(task.id);
+      assigned = true;
       c.socket.emit('chunk:assign', {
         taskId: task.id,
         chunkId,
@@ -157,6 +173,7 @@ export class TaskManager{
       task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tSent });
       if(entry.replicas >= task.K) break;
     }
+    return assigned;
   }
 
   receiveResult(socketId, data){
@@ -167,6 +184,7 @@ export class TaskManager{
     if(!entry){ logger.warn('Result for unknown chunk', chunkId); return; }
 
     const tServerRecv = now();
+    const client = this.clients.get(socketId); if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
     task.timers.chunkRow({
       chunkId, replica,
       tCreate: entry.tCreate,
@@ -179,6 +197,7 @@ export class TaskManager{
       logger.warn('Replica failed', taskId, chunkId, replica, 'from', socketId);
       entry.assignedTo.delete(socketId);
       this._assignChunkReplica(task, chunkId);
+      this._drainTaskQueue(task);
       return;
     }
 
@@ -195,6 +214,7 @@ export class TaskManager{
           task.completedChunks += 1;
           logger.debug('Chunk accepted', task.id, chunkId, 'checksum', cs);
           this._maybeFinish(task.id);
+          this._drainTaskQueue(task);
         }catch(e){
           logger.error('Assembler integrate error', e);
         }
@@ -247,5 +267,20 @@ export class TaskManager{
       strategyId: t.strategy.id,
       label: t.descriptor.label,
     };
+  }
+
+
+  _drainTaskQueue(task){
+    if(!task || task.status!=='running') return;
+    // Iterate over queued chunks and try to assign replicas
+    for(const chunkId of task.queue){
+      const entry = task.assignments.get(chunkId);
+      if(!entry || entry.completed) continue;
+      // Try to assign as many replicas as needed (up to K)
+      while(entry.replicas < task.K){
+        const assigned = this._assignChunkReplica(task, chunkId);
+        if(!assigned) break; // No capacity right now
+      }
+    }
   }
 }

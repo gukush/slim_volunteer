@@ -103,8 +103,19 @@ export function buildAssembler({ taskId, taskDir, config }) {
       const { chunkIndex, originalSize } = meta;
 
       // Convert result back to Uint32Array
-      const sortedData = new Uint32Array(result);
-
+      //const sortedData = new Uint32Array(result);
+      let sortedData;
+      if (result instanceof ArrayBuffer) {
+        sortedData = new Uint32Array(result);
+      } else if (ArrayBuffer.isView(result)) {
+        sortedData = new Uint32Array(result.buffer, result.byteOffset, Math.floor(result.byteLength/4));
+      } else if (result && result.type==='Buffer' && Array.isArray(result.data)) {
+        const u8 = Uint8Array.from(result.data);
+        sortedData = new Uint32Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength/4));
+      } else {
+        const u8 = Uint8Array.from(result);
+        sortedData = new Uint32Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength/4));
+      }
       // Only take the original size (ignore padding)
       const actualData = sortedData.slice(0, originalSize);
 
