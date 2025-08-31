@@ -1,0 +1,16 @@
+version: '3'
+services:
+  webgpu-volunteer-server:
+    build: ./server
+    ports:
+      - "0.0.0.0:3000:3000"
+    volumes:
+      - ./server:/app
+      - /app/node_modules
+      - ./server/certificates:/app/certificates
+    environment:
+      - NODE_ENV=development
+      - HOST=0.0.0.0
+      - LOG_LEVEL=debug
+      - ALLOW_INSECURE=0
+    restart: unless-stopped

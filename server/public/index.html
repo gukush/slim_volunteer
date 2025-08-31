@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Volunteer Compute Client</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 24px; }
+      .ok { color: #0b7300; }
+      .warn { color: #b36b00; }
+      .err { color: #b30000; }
+      #log { white-space: pre-wrap; background: #111; color: #ddd; padding: 12px; border-radius: 8px; height: 40vh; overflow:auto; }
+      #status { font-weight: 700; }
+    </style>
+  </head>
+  <body>
+    <h1>Volunteer Compute Client</h1>
+    <p>Status: <span id="status">connecting…</span></p>
+    <div id="log"></div>
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/public/client.js" type="module"></script>
+  </body>
+</html>

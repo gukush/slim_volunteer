@@ -1,0 +1,22 @@
+{
+  "name": "volunteer-compute-fresh-flex",
+  "version": "0.3.0",
+  "description": "Volunteer computing server with switchable frameworks",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "generate-certs": "bash ../generate-certs.sh"
+  },
+  "dependencies": {
+    "busboy": "^1.6.0",
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2",
+    "uuid": "^9.0.1",
+    "minimist": "^1.2.8"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}
