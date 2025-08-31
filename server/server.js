@@ -16,6 +16,9 @@ const ALLOW_INSECURE = process.env.ALLOW_INSECURE === '1';
 const app = express();
 app.disable('x-powered-by');
 
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
 app.use('/public', express.static(path.join(process.cwd(), 'public')));
 app.get('/', (req,res)=>res.sendFile(path.join(process.cwd(),'public','index.html')));
 
@@ -79,6 +82,38 @@ app.delete('/tasks/:id', (req,res)=>{
 });
 
 app.post('/tasks', (req, res)=>{
+   const contentType = req.headers['content-type'] || '';
+  // Handle JSON requests
+  if (contentType.includes('application/json')) {
+    try {
+      // Debug logging
+      console.log('Received JSON request, body:', req.body);
+
+      const { strategyId, input, label, K = 1, config = {} } = req.body || {};
+
+      if (!strategyId) {
+        return res.status(400).json({ error: 'strategyId is required' });
+      }
+
+      getStrategy(strategyId); // Validate strategy exists
+
+      const desc = tm.createTask({
+        strategyId,
+        K,
+        label: label || 'task',
+        config,
+        inputArgs: input || {},
+        inputFiles: []
+      });
+
+      res.json(desc);
+    } catch (e) {
+      logger.error('Create task error (JSON)', e);
+      res.status(400).json({ error: e.message });
+    }
+    return;
+  }
+
   const bb = Busboy({ headers: req.headers });
   const files = [];
   const fields = {};
