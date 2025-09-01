@@ -134,13 +134,15 @@ async function modeRun(args){
   const chunk_size = Number(args.chunk_size ?? 256);
   const total_curves = Number(args.total_curves ?? 1024);
   const outDir = args.outDir || path.join(__dirname, `task-${Date.now()}`);
+  const gcdMode = Number(args.gcdMode ?? 1);
   fs.mkdirSync(outDir, { recursive: true });
 
   // 1) Create task
   const createBody = {
     strategyId: 'ecm-stage1',
     input: { N: '0x'+N.toString(16), B1, chunk_size, total_curves },
-    label: `ECM N=${N.toString(16)} B1=${B1}`
+    config: { gcdMode },
+    label: `ECM N=${N.toString(16)} B1=${B1} gcdMode=${gcdMode}`
   };
   const t = await api(baseURL, '/tasks', { method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(createBody) });
   const taskId = t.id || t.taskId || t.task?.id;

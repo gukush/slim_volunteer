@@ -4,14 +4,6 @@
 // - Montgomery multiplication (CIOS) with 32-bit word size
 // - One thread per curve. The host supplies: N, R2, mont_one, n0inv32, A24/X1 per curve, and prime powers list.
 //
-// Layout
-// ------
-// @group(0) @binding(0)  storage, read         -> ConstsBuffer
-// @group(0) @binding(1)  storage, read         -> CurvesInBuffer  (length = num_curves)
-// @group(0) @binding(2)  storage, read         -> PrimePowers     (length = pp_count)
-// @group(0) @binding(3)  storage, read_write   -> CurvesOutBuffer (length = num_curves)
-// @group(0) @binding(4)  uniform               -> Params { pp_count, num_curves, compute_gcd }
-//
 // Notes
 // -----
 // * n0inv32 = -N^{-1} mod 2^32 (host computes from N.limbs[0]).
@@ -205,7 +197,8 @@ fn to_mont(a: U256, C: Consts) -> U256 {
   return mont_mul(a, C.R2, C.N, C.n0inv32);
 }
 fn from_mont(a: U256, C: Consts) -> U256 {
-  return mont_mul(a, C.mont_one, C.N, C.n0inv32);
+  let one = set_one();  // Regular 1, not Montgomery 1
+  return mont_mul(a, one, C.N, C.n0inv32);
 }
 fn mont_add(a: U256, b: U256, C: Consts) -> U256 {
   return cond_sub_N(add_u256(a,b), C.N);
@@ -220,16 +213,16 @@ fn mont_sqr(a: U256, C: Consts) -> U256 { return mont_mul(a,a,C.N,C.n0inv32); }
 // ---- Montgomery curve x-only ops ----
 //struct PointXZ { X: U256, Z: U256 };
 
-fn xDBL(R: PointXZ, A24: U256, C: Consts) -> PointXZ {
-  var t1 = mont_add(R.X, R.Z, C);
-  var t2 = mont_sub(R.X, R.Z, C);
-  t1 = mont_sqr(t1, C);
-  t2 = mont_sqr(t2, C);
-  let t3 = mont_sub(t1, t2, C);
-  let X2 = mont_mul(t1, t2, C.N, C.n0inv32);
-  var t4 = mont_mul(t3, A24, C.N, C.n0inv32);
-  t4 = mont_add(t4, t2, C);
-  let Z2 = mont_mul(t3, t4, C.N, C.n0inv32);
+fn xDBL(P: PointXZ, A24: U256, C: Consts) -> PointXZ {
+  var t1 = mont_add(P.X, P.Z, C);  // X+Z
+  var t2 = mont_sub(P.X, P.Z, C);  // X-Z
+  let t3 = mont_sqr(t1, C);        // (X+Z)^2 = XX
+  let t4 = mont_sqr(t2, C);        // (X-Z)^2 = ZZ
+  let t5 = mont_sub(t3, t4, C);    // 4XZ = diff
+  let temp = mont_mul(A24, t5, C.N, C.n0inv32);  // A24 * diff
+  let Z_mult = mont_add(t3, temp, C);  // XX + A24 * diff
+  let X2 = mont_mul(t3, t4, C.N, C.n0inv32);    // XX * ZZ
+  let Z2 = mont_mul(t5, Z_mult, C.N, C.n0inv32);  // diff * Z_mult
   return PointXZ(X2, Z2);
 }
 
@@ -369,21 +362,25 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   var result = set_zero();
-  var status:u32 = 0u;
+  var status: u32 = 999u;
+  // var status:u32 = 0u;
 
   if (params.compute_gcd == 1u) {
+    status = 777u;
     let Zstd = from_mont(R.Z, C);
     let g = gcd_u256(Zstd, C.N);
     result = g;
+
     let one = set_one();
-    if (!is_zero(g) && (cmp(g, C.N) < 0)) {
-      status = select(1u, 2u, cmp(g, one) > 0); // 2=non-trivial, 1=no factor
+    if (!is_zero(g) && (cmp(g, C.N) < 0) && (cmp(g, one) > 0)) {
+      status = 2u; // Found a non-trivial factor!
     } else {
-      status = 1u;
+      status = 1u; // No factor found
     }
   } else {
     result = from_mont(R.Z, C);
-    status = 0u;
+    status = 888u;
+    // status = 0u;
   }
 
   outBuf[idx].result = result;

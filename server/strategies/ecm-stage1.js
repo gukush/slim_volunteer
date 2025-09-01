@@ -97,32 +97,86 @@ function computeMontgomeryConstants(N) {
   };
 }
 
-function generateRandomCurve(N, seed) {
-  // Generate pseudo-random curve parameters (A24, X1) for ECM
-  // Using a simple LCG for reproducible randomness
-  let rng = seed;
-  function rand32() {
-    rng = (rng * 1103515245 + 12345) & 0x7FFFFFFF;
-    return rng;
+// --- modular helpers (BigInt) ---
+function mod(a, n){ a %= n; return a < 0n ? a + n : a; }
+
+// Extended GCD (iterative; safe in Node)
+function egcd(a, b){
+  a = mod(a, b); // ensure 0 <= a < b when possible
+  let old_r = b, r = a;
+  let old_s = 1n, s = 0n;
+  let old_t = 0n, t = 1n;
+  while (r !== 0n) {
+    const q = old_r / r;
+    [old_r, r] = [r, old_r - q*r];
+    [old_s, s] = [s, old_s - q*s];
+    [old_t, t] = [t, old_t - q*t];
   }
-
-  function randBigInt() {
-    let result = 0n;
-    for (let i = 0; i < 8; i++) {
-      result |= BigInt(rand32()) << (32n * BigInt(i));
-    }
-    return result % N;
-  }
-
-  // Generate random A24 and X1 coordinates
-  const A24 = randBigInt();
-  const X1 = randBigInt();
-
-  return {
-    A24: bigIntToLimbs(A24),
-    X1: bigIntToLimbs(X1)
-  };
+  // old_r = gcd(a,b), and old_s*a + old_t*b = gcd
+  return [old_r, old_s, old_t];
 }
+
+// Multiplicative inverse mod n; returns null if non-invertible
+function modInv(a, n){
+  a = mod(a, n);
+  if (a === 0n) return null;
+  const [g, x] = egcd(a, n);
+  if (g !== 1n) return null;            // no inverse ⇒ shares factor with n
+  return mod(x, n);
+}
+
+// --- Suyama parametrization for (A24, X1) on a Montgomery curve ---
+// This REPLACES your current generateRandomCurve
+function generateRandomCurve(N, seed) {
+  // small LCG for reproducible σ
+  let rng = BigInt(seed) & 0x7fffffffn;
+  function rand32(){ rng = (rng * 1103515245n + 12345n) & 0x7fffffffn; return rng; }
+  function nextSigma(){
+    let s = 0n;
+    for (let i=0;i<3;i++) s = (s << 21n) | rand32();
+    return mod(s, N);
+  }
+
+  const inv4 = modInv(4n, N);  // should exist for odd N
+  for (let tries = 0; tries < 32; tries++){
+    const sigma = nextSigma();
+    // Reject bad sigmas: 0, ±1, ±2
+    if (sigma===0n) continue;
+    if (sigma===1n || sigma===N-1n) continue;
+    if (sigma===2n || sigma===N-2n) continue;
+
+    const u = mod(sigma*sigma - 5n, N);
+    const v = mod(4n*sigma, N);
+
+    const invu = modInv(u, N);
+    const invv = modInv(v, N);
+    if (!invu || !invv || !inv4) continue; // unlucky (or a factor) → retry
+
+    // A = ((v−u)^3 * (3u+v)) / (4 u^3 v) − 2   (mod N)
+    const vm_u   = mod(v - u, N);
+    const num    = mod(vm_u*vm_u % N * vm_u % N * mod(3n*u + v, N), N);
+    const den    = mod(4n * (u*u % N * u % N) % N * v, N);
+    const invDen = modInv(den, N);
+    if (!invDen) continue;
+
+    const A      = mod(num * invDen - 2n, N);
+    const A24    = mod((A + 2n) * inv4, N);
+
+    // X1 = (u^3 / v^3) = u^3 * (v^-3)
+    const u3     = mod(u*u % N * u % N, N);
+    const vInv3  = modInv(v, N);
+    if (!vInv3) continue;
+    const X1     = mod(u3 * (vInv3*vInv3 % N * vInv3 % N), N);
+
+    return {
+      A24: bigIntToLimbs(A24),
+      X1:  bigIntToLimbs(X1)
+    };
+  }
+  // If we failed many times (extremely unlikely), perturb seed and retry
+  return generateRandomCurve(N, Number((BigInt(seed) + 777n) % 0x7fffffffn));
+}
+
 
 export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles }){
   // Parse ECM parameters from inputArgs
@@ -216,6 +270,9 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
           chunkIndex,
           startCurve,
           endCurve,
+          n: curvesInChunk,      // <— add
+          pp_count,              // <— add
+          total_words: totalWords,
           N: N_hex,
           B1
         };
@@ -232,6 +289,43 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
   };
 }
 
+function asU32View(bin){
+  // 1) Pure ArrayBuffer
+  if (bin instanceof ArrayBuffer){
+    if ((bin.byteLength % 4) !== 0) throw new Error('Result byteLength not multiple of 4');
+    return new Uint32Array(bin);
+  }
+  // 2) Any typed array / DataView
+  if (ArrayBuffer.isView(bin)){
+    const { buffer, byteOffset, byteLength } = bin;
+    if ((byteLength % 4) !== 0) throw new Error('Result view length not multiple of 4');
+    // If aligned to 4 bytes, we can make a zero-copy view
+    if ((byteOffset % 4) === 0){
+      return new Uint32Array(buffer, byteOffset, Math.floor(byteLength / 4));
+    }
+    // Unaligned: copy into an aligned buffer
+    const copy = new Uint8Array(byteLength);
+    copy.set(new Uint8Array(buffer, byteOffset, byteLength));
+    return new Uint32Array(copy.buffer);
+  }
+  // 3) Node Buffer (what Socket.IO gives us)
+  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(bin)){
+    const buf = bin;
+    if ((buf.byteLength % 4) !== 0) throw new Error('Result Buffer length not multiple of 4');
+    if ((buf.byteOffset % 4) === 0){
+      return new Uint32Array(buf.buffer, buf.byteOffset, Math.floor(buf.byteLength / 4));
+    }
+    // Unaligned Buffer: realign by copying
+    const copy = Buffer.from(buf);
+    return new Uint32Array(copy.buffer, copy.byteOffset, Math.floor(copy.byteLength / 4));
+  }
+
+  // 4) Last resort: coerce to Buffer then view
+  const coerced = Buffer.from(bin);
+  if ((coerced.byteLength % 4) !== 0) throw new Error('Result coerced length not multiple of 4');
+  return new Uint32Array(coerced.buffer, coerced.byteOffset, Math.floor(coerced.byteLength / 4));
+}
+
 export function buildAssembler({ taskId, taskDir, config, inputArgs }){
   const results = [];
   const factorsFound = [];
@@ -244,9 +338,18 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }){
   return {
     integrate({ chunkId, result, meta }){
       // Parse results from WebGPU output
-      const u32 = new Uint32Array(result);
+      const u32 = asU32View(result);
+        if (u32[0] !== 0x45434D31 /* "ECM1" */){
+          logger.warn('Unexpected header magic in chunk', chunkId, 'got', '0x'+u32[0].toString(16));
+        }
+      // Debug: Check if the buffer looks initialized
+      let nonZeroCount = 0;
+      for(let i = 0; i < Math.min(100, u32.length); i++) {
+        if(u32[i] !== 0) nonZeroCount++;
+      }
+      console.log(`Buffer non-zero ratio: ${nonZeroCount}/100`);
       const { n, pp_count } = meta;
-
+      logger.debug(`Integrate ${chunkId}: n=${n}, pp_count=${pp_count}`);
       // Find output section in the buffer
       const HEADER_WORDS = 8;
       const CONST_WORDS = 8*3 + 4;
@@ -254,7 +357,7 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }){
       const CURVE_OUT_WORDS_PER = 8 + 1 + 3; // result(8) + status(1) + pad(3)
 
       const outStart = HEADER_WORDS + CONST_WORDS + pp_count + n * CURVE_IN_WORDS_PER;
-
+      console.log(`Parsing results starting at word ${outStart}, buffer length: ${u32.length}`);
       const chunkResults = [];
       for(let i = 0; i < n; i++){
         const offset = outStart + i * CURVE_OUT_WORDS_PER;
@@ -267,12 +370,18 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }){
           factor = (factor << 32n) | BigInt(resultLimbs[j] >>> 0);
         }
 
+        // Debug log
+        if (i < 3 || status === 2) {
+          console.log(`Curve ${meta.startCurve + i}: status=${status}, factor=${factor.toString(16)}`);
+        }
+
         const curveIndex = meta.startCurve + i;
         chunkResults.push({ curveIndex, factor, status });
 
-        // Check for non-trivial factors (status === 2)
+        // Check for non-trivial factors (status === 2 means factor found)
         if(status === 2 && factor > 1n && factor < N){
           const isValid = (N % factor) === 0n;
+          console.log(`Factor check: ${factor.toString(16)} divides ${N.toString(16)}? ${isValid}`);
           factorsFound.push({
             curveIndex,
             factor: factor.toString(),
@@ -280,9 +389,6 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }){
             status,
             valid: isValid
           });
-          if(isValid){
-            logger.info(`ECM found factor: curve ${curveIndex}, factor=${factor.toString(16)}`);
-          }
         }
       }
 
