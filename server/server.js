@@ -4,6 +4,7 @@ import https from 'https';
 import path from 'path';
 import express from 'express';
 import { Server as SocketIOServer } from 'socket.io';
+import { WebSocketServer } from 'ws';
 import Busboy from 'busboy';
 import { logger } from './lib/logger.js';
 import { listStrategies, getStrategy } from './lib/StrategyRegistry.js';
@@ -38,19 +39,100 @@ const server = (()=>{
   }
 })();
 
+// Socket.IO for browser clients (keep original configuration)
 const io = new SocketIOServer(server, {
   cors: { origin: true, methods: ['GET','POST'] },
-  maxHttpBufferSize: 1e8,
+  maxHttpBufferSize: 3e8,
+  pingTimeout: 60000
 });
 
-const tm = new TaskManager({ io, storageDir: path.join(process.cwd(), 'storage'), timingDir: path.join(process.cwd(), 'storage', 'timing') });
+// Raw WebSocket server for native clients - IMPORTANT: different server instance
+const wss = new WebSocketServer({
+  port: PORT + 1, // Use different port to avoid conflicts
+  path: '/ws-native'
+});
 
+logger.info(`Socket.IO will be available on port ${PORT}`);
+logger.info(`Native WebSocket server will be available on port ${PORT + 1}`);
+
+const tm = new TaskManager({
+  io,
+  wss,
+  storageDir: path.join(process.cwd(), 'storage'),
+  timingDir: path.join(process.cwd(), 'storage', 'timing')
+});
+
+// Socket.IO handlers (unchanged - this is what your browser uses)
 io.on('connection', (socket)=>{
-  socket.on('hello', (info)=>tm.registerClient(socket, info||{}));
+  logger.info('Browser client connected via Socket.IO:', socket.id);
+  socket.on('hello', (info)=>tm.registerClient(socket, info||{}, 'socketio'));
   socket.on('disconnect', ()=>tm.removeClient(socket.id));
   socket.on('chunk:result', (data)=>tm.receiveResult(socket.id, data));
 });
 
+// Raw WebSocket handlers (native clients only)
+wss.on('connection', (ws, req) => {
+  logger.info('Native client connected via WebSocket');
+
+  // Generate a unique ID for this WebSocket connection
+  ws.id = `native_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+  // FIXED: Properly add emit method without breaking native send
+  ws.emit = (event, data) => {
+    if (ws.readyState === ws.OPEN) {
+      const message = { type: event, data: data };
+      ws.send(JSON.stringify(message)); // Use native send method
+    }
+  };
+
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      const { type, data: eventData } = message;
+
+      logger.debug('Native client message:', type);
+
+      switch (type) {
+        case 'client:join':
+          tm.registerClient(ws, eventData || {}, 'native');
+          break;
+        case 'task:request':
+          // Handle task requests if needed
+          break;
+        case 'task:complete':
+          tm.receiveTaskResult(ws.id, eventData);
+          break;
+        case 'workload:done':
+          tm.receiveWorkloadResult(ws.id, eventData);
+          break;
+        case 'workload:chunk_done_enhanced':
+          tm.receiveChunkResult(ws.id, eventData);
+          break;
+        case 'workload:error':
+          tm.receiveError(ws.id, eventData);
+          break;
+        case 'workload:chunk_error':
+          tm.receiveChunkError(ws.id, eventData);
+          break;
+        default:
+          logger.warn('Unknown native client message type:', type);
+      }
+    } catch (e) {
+      logger.error('Error parsing native client message:', e);
+    }
+  });
+
+  ws.on('close', () => {
+    logger.info('Native client disconnected');
+    tm.removeClient(ws.id);
+  });
+
+  ws.on('error', (error) => {
+    logger.error('Native WebSocket error:', error);
+  });
+});
+
+// REST API endpoints (unchanged)
 app.get('/tasks/:id', (req, res)=>{
   const s = tm.statusTask(req.params.id);
   if(!s) return res.status(404).json({ error: 'not found' });
@@ -82,20 +164,18 @@ app.delete('/tasks/:id', (req,res)=>{
 });
 
 app.post('/tasks', (req, res)=>{
-   const contentType = req.headers['content-type'] || '';
+  const contentType = req.headers['content-type'] || '';
+
   // Handle JSON requests
   if (contentType.includes('application/json')) {
     try {
-      // Debug logging
-      console.log('Received JSON request, body:', req.body);
-
       const { strategyId, input, label, K = 1, config = {} } = req.body || {};
 
       if (!strategyId) {
         return res.status(400).json({ error: 'strategyId is required' });
       }
 
-      getStrategy(strategyId); // Validate strategy exists
+      getStrategy(strategyId);
 
       const desc = tm.createTask({
         strategyId,
@@ -114,16 +194,27 @@ app.post('/tasks', (req, res)=>{
     return;
   }
 
+  // Handle multipart/form-data (file uploads)
   const bb = Busboy({ headers: req.headers });
   const files = [];
   const fields = {};
+
   bb.on('file', (name, file, info)=>{
     const { filename } = info;
-    const chunks = [];
-    file.on('data', (d)=>chunks.push(d));
-    file.on('end', ()=>files.push({ originalName: filename, buffer: Buffer.concat(chunks) }));
+    const tmpDir = path.join(process.cwd(), 'uploads');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const tmpPath = path.join(tmpDir, `${Date.now()}_${Math.random().toString(16).slice(2)}_${filename}`);
+    const ws = fs.createWriteStream(tmpPath);
+    let bytes = 0;
+    file.on('data', d => { bytes += d.length; });
+    file.pipe(ws);
+    ws.on('finish', ()=>{
+      files.push({ originalName: filename, path: tmpPath, size: bytes });
+    });
   });
+
   bb.on('field', (name, val)=>{ fields[name] = val; });
+
   bb.on('finish', ()=>{
     try{
       const strategyId = fields.strategyId;
@@ -139,6 +230,7 @@ app.post('/tasks', (req, res)=>{
       res.status(400).json({ error: e.message });
     }
   });
+
   req.pipe(bb);
 });
 
@@ -153,5 +245,7 @@ app.post('/tasks/:id/start', async (req, res)=>{
 
 server.listen(PORT, HOST, ()=>{
   logger.info(`Server listening on ${HOST}:${PORT}`);
+  logger.info('Socket.IO endpoint: /socket.io/ (for browsers)');
+  logger.info(`Native WebSocket endpoint: ws${ALLOW_INSECURE ? '' : 's'}://${HOST}:${PORT + 1}/ws-native (for native clients)`);
   logger.info('Open https://localhost:3000/ in a WebGPU/WebGL2-enabled Chrome.');
 });

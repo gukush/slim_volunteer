@@ -51,10 +51,27 @@ export class TaskManager{
     const taskDir = path.join(this.storageDir, 'tasks', id);
     ensureDir(taskDir);
     const descriptor = { id, label, strategyId, status: 'created', createdAt: now(), K, config, inputArgs, inputFiles: [] };
+    /*
     for(const f of inputFiles){
       const dest = path.join(taskDir, f.originalName);
       fs.writeFileSync(dest, f.buffer);
       descriptor.inputFiles.push({ path: dest, originalName: f.originalName, size: f.buffer.length });
+    }
+    */
+    for (const f of inputFiles){
+      const dest = path.join(taskDir, f.originalName || path.basename(f.path));
+      if (f.path) {
+        fs.copyFileSync(f.path, dest);              // streamless copy on same disk; or use streams if cross-device
+        const size = f.size ?? fs.statSync(dest).size;
+        descriptor.inputFiles.push({ path: dest, originalName: path.basename(dest), size });
+      } else if (f.buffer) {
+        fs.writeFileSync(dest, f.buffer);           // fallback for small files only
+        descriptor.inputFiles.push({ path: dest, originalName: path.basename(dest), size: f.buffer.length });
+      } else {
+        throw new Error('input file missing buffer/path');
+      }
+      const size = f.size ?? fs.statSync(dest).size;
+      descriptor.inputFiles.push({ path: dest, originalName: f.originalName, size });
     }
     writeJSON(path.join(taskDir, `task_descriptor_${id}.json`), descriptor);
 
@@ -77,60 +94,165 @@ export class TaskManager{
 
   getTask(id){ return this.tasks.get(id); }
 
-  async startTask(id){
-    const task = this.getTask(id);
-    if(!task) throw new Error('No such task');
-    if(task.status !== 'created' && task.status !== 'paused'){
-      throw new Error('Task not in a startable state');
-    }
+  async startTask(id) {
+  const task = this.getTask(id);
+  if (!task) throw new Error('No such task');
+  if (task.status !== 'created' && task.status !== 'paused') {
+    throw new Error('Task not in a startable state');
+  }
+
+  try {
     task.status = 'running';
     task.startTime = now();
 
     const execInfo = task.strategy.getClientExecutorInfo(task.descriptor.config, task.descriptor.inputArgs);
     task.framework = execInfo.framework;
-    const executorCode = fs.readFileSync(path.join(process.cwd(), execInfo.path), 'utf-8');
-    const kernels = (execInfo.kernels||[]).map(p=>({ name: p, content: fs.readFileSync(path.join(process.cwd(), p), 'utf-8') }));
 
-    this.io.emit('task:init', {
-      taskId: id,
-      strategyId: task.strategy.id,
-      framework: execInfo.framework,
-      executorCode,
-      kernels,
-      schema: execInfo.schema || {},
-      config: task.descriptor.config,
-      inputArgs: task.descriptor.inputArgs,
-    });
+    // Send task initialization to clients
+    const nativeClients = Array.from(this.clients.values()).filter(c => c.clientType === 'native');
+    const browserClients = Array.from(this.clients.values()).filter(c => c.clientType !== 'native');
 
-    (async ()=>{
-      let count = 0;
-      for await (const chunk of task.chunker.stream()){
-        if(task.cancelRequested) break;
-        const entry = {
-          results: new Map(),
-          assignedTo: new Set(),
-          completed: false,
-          replicas: 0,
-          payload: chunk.payload,
-          meta: chunk.meta || {},
-          tCreate: chunk.tCreate || now(),
-        };
-        task.assignments.set(chunk.id, entry);
-        task.queue.push(chunk.id);
-        task.timers.chunkRow({ chunkId: chunk.id, replica: -1, tCreate: entry.tCreate });
-        this._assignChunkReplica(task, chunk.id);
-        count++;
-      }
-      task.totalChunks = count;
-      task.chunkerFinished = true;
-      logger.info('Chunker finished streaming', id, 'count', count);
-      this._maybeFinish(id);
-    })().catch(e=>{
-      logger.error('Chunker stream error', e);
+    logger.info(`Starting task ${id}: ${browserClients.length} browser clients, ${nativeClients.length} native clients`);
+
+    if (browserClients.length > 0) {
+      const executorCode = fs.readFileSync(path.join(process.cwd(), execInfo.path), 'utf-8');
+      const kernels = (execInfo.kernels || []).map(p => ({
+        name: p,
+        content: fs.readFileSync(path.join(process.cwd(), p), 'utf-8')
+      }));
+
+      this.io.emit('task:init', {
+        taskId: id,
+        strategyId: task.strategy.id,
+        framework: execInfo.framework,
+        executorCode,
+        kernels,
+        schema: execInfo.schema || {},
+        config: task.descriptor.config,
+        inputArgs: task.descriptor.inputArgs,
+      });
+    }
+
+    for (const client of nativeClients) {
+      this._sendToNativeClient(client.socket, 'workload:new', {
+        id: id,
+        strategyId: task.strategy.id,
+        framework: execInfo.framework,
+        kernels: execInfo.kernels || [],
+        config: task.descriptor.config,
+        inputArgs: task.descriptor.inputArgs,
+        schema: execInfo.schema || {},
+        type: 'computation'
+      });
+    }
+
+    // Start chunking with comprehensive error handling
+    this._startChunkingProcess(task).catch(e => {
+      logger.error(`Chunking process failed for task ${id}:`, e);
       task.status = 'error';
-    });
-  }
+      task.error = e.message;
 
+      // Notify all clients of task failure
+      this.io.emit('task:error', { taskId: id, error: e.message });
+      for (const client of nativeClients) {
+        this._sendToNativeClient(client.socket, 'workload:error', {
+          id: id,
+          message: e.message
+        });
+      }
+    });
+
+  } catch (error) {
+    task.status = 'error';
+    task.error = error.message;
+    logger.error(`Failed to start task ${id}:`, error);
+    throw error;
+  }
+}
+
+async _startChunkingProcess(task) {
+  let count = 0;
+  const BATCH_SIZE = 50;  // Smaller batches for better responsiveness
+  const YIELD_INTERVAL = 25; // Yield more frequently
+  const MAX_PENDING = 5000; // Limit pending chunks
+
+  let batch = 0;
+  const startTime = Date.now();
+  let lastLogTime = startTime;
+
+  try {
+    for await (const chunk of task.chunker.stream()) {
+      if (task.cancelRequested) {
+        logger.info(`Task ${task.id}: Chunking cancelled at ${count.toLocaleString()} chunks`);
+        break;
+      }
+
+      const entry = {
+        results: new Map(),
+        assignedTo: new Set(),
+        completed: false,
+        replicas: 0,
+        payload: chunk.payload,
+        meta: chunk.meta || {},
+        tCreate: chunk.tCreate || now(),
+      };
+
+      task.assignments.set(chunk.id, entry);
+      task.queue.push(chunk.id);
+      task.timers.chunkRow({ chunkId: chunk.id, replica: -1, tCreate: entry.tCreate });
+
+      // Try to assign immediately
+      this._assignChunkReplica(task, chunk.id);
+      count++;
+      batch++;
+
+      // Periodic logging and yielding
+      const now = Date.now();
+      if (now - lastLogTime > 10000) { // Every 10 seconds
+        const rate = count / ((now - startTime) / 1000);
+        logger.info(`Task ${task.id}: Generated ${count.toLocaleString()} chunks (${rate.toFixed(1)} chunks/sec)`);
+        lastLogTime = now;
+      }
+
+      // Yield control to event loop frequently
+      if (batch >= YIELD_INTERVAL) {
+        batch = 0;
+        await new Promise(resolve => setImmediate(resolve));
+      }
+
+      // Throttle if too many chunks are pending
+      const pending = task.assignments.size - task.completedChunks;
+      while (pending > MAX_PENDING && !task.cancelRequested) {
+        logger.debug(`Task ${task.id}: Throttling chunk generation (${task.queue.length} pending)`);
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
+      // Memory pressure check
+      if (count % 1000 === 0) {
+        const memUsage = process.memoryUsage();
+        const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+        if (heapUsedMB > 2048) { // Over 2GB heap usage
+          logger.warn(`Task ${task.id}: High memory usage: ${heapUsedMB}MB heap`);
+        }
+      }
+    }
+
+    task.totalChunks = count;
+    task.chunkerFinished = true;
+
+    const duration = (Date.now() - startTime) / 1000;
+    const rate = count / duration;
+    logger.info(`Task ${task.id}: Chunking completed - ${count.toLocaleString()} chunks in ${duration.toFixed(1)}s (${rate.toFixed(1)} chunks/sec)`);
+
+    this._maybeFinish(task.id);
+
+  } catch (error) {
+    logger.error(`Chunking stream error for task ${task.id}:`, error);
+    task.status = 'error';
+    task.error = error.message;
+    throw error;
+  }
+}
   _eligibleClients(task){
     // Only clients that support the framework
     const list = Array.from(this.clients.values()).filter(c=>{
@@ -152,15 +274,24 @@ export class TaskManager{
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) return;
     if(entry.replicas >= task.K) return;
+
+    // Check if we allow same client multiple replicas (for research/testing)
+    const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
+
     for(const c of this._eligibleClients(task)){
-      if(entry.assignedTo.has(c.socket.id)) continue;
+      // Skip if client already assigned to this chunk AND we don't allow same client replicas
+      if(!allowSameClient && entry.assignedTo.has(c.socket.id)) continue;
+
       if((c.inFlight||0) >= (c.capacity||1)) continue; // respect client capacity
+
       const replica = entry.replicas;
       entry.assignedTo.add(c.socket.id);
       entry.replicas++;
       c.inFlight = (c.inFlight||0) + 1;
       c.tasks.add(task.id);
       assigned = true;
+
+      // Emit chunk assignment with replica ID
       c.socket.emit('chunk:assign', {
         taskId: task.id,
         chunkId,
@@ -169,8 +300,10 @@ export class TaskManager{
         meta: entry.meta,
         tCreate: entry.tCreate,
       });
+
       const tSent = now();
       task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tSent });
+
       if(entry.replicas >= task.K) break;
     }
     return assigned;
@@ -184,7 +317,9 @@ export class TaskManager{
     if(!entry){ logger.warn('Result for unknown chunk', chunkId); return; }
 
     const tServerRecv = now();
-    const client = this.clients.get(socketId); if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
+    const client = this.clients.get(socketId);
+    if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
+
     task.timers.chunkRow({
       chunkId, replica,
       tCreate: entry.tCreate,
@@ -195,19 +330,29 @@ export class TaskManager{
 
     if(status!=='ok'){
       logger.warn('Replica failed', taskId, chunkId, replica, 'from', socketId);
-      entry.assignedTo.delete(socketId);
+      // For same-client replicas, we might want to reassign differently
+      const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
+      if (!allowSameClient) {
+        entry.assignedTo.delete(socketId);
+      }
       this._assignChunkReplica(task, chunkId);
       this._drainTaskQueue(task);
       return;
     }
 
-    if(!entry.results.has(checksum)) entry.results.set(checksum, []);
-    entry.results.get(checksum).push({ socketId, result });
+    // Handle multiple results with same checksum (existing logic is fine)
+    let rec = entry.results.get(checksum);
+    if (!rec) {
+      entry.results.set(checksum, { count: 1, buf: result });
+    } else {
+      rec.count += 1;
+    }
 
-    for(const [cs, arr] of entry.results){
-      if(arr.length >= task.K){
+    // Check if we have enough matching results
+    for (const [cs, rec2] of entry.results){
+      if (rec2.count >= task.K){
         try{
-          task.assembler.integrate({ chunkId, result: arr[0].result, meta: entry.meta });
+          task.assembler.integrate({ chunkId, result: rec2.buf, meta: entry.meta });
           const tAssembled = now();
           task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled });
           entry.completed = true;
