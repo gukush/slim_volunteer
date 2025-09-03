@@ -1,4 +1,4 @@
-# Volunteer Compute (Fresh)
+# Volunteer Compute
 
 Minimal, readable volunteer computing system: Node.js server + browser clients (WebGPU).
 
@@ -30,15 +30,5 @@ google-chrome --enable-gpu --enable-unsafe-webgpu --use-vulkan=swiftshader   --e
 ## Strategies
 
 ### block-matmul (WebGPU)
-- Config: `{ "N": 512, "K": 512, "M": 512, "tileSize": 128 }`
-- Output: `output.bin` (Float32 row-major N x M) in task dir
-
 ### ecm-stage1 (WebGPU demo)
-- Demo harness using your provided WGSL if available; otherwise uses a simple transform kernel.
-- Input: JSON list of `u32` values; output: transformed chunks JSON for inspection.
-
-## Notes
-- Executor + kernels are sent **once** per task (`task:init`). Chunks then carry only data + meta.
-- Redundancy `K` and checksum verification implemented on the server.
-- Timings CSV are written to `server/storage/timing/`.
-
+### distributed-sort (WebGPU)
