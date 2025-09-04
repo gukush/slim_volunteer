@@ -4,6 +4,7 @@ server/storage/*
 server/uploads/*
 server/custom_tasks.json
 .env
+*.txt
 remove_emojis.sh
 server/custom_chunks.json
 server/matrix_16.bin/

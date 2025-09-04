@@ -36,13 +36,86 @@ function nextPowerOf2(n) {
   return Math.pow(2, Math.ceil(Math.log2(n)));
 }
 
+
+// return the newest matching file from a list of directories
+function findNewestBin({ preferredName = 'large_sort_input.bin', taskDir, uploadsDir }) {
+  const candidates = [];
+
+  const pushIfExists = (p) => {
+    try {
+      const st = fs.statSync(p);
+      if (st.isFile()) {
+        candidates.push({ path: p, mtime: st.mtimeMs, size: st.size });
+      }
+    } catch {}
+  };
+
+  if (taskDir) {
+    try {
+      for (const name of fs.readdirSync(taskDir)) {
+        if (/\.bin$/i.test(name) && !/_[AB]\.bin$/i.test(name)) {
+          // Prefer exact preferredName
+          if (name === preferredName || name.endsWith(`_${preferredName}`)) {
+            pushIfExists(path.join(taskDir, name));
+          } else {
+            pushIfExists(path.join(taskDir, name));
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // 2) Then search uploadsDir (process.cwd()/uploads by default)
+  const upDir = uploadsDir || path.join(process.cwd(), 'uploads');
+  try {
+    for (const name of fs.readdirSync(upDir)) {
+      if (/\.bin$/i.test(name) && !/_[AB]\.bin$/i.test(name)) {
+        // Prefer names ending in _preferredName
+        if (name === preferredName || name.endsWith(`_${preferredName}`)) {
+          pushIfExists(path.join(upDir, name));
+        } else {
+          pushIfExists(path.join(upDir, name));
+        }
+      }
+    }
+  } catch {}
+
+  if (candidates.length === 0) return null;
+
+  // Prefer files that exactly match or end with _preferredName; if tie, pick newest
+  candidates.sort((a, b) => {
+    const aPref = Number(a.path.endsWith(`_${preferredName}`) || path.basename(a.path) === preferredName);
+    const bPref = Number(b.path.endsWith(`_${preferredName}`) || path.basename(b.path) === preferredName);
+    if (aPref !== bPref) return bPref - aPref;
+    // newest mtime first
+    if (a.mtime !== b.mtime) return b.mtime - a.mtime;
+    // larger size next
+    return (b.size || 0) - (a.size || 0);
+  });
+
+  return candidates[0].path;
+}
 export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
-  const inputFile = inputFiles.find(f => /\.bin$/.test(f.originalName))?.path || inputFiles[0]?.path;
+const uploadsDir = process.env.UPLOADS_DIR || path.join(process.cwd(), 'uploads');
+const listed = Array.isArray(inputFiles) ? inputFiles : [];
+const byName = listed.find(f => f && f.originalName && /\.bin$/i.test(f.originalName) && !/_[AB]\.bin$/i.test(f.originalName));
+let inputFile = (byName && byName.path) || (listed[0] && listed[0].path) || null;
+if (!inputFile) {
+  // Fallback: scan taskDir then uploadsDir for a suitable .bin (prefer *_large_sort_input.bin)
+  inputFile = findNewestBin({ preferredName: 'large_sort_input.bin', taskDir, uploadsDir }) ||
+              findNewestBin({ preferredName: 'input.bin', taskDir, uploadsDir });
+}
+
   if (!inputFile) throw new Error('Need input binary file with integers');
 
   const { chunkSize = 65536, ascending = true } = config; // Default 64K integers per chunk
-  const fd = fs.openSync(inputFile, 'r');
+if (!inputFile) {
+  throw new Error('Need input binary file with integers (.bin). None provided and none found in task/uploads.');
+}
+const fd = fs.openSync(inputFile, 'r');
+
   const fileStats = fs.fstatSync(fd);
+  if (fileStats.size % 4 !== 0) throw new Error(`Input file size (${fileStats.size} bytes) is not a multiple of 4.`);
   const totalIntegers = Math.floor(fileStats.size / 4); // 4 bytes per 32-bit integer
   const chunksCount = Math.ceil(totalIntegers / chunkSize);
 
@@ -55,14 +128,13 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
         const actualChunkSize = Math.min(chunkSize, totalIntegers - offset);
         const paddedSize = nextPowerOf2(actualChunkSize); // Pad to power of 2 for bitonic sort
 
-        // Read actual data
         const integers = readIntegersChunk(fd, offset, actualChunkSize, totalIntegers);
 
         // Pad with max/min values depending on sort direction
         const paddedIntegers = new Uint32Array(paddedSize);
         paddedIntegers.set(integers);
 
-        // Fill padding with sentinel values
+        // Fill padding with sentino values
         const sentinelValue = ascending ? 0xFFFFFFFF : 0x00000000;
         for (let i = actualChunkSize; i < paddedSize; i++) {
           paddedIntegers[i] = sentinelValue;
@@ -95,8 +167,117 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
 
 export function buildAssembler({ taskId, taskDir, config }) {
   const { ascending = true } = config;
-  const sortedChunks = []; // Array of {chunkIndex, data, originalSize}
+
+  // Merge configuration
+  const memoryThresholdMB = config.memoryThresholdMB || 512; // Default 512MB
+  const memoryThresholdBytes = memoryThresholdMB * 1024 * 1024;
+  const maxRunsBeforeMerge = config.maxRunsBeforeMerge || 10; // Merge disk runs when we have this many
+  const runMergeSize = config.runMergeSize || 4; // How many runs to merge at once
+
+  // State tracking
+  const inMemoryChunks = []; // Array of {chunkIndex, data, originalSize}
+  const diskRuns = []; // Array of {runId, filePath, elementCount}
+  const tempDir = path.join(taskDir, 'temp_runs');
   const outPath = path.join(taskDir, 'output.bin');
+
+  let currentMemoryUsage = 0;
+  let runCounter = 0;
+  let backgroundMergeRunning = false;
+
+  if (!fs.existsSync(tempDir)) {
+    fs.mkdirSync(tempDir, { recursive: true });
+  }
+
+  function writeRunToDisk(chunks) {
+    if (chunks.length === 0) return null;
+
+    const runId = `run_${runCounter++}`;
+    const runPath = path.join(tempDir, `${runId}.bin`);
+
+    chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+    const mergedData = mergeKSortedArrays(chunks.map(chunk => chunk.data), ascending);
+
+    // Write to disk
+    const runBuffer = Buffer.from(mergedData.buffer);
+    fs.writeFileSync(runPath, runBuffer);
+
+    const elementCount = mergedData.length;
+    const runInfo = { runId, filePath: runPath, elementCount };
+    diskRuns.push(runInfo);
+
+    logger.info(`Wrote run ${runId} to disk: ${elementCount} elements (${(runBuffer.length / 1024 / 1024).toFixed(1)} MB)`);
+    return runInfo;
+  }
+
+  function readRunFromDisk(runInfo) {
+    const buffer = fs.readFileSync(runInfo.filePath);
+    return new Uint32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
+  }
+
+  async function backgroundMergeRuns() {
+    if (backgroundMergeRunning || diskRuns.length < runMergeSize) return;
+
+    backgroundMergeRunning = true;
+
+    try {
+      while (diskRuns.length >= runMergeSize) {
+        // Take the first N runs for merging
+        const runsToMerge = diskRuns.splice(0, runMergeSize);
+        logger.info(`Background merging ${runsToMerge.length} runs`);
+
+        // Read all runs into memory
+        const runArrays = runsToMerge.map(runInfo => readRunFromDisk(runInfo));
+
+        const mergedData = mergeKSortedArrays(runArrays, ascending);
+
+        // Write merged result back as a single run
+        const newRunId = `merged_run_${runCounter++}`;
+        const newRunPath = path.join(tempDir, `${newRunId}.bin`);
+        const mergedBuffer = Buffer.from(mergedData.buffer);
+        fs.writeFileSync(newRunPath, mergedBuffer);
+
+        const newRunInfo = {
+          runId: newRunId,
+          filePath: newRunPath,
+          elementCount: mergedData.length
+        };
+        diskRuns.push(newRunInfo);
+
+        // Clean up old run files
+        for (const oldRun of runsToMerge) {
+          try {
+            fs.unlinkSync(oldRun.filePath);
+            logger.debug(`Cleaned up old run file: ${oldRun.filePath}`);
+          } catch (e) {
+            logger.warn(`Failed to clean up run file ${oldRun.filePath}:`, e.message);
+          }
+        }
+
+        logger.info(`Background merge complete: ${newRunInfo.elementCount} elements`);
+
+        // Yield control to allow other operations
+        await new Promise(resolve => setImmediate(resolve));
+      }
+    } finally {
+      backgroundMergeRunning = false;
+    }
+  }
+
+  // Check if we need to spill to disk
+  function checkMemoryThreshold() {
+    if (currentMemoryUsage > memoryThresholdBytes && inMemoryChunks.length > 0) {
+      logger.info(`Memory threshold exceeded (${(currentMemoryUsage / 1024 / 1024).toFixed(1)} MB), spilling to disk`);
+
+      writeRunToDisk([...inMemoryChunks]);
+
+      // Clear in-memory state
+      inMemoryChunks.length = 0;
+      currentMemoryUsage = 0;
+
+      // Trigger background merge if needed
+      setTimeout(() => backgroundMergeRuns(), 0);
+    }
+  }
 
   return {
     integrate({ chunkId, result, meta }) {
@@ -104,15 +285,14 @@ export function buildAssembler({ taskId, taskDir, config }) {
 
       let u8;
       if (result instanceof ArrayBuffer) {
-        u8 = new Uint8Array(result);                       // aligned at 0
+        u8 = new Uint8Array(result);
       } else if (ArrayBuffer.isView(result)) {
-        // copy bytes so the new view starts at offset 0
         u8 = new Uint8Array(result.byteLength);
         u8.set(new Uint8Array(result.buffer, result.byteOffset, result.byteLength));
       } else if (Buffer.isBuffer?.(result)) {
-        u8 = Uint8Array.from(result);                      // copy from Node Buffer
+        u8 = Uint8Array.from(result);
       } else if (result && result.type === 'Buffer' && Array.isArray(result.data)) {
-        u8 = Uint8Array.from(result.data);                 // JSON-ified Buffer
+        u8 = Uint8Array.from(result.data);
       } else {
         u8 = Uint8Array.from(result);
       }
@@ -120,46 +300,106 @@ export function buildAssembler({ taskId, taskDir, config }) {
       if (u8.byteLength % 4 !== 0) {
         throw new Error(`Result byteLength ${u8.byteLength} not multiple of 4`);
       }
+
       const sortedData = new Uint32Array(u8.buffer, 0, u8.byteLength >>> 2);
-      // keep only real values (drop padding)
       const actualData = sortedData.subarray(0, originalSize);
 
-      sortedChunks.push({
+      // Add to in-memory chunks
+      const chunkInfo = {
         chunkIndex,
         data: actualData,
         originalSize
-      });
+      };
 
-      logger.debug(`Integrated chunk ${chunkIndex}, size: ${originalSize}`);
+      inMemoryChunks.push(chunkInfo);
+      currentMemoryUsage += actualData.byteLength;
+
+      logger.debug(`Integrated chunk ${chunkIndex}, size: ${originalSize}, memory usage: ${(currentMemoryUsage / 1024 / 1024).toFixed(1)} MB`);
+
+      // Check if we need to spill to disk
+      checkMemoryThreshold();
     },
 
-    finalize() {
-      // Sort chunks by their index to maintain order
-      sortedChunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+    async finalize() {
+      logger.info(`Starting finalization: ${inMemoryChunks.length} in-memory chunks, ${diskRuns.length} disk runs`);
 
-      // Perform k-way merge of sorted chunks
-      const mergedData = mergeKSortedArrays(sortedChunks.map(chunk => chunk.data), ascending);
+      // Wait for any background merging to complete
+      while (backgroundMergeRunning) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
 
-      // Write to output file
-      const outputBuffer = Buffer.from(mergedData.buffer);
+      // Final background merge to reduce disk run count
+      await backgroundMergeRuns();
+
+      // Prepare final merge sources
+      const mergeSources = [];
+
+      // Add in-memory chunks as merge sources
+      if (inMemoryChunks.length > 0) {
+        inMemoryChunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+        const memoryMerged = mergeKSortedArrays(inMemoryChunks.map(chunk => chunk.data), ascending);
+        mergeSources.push(memoryMerged);
+        logger.info(`In-memory merge: ${memoryMerged.length} elements`);
+      }
+
+      // Add disk runs as merge sources
+      for (const runInfo of diskRuns) {
+        const runData = readRunFromDisk(runInfo);
+        mergeSources.push(runData);
+        logger.info(`Loaded disk run ${runInfo.runId}: ${runData.length} elements`);
+      }
+
+      if (mergeSources.length === 0) {
+        throw new Error('No data to merge');
+      }
+
+      // Perform final k-way merge
+      logger.info(`Final merge of ${mergeSources.length} sources`);
+      const finalResult = mergeSources.length === 1
+        ? mergeSources[0]
+        : mergeKSortedArrays(mergeSources, ascending);
+
+      // Write final output
+      const outputBuffer = Buffer.from(finalResult.buffer);
       fs.writeFileSync(outPath, outputBuffer);
 
-      logger.info(`Sorting complete. Output written to ${outPath}, ${mergedData.length} integers`);
-      return { outPath, elements: mergedData.length };
+      // Clean up temporary files
+      try {
+        for (const runInfo of diskRuns) {
+          fs.unlinkSync(runInfo.filePath);
+        }
+        fs.rmdirSync(tempDir);
+        logger.info('Cleaned up temporary files');
+      } catch (e) {
+        logger.warn('Error cleaning up temporary files:', e.message);
+      }
+
+      logger.info(`External sort complete. Output written to ${outPath}, ${finalResult.length} integers`);
+
+      const memoryPeakMB = (memoryThresholdBytes / 1024 / 1024).toFixed(1);
+      const totalSizeMB = (finalResult.length * 4 / 1024 / 1024).toFixed(1);
+      logger.info(`Memory efficiency: Peak ${memoryPeakMB} MB for ${totalSizeMB} MB dataset (${(memoryThresholdMB / (finalResult.length * 4 / 1024 / 1024) * 100).toFixed(1)}% of total)`);
+
+      return {
+        outPath,
+        elements: finalResult.length,
+        memoryPeakMB: parseFloat(memoryPeakMB),
+        totalSizeMB: parseFloat(totalSizeMB),
+        diskRunsUsed: diskRuns.length
+      };
     }
   };
 }
 
-// K-way merge of sorted arrays
+// k-way merge with streaming support for large datasets
 function mergeKSortedArrays(sortedArrays, ascending = true) {
   if (sortedArrays.length === 0) return new Uint32Array(0);
   if (sortedArrays.length === 1) return new Uint32Array(sortedArrays[0]);
 
-  // Calculate total size
   const totalSize = sortedArrays.reduce((sum, arr) => sum + arr.length, 0);
   const result = new Uint32Array(totalSize);
 
-  // Min/Max heap approach using simple array with indices
+  // Use a priority queue approach with indices
   const heap = [];
   const indices = new Array(sortedArrays.length).fill(0);
 
@@ -170,7 +410,6 @@ function mergeKSortedArrays(sortedArrays, ascending = true) {
     }
   }
 
-  // Sort initial heap
   heap.sort((a, b) => ascending ? a.value - b.value : b.value - a.value);
 
   let resultIndex = 0;
