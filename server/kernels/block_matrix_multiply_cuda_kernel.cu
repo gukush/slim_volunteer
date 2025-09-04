@@ -1,4 +1,4 @@
-__global__ void execute_task(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int rows, int K, int cols) {
+extern "C" __global__ void execute_task(const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C, int rows, int K, int cols) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   int r = blockIdx.y * blockDim.y + threadIdx.y;
   if (r >= rows || c >= cols) return;
