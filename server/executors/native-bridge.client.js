@@ -216,7 +216,7 @@ export function createExecutor({ kernels, config }) {
         action: 'compile_and_run',
         framework: 'cuda',
         source: src,
-        entry: config?.entry || 'main',
+        entry: config?.entry || 'execute_task',
         grid, block, uniforms, inputs, outputSizes
       };
     }
