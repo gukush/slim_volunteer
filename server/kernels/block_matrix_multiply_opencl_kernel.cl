@@ -1,4 +1,4 @@
-__kernel void execute_task(__global const float* A, __global const float* B, __global float* C, const int rows, const int K, const int cols) {
+__kernel void execute_task(const int rows, const int K, const int cols, __global const float* A, __global const float* B, __global float* C) {
   int c = get_global_id(0);
   int r = get_global_id(1);
   if (r >= rows || c >= cols) return;
