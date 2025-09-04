@@ -1,91 +1,96 @@
-// ecm_stage1_webgpu.wgsl
-// ECM Stage 1 (Montgomery curves) for WebGPU (WGSL)
-// - 256-bit big integers using 8x32-bit limbs (little-endian: limbs[0] is least significant)
-// - Montgomery multiplication (CIOS) with 32-bit word size
-// - One thread per curve. The host supplies: N, R2, mont_one, n0inv32, A24/X1 per curve, and prime powers list.
-//
-// Notes
-// -----
-// * n0inv32 = -N^{-1} mod 2^32 (host computes from N.limbs[0]).
-// * mont_one = R mod N, where R = 2^(32*8) = 2^256.
-// * R2 = R^2 mod N.
-//
-struct U256 {
-  limbs: array<u32, 8>,
-};
+// kernels/ecm_stage1_webgpu_compute.wgsl - Version 2 (robust)
+//  - 256-bit big integers (8x u32, little-endian)
+//  - Montgomery math (CIOS, word=32, L=8)
+//  - Deterministic RNG via 64-bit LCG emulated with u32
+//  - Suyama parametrization
+//  - Binary modular inverse (u32)
+//  - Correct constant-time Montgomery ladder with final swap
+//  - Status codes: 1=no factor, 2=factor found, 3=bad curve/inverse failed
 
-struct CurveIn {
-  A24: U256,
-  X1:  U256,
-};
-
-/// 32 bytes (U256) + 4 (status) + 12 (padding) = 48 bytes total
-struct CurveOut {
-  result: U256,
-  status: u32,
-  _pad0:  u32,
-  _pad1:  u32,
-  _pad2:  u32,
-};
+// --------------------------- Types & IO ---------------------------
+struct U256 { limbs: array<u32, 8>, };
 
 struct PointXZ {
   X: U256,
   Z: U256,
 };
 
-/// Constants buffer (binding 0)
-/// 8*4 * 3 = 96 bytes for N,R2,one + 4 for n0inv32 + 12 pad = 112 bytes
-struct Consts {
-  N:        U256,
-  R2:       U256,
-  mont_one: U256,
-  n0inv32:  u32,
-  _cpad0:   u32,
-  _cpad1:   u32,
-  _cpad2:   u32,
+struct InvResult {
+  ok  : bool,
+  val : U256,
 };
 
-/// Uniforms buffer (binding 4), 16 bytes total
-struct Params {
-  pp_count:    u32,
-  num_curves:  u32,
-  compute_gcd: u32,
-  _upad:       u32,
+struct CurveResult {
+  ok   : bool,
+  A24m : U256, // Montgomery domain
+  X1m  : U256, // Montgomery domain
 };
 
-struct Packed {
-  consts: Consts,    // Constants (N, R2, mont_one, n0inv32)
-  primes: array<u32>, // Prime powers list (runtime-sized array)
+struct Header {
+  magic      : u32, // "ECM1"
+  version    : u32, // 2
+  rsv0       : u32,
+  rsv1       : u32,
+  pp_count   : u32,
+  n_curves   : u32,
+  seed_lo    : u32,
+  seed_hi    : u32,
+  base_curve : u32,
+  flags      : u32,
+  rsv2       : u32,
+  rsv3       : u32,
 };
 
-@group(0) @binding(0) var<uniform>              params: Params;         // uniforms
-@group(0) @binding(1) var<storage, read>        packed: Packed;         // consts+primes
-@group(0) @binding(2) var<storage, read>        curves: array<CurveIn>; // inputs
-@group(0) @binding(3) var<storage, read_write>  outBuf: array<CurveOut>; // output
+struct IO { words: array<u32>, };
 
-// --------- helpers: 32x32->64 via 16-bit split ---------
-fn mul32x32_64(a: u32, b: u32) -> vec2<u32> {
-  let a0 = a & 0xFFFFu;
-  let a1 = a >> 16u;
-  let b0 = b & 0xFFFFu;
-  let b1 = b >> 16u;
+@group(0) @binding(0) var<storage, read_write> io : IO;
 
-  var p00 = a0 * b0;               // 32-bit
-  var p01 = a0 * b1;
-  var p10 = a1 * b0;
-  var p11 = a1 * b1;
-
-  // assemble 64-bit: lo = p00 + ((p01 + p10) << 16), hi = p11 + carry from mid
-  var mid = p01 + p10;
-  var lo = (p00 & 0xFFFFu) | ((mid & 0xFFFFu) << 16u);
-
-  var carry = (p00 >> 16u) + (mid >> 16u);
-  // hi = p11 + carry
-  var hi = p11 + carry;
-  return vec2<u32>(lo, hi);
+fn getHeader() -> Header {
+  return Header(
+    io.words[0], io.words[1], io.words[2], io.words[3],
+    io.words[4], io.words[5], io.words[6], io.words[7],
+    io.words[8], io.words[9], io.words[10], io.words[11]
+  );
 }
 
-// add with carry: returns (sum, carry_out)
+fn constOffset() -> u32 { return 12u; }
+fn ppOffset()    -> u32 { return constOffset() + (8u*3u + 4u); } // N(8)+R2(8)+mont_one(8)+n0inv32(1)+pad(3)
+fn outOffset(h: Header) -> u32 { return ppOffset() + h.pp_count; }
+
+const LIMBS : u32 = 8u;
+
+// --------------------------- Small helpers ---------------------------
+fn set_zero() -> U256 { var r:U256; for (var i=0u;i<8u;i++){ r.limbs[i]=0u; } return r; }
+fn set_one() -> U256 { var r = set_zero(); r.limbs[0]=1u; return r; }
+fn u256_from_u32(x: u32) -> U256 { var r = set_zero(); r.limbs[0]=x; return r; }
+
+fn is_zero(a: U256) -> bool {
+  var x:u32 = 0u;
+  for (var i=0u;i<8u;i++){ x |= a.limbs[i]; }
+  return x == 0u;
+}
+fn cmp(a: U256, b: U256) -> i32 {
+  for (var i:i32=7; i>=0; i--) {
+    let ai = a.limbs[u32(i)];
+    let bi = b.limbs[u32(i)];
+    if (ai < bi) { return -1; }
+    if (ai > bi) { return 1; }
+  }
+  return 0;
+}
+fn is_even(a: U256) -> bool { return (a.limbs[0] & 1u) == 0u; }
+
+fn rshift1(a: U256) -> U256 {
+  var r: U256;
+  var carry: u32 = 0u;
+  for (var i:i32=7; i>=0; i--) {
+    let w = a.limbs[u32(i)];
+    r.limbs[u32(i)] = (w >> 1u) | (carry << 31u);
+    carry = w & 1u;
+  }
+  return r;
+}
+
 fn addc(a:u32, b:u32, cin:u32) -> vec2<u32> {
   let s = a + b;
   let c1 = select(0u, 1u, s < a);
@@ -93,8 +98,6 @@ fn addc(a:u32, b:u32, cin:u32) -> vec2<u32> {
   let c2 = select(0u, 1u, s2 < cin);
   return vec2<u32>(s2, c1 + c2);
 }
-
-// sub with borrow: returns (diff, borrow_out)
 fn subb(a:u32, b:u32, bin:u32) -> vec2<u32> {
   let d = a - b;
   let b1 = select(0u, 1u, a < b);
@@ -103,30 +106,10 @@ fn subb(a:u32, b:u32, bin:u32) -> vec2<u32> {
   return vec2<u32>(d2, select(0u, 1u, (b1 | b2) != 0u));
 }
 
-// comparisons
-fn is_zero(a: U256) -> bool {
-  var x:u32 = 0u;
-  for (var i=0u;i<8u;i++) { x |= a.limbs[i]; }
-  return x == 0u;
-}
-fn cmp(a: U256, b: U256) -> i32 {
-  for (var i: i32 = 7; i >= 0; i--) {
-    let ai = a.limbs[u32(i)];
-    let bi = b.limbs[u32(i)];
-    if (ai < bi) { return -1; }
-    if (ai > bi) { return 1; }
-  }
-  return 0;
-}
-
-fn copy(a: U256) -> U256 { return a; }
-fn set_zero() -> U256 { var r:U256; for (var i=0u;i<8u;i++){ r.limbs[i]=0u; } return r; }
-fn set_one() -> U256 { var r = set_zero(); r.limbs[0]=1u; return r; }
-
 fn add_u256(a: U256, b: U256) -> U256 {
   var r: U256;
   var c:u32 = 0u;
-  for (var i=0u;i<8u;i++) {
+  for (var i=0u;i<8u;i++){
     let ac = addc(a.limbs[i], b.limbs[i], c);
     r.limbs[i] = ac.x; c = ac.y;
   }
@@ -135,33 +118,53 @@ fn add_u256(a: U256, b: U256) -> U256 {
 fn sub_u256(a: U256, b: U256) -> U256 {
   var r: U256;
   var br:u32 = 0u;
-  for (var i=0u;i<8u;i++) {
+  for (var i=0u;i<8u;i++){
     let sb = subb(a.limbs[i], b.limbs[i], br);
     r.limbs[i] = sb.x; br = sb.y;
   }
   return r;
 }
-
-// conditional subtract N if r >= N
 fn cond_sub_N(a: U256, N: U256) -> U256 {
-  let c = cmp(a, N);
-  if (c >= 0) {
-    return sub_u256(a, N);
-  }
+  if (cmp(a, N) >= 0) { return sub_u256(a, N); }
   return a;
 }
+fn add_mod(a: U256, b: U256, N: U256) -> U256 {
+  return cond_sub_N(add_u256(a, b), N);
+}
+fn sub_mod(a: U256, b: U256, N: U256) -> U256 {
+  if (cmp(a, b) >= 0) { return sub_u256(a, b); }
+  // a < b  =>  N - (b - a)
+  let diff = sub_u256(b, a);
+  return sub_u256(N, diff);
+}
 
-// Montgomery multiply (CIOS), word size 32, L=8.
+// 32x32 -> 64 multiply via 16-bit split. Returns (lo, hi).
+fn mul32x32_64(a: u32, b: u32) -> vec2<u32> {
+  let a0 = a & 0xFFFFu; let a1 = a >> 16u;
+  let b0 = b & 0xFFFFu; let b1 = b >> 16u;
+
+  let p00 = a0 * b0;
+  let p01 = a0 * b1;
+  let p10 = a1 * b0;
+  let p11 = a1 * b1;
+
+  let mid = p01 + p10;
+  let lo  = (p00 & 0xFFFFu) | ((mid & 0xFFFFu) << 16u);
+  let carry = (p00 >> 16u) + (mid >> 16u);
+  let hi = p11 + carry;
+
+  return vec2<u32>(lo, hi);
+}
+
+// --------------------------- Montgomery math (CIOS) ---------------------------
 fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
-  var t : array<u32, 9>;
+  var t: array<u32, 9>;
   for (var i=0u;i<9u;i++){ t[i]=0u; }
 
-  for (var i=0u;i<8u;i++) {
-    // t += a_i * b
+  for (var i=0u;i<8u;i++){
     var carry:u32 = 0u;
-    for (var j=0u;j<8u;j++) {
-      let prod = mul32x32_64(a.limbs[i], b.limbs[j]);
-      // t[j] = t[j] + prod.lo + carry
+    for (var j=0u;j<8u;j++){
+      let prod = mul32x32_64(a.limbs[i], b.limbs[j]); // (lo,hi)
       let s1 = addc(t[j], prod.x, 0u);
       let s2 = addc(s1.x, carry, 0u);
       t[j] = s2.x;
@@ -169,12 +172,10 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
     }
     t[8] = t[8] + carry;
 
-    // m = t0 * n0inv32 mod 2^32
     let m = t[0] * n0inv32;
 
-    // t += m * N
     carry = 0u;
-    for (var j=0u;j<8u;j++) {
+    for (var j=0u;j<8u;j++){
       let prod = mul32x32_64(m, N.limbs[j]);
       let s1 = addc(t[j], prod.x, 0u);
       let s2 = addc(s1.x, carry, 0u);
@@ -183,206 +184,368 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
     }
     t[8] = t[8] + carry;
 
-    // shift t right by one limb
     for (var k=0u;k<8u;k++){ t[k] = t[k+1]; }
     t[8]=0u;
   }
 
-  var r:U256;
+  var r: U256;
   for (var i=0u;i<8u;i++){ r.limbs[i]=t[i]; }
   return cond_sub_N(r, N);
 }
 
-fn to_mont(a: U256, C: Consts) -> U256 {
-  return mont_mul(a, C.R2, C.N, C.n0inv32);
+fn mont_add(a: U256, b: U256, N: U256) -> U256 {
+  return cond_sub_N(add_u256(a, b), N);
 }
-fn from_mont(a: U256, C: Consts) -> U256 {
-  let one = set_one();  // Regular 1, not Montgomery 1
-  return mont_mul(a, one, C.N, C.n0inv32);
+fn mont_sub(a: U256, b: U256, N: U256) -> U256 {
+  if (cmp(a,b) >= 0) { return sub_u256(a,b); }
+  // a < b  =>  a - b (mod N) = N - (b - a)
+  let diff = sub_u256(b, a);
+  return sub_u256(N, diff);
 }
-fn mont_add(a: U256, b: U256, C: Consts) -> U256 {
-  return cond_sub_N(add_u256(a,b), C.N);
-}
-fn mont_sub(a: U256, b: U256, C: Consts) -> U256 {
-  let c = cmp(a,b);
-  if (c >= 0) { return sub_u256(a,b); }
-  else { return add_u256(sub_u256(a,b), C.N); }
-}
-fn mont_sqr(a: U256, C: Consts) -> U256 { return mont_mul(a,a,C.N,C.n0inv32); }
+fn mont_sqr(a: U256, N: U256, n0inv32: u32) -> U256 { return mont_mul(a, a, N, n0inv32); }
 
-// ---- Montgomery curve x-only ops ----
-//struct PointXZ { X: U256, Z: U256 };
+fn to_mont(a: U256, R2: U256, N: U256, n0inv32: u32) -> U256 { return mont_mul(a, R2, N, n0inv32); }
+fn from_mont(a: U256, N: U256, n0inv32: u32) -> U256 { return mont_mul(a, set_one(), N, n0inv32); }
 
-fn xDBL(P: PointXZ, A24: U256, C: Consts) -> PointXZ {
-  var t1 = mont_add(P.X, P.Z, C);  // X+Z
-  var t2 = mont_sub(P.X, P.Z, C);  // X-Z
-  let t3 = mont_sqr(t1, C);        // (X+Z)^2 = XX
-  let t4 = mont_sqr(t2, C);        // (X-Z)^2 = ZZ
-  let t5 = mont_sub(t3, t4, C);    // 4XZ = diff
-  let temp = mont_mul(A24, t5, C.N, C.n0inv32);  // A24 * diff
-  let Z_mult = mont_add(t3, temp, C);  // XX + A24 * diff
-  let X2 = mont_mul(t3, t4, C.N, C.n0inv32);    // XX * ZZ
-  let Z2 = mont_mul(t5, Z_mult, C.N, C.n0inv32);  // diff * Z_mult
+// --------------------------- X-only ops ---------------------------
+fn xDBL(P: PointXZ, A24: U256, N: U256, n0inv32: u32) -> PointXZ {
+  let t1 = mont_add(P.X, P.Z, N);
+  let t2 = mont_sub(P.X, P.Z, N);
+  let t3 = mont_sqr(t1, N, n0inv32);
+  let t4 = mont_sqr(t2, N, n0inv32);
+  let t5 = mont_sub(t3, t4, N);
+  let t6 = mont_mul(A24, t5, N, n0inv32);
+  let Z_mult = mont_add(t3, t6, N);
+  let X2 = mont_mul(t3, t4, N, n0inv32);
+  let Z2 = mont_mul(t5, Z_mult, N, n0inv32);
   return PointXZ(X2, Z2);
 }
 
-fn xADD(P: PointXZ, Q: PointXZ, Diff: PointXZ, C: Consts) -> PointXZ {
-  var t1 = mont_add(P.X, P.Z, C);
-  var t2 = mont_sub(P.X, P.Z, C);
-  var t3 = mont_add(Q.X, Q.Z, C);
-  var t4 = mont_sub(Q.X, Q.Z, C);
-  let t5 = mont_mul(t1, t4, C.N, C.n0inv32);
-  let t6 = mont_mul(t2, t3, C.N, C.n0inv32);
-  t1 = mont_add(t5, t6, C);
-  t2 = mont_sub(t5, t6, C);
-  t1 = mont_sqr(t1, C);
-  t2 = mont_sqr(t2, C);
-  let X3 = mont_mul(t1, Diff.Z, C.N, C.n0inv32);
-  let Z3 = mont_mul(t2, Diff.X, C.N, C.n0inv32);
+fn xADD(P: PointXZ, Q: PointXZ, Diff: PointXZ, N: U256, n0inv32: u32) -> PointXZ {
+  let t1 = mont_add(P.X, P.Z, N);
+  let t2 = mont_sub(P.X, P.Z, N);
+  let t3 = mont_add(Q.X, Q.Z, N);
+  let t4 = mont_sub(Q.X, Q.Z, N);
+  let t5 = mont_mul(t1, t4, N, n0inv32);
+  let t6 = mont_mul(t2, t3, N, n0inv32);
+  let t1n = mont_add(t5, t6, N);
+  let t2n = mont_sub(t5, t6, N);
+  let X3 = mont_mul(mont_sqr(t1n, N, n0inv32), Diff.Z, N, n0inv32);
+  let Z3 = mont_mul(mont_sqr(t2n, N, n0inv32), Diff.X, N, n0inv32);
   return PointXZ(X3, Z3);
 }
 
 fn cswap(a: ptr<function, PointXZ>, b: ptr<function, PointXZ>, bit: u32) {
   let mask = (0u - (bit & 1u));
   for (var i=0u;i<8u;i++){
-    let tx = ((*a).X.limbs[i] ^ (*b).X.limbs[i]) & mask;
+    let tx = (((*a).X.limbs[i]) ^ ((*b).X.limbs[i])) & mask;
     (*a).X.limbs[i] ^= tx; (*b).X.limbs[i] ^= tx;
-    let tz = ((*a).Z.limbs[i] ^ (*b).Z.limbs[i]) & mask;
+    let tz = (((*a).Z.limbs[i]) ^ ((*b).Z.limbs[i])) & mask;
     (*a).Z.limbs[i] ^= tz; (*b).Z.limbs[i] ^= tz;
   }
 }
 
-fn ladder(P: PointXZ, k: u32, A24: U256, C: Consts) -> PointXZ {
-  var R0 = PointXZ(C.mont_one, set_zero()); // (1:0)
-  var R1 = P;
+// Correct constant-time Montgomery ladder (with transition and final swap)
+fn ladder(P: PointXZ, k: u32, A24: U256, N: U256, n0inv32: u32, mont_one: U256) -> PointXZ {
+  var R0 = PointXZ(mont_one, set_zero()); // 0*P
+  var R1 = P;                             // 1*P
+  var prev: u32 = 0u;
   var started = false;
+
   for (var i:i32=31; i>=0; i--) {
-    let bit = (k >> u32(i)) & 1u;
-    if (!started && bit==0u) { continue; }
+    let b = (k >> u32(i)) & 1u;
+    if (!started && b == 0u) { continue; }
     started = true;
-    cswap(&R0, &R1, 1u - bit);
-    let T0 = xADD(R0, R1, P, C);
-    let T1 = xDBL(R1, A24, C);
-    R0 = T0; R1 = T1;
+
+    // swap on bit transition
+    cswap(&R0, &R1, b ^ prev);
+    prev = b;
+
+    let R0n = xADD(R0, R1, P, N, n0inv32); // R0 + R1
+    let R1n = xDBL(R1, A24, N, n0inv32);   // 2*R1
+    R0 = R0n;
+    R1 = R1n;
   }
+  cswap(&R0, &R1, prev); // finalize
   return R0;
 }
 
-// ---- shifts and gcd ----
-fn ctz32(x:u32) -> u32 {
-  var n:u32 = 0u;
-  if (x == 0u) { return 32u; }
-  var y = x;
-  while ((y & 1u) == 0u) { y = y >> 1u; n = n + 1u; }
-  return n;
-}
-fn ctz_u256(a: U256) -> u32 {
-  var tz:u32 = 0u;
-  for (var i=0u;i<8u;i++) {
-    let w = a.limbs[i];
-    if (w == 0u) { tz += 32u; continue; }
-    tz += ctz32(w); break;
-  }
-  return tz;
-}
-fn rshiftk(a: U256, k:u32) -> U256 {
-  if (k == 0u) { return a; }
-  var r = set_zero();
-  let limb = k / 32u;
-  let bits = k % 32u;
-  for (var i=0u;i<8u;i++) {
-    var val:u32 = 0u;
-    if (i + limb < 8u) {
-      val = a.limbs[i+limb];
-      if (bits != 0u) {
-        let cond = (i + limb + 1u) < 8u;
-        let hi   = select(0u, a.limbs[i + limb + 1u], cond);
-        val = (val >> bits) | (hi << (32u - bits));
-      }
-    }
-    r.limbs[i] = val;
-  }
-  return r;
-}
-fn lshiftk(a: U256, k:u32) -> U256 {
-  if (k == 0u) { return a; }
-  var r = set_zero();
-  let limb = k / 32u;
-  let bits = k % 32u;
-  for (var i: i32 = 7; i >= 0; i--) {
-    var val:u32 = 0u;
-    if (i >= i32(limb)) {
-      val = a.limbs[u32(i) - limb];
-      if (bits != 0u) {
-        let cond = (i >= i32(limb)+1);
-        let lo = select(0u, a.limbs[u32(i - 1) - limb], cond);
-        val = (val << bits) | (lo >> (32u - bits));
-      }
-    }
-    r.limbs[u32(i)] = val;
-  }
-  return r;
+// --------------------------- RNG (64-bit LCG in u32) ---------------------------
+fn lcg64_u32(state: ptr<function, vec2<u32>>) -> vec2<u32> {
+  const A_LO:u32=0x4C957F2Du; const A_HI:u32=0x5851F42Du;
+  const C_LO:u32=0xF767814Fu; const C_HI:u32=0x14057B7Eu;
+
+  let s_lo = (*state).x; let s_hi = (*state).y;
+
+  let t = mul32x32_64(s_lo, A_LO); // (lo,hi)
+  var res_lo = t.x;
+  var res_hi = t.y;
+
+  let u = mul32x32_64(s_lo, A_HI);
+  res_hi = res_hi + u.x;
+
+  let v = mul32x32_64(s_hi, A_LO);
+  res_hi = res_hi + v.x;
+
+  let new_lo = res_lo + C_LO;
+  let carry0 : u32 = select(0u, 1u, new_lo < res_lo);
+  let new_hi = res_hi + C_HI + carry0;
+
+  (*state) = vec2<u32>(new_lo, new_hi);
+  return (*state);
 }
 
+fn next_sigma(_N: U256, state: ptr<function, vec2<u32>>) -> U256 {
+  var acc: U256;
+  for (var i:u32=0u;i<4u;i++){
+    let r = lcg64_u32(state);  // r.x=lo, r.y=hi
+    acc.limbs[2u*i+0u] = r.x;
+    acc.limbs[2u*i+1u] = r.y;
+  }
+  var sigma = acc;
+  if (is_zero(sigma)) { sigma.limbs[0]=6u; }
+  let one = set_one();
+  if (cmp(sigma, one)==0) { sigma.limbs[0]=6u; }
+  return sigma;
+}
+
+// --------------------------- Binary modular inverse ---------------------------
+// Returns inverse of a mod N if gcd(a,N)==1
+fn mod_inverse(a_in: U256, N: U256) -> InvResult {
+  if (is_zero(a_in)) { return InvResult(false, set_zero()); }
+
+  // reduce a mod N with up to two subs (good enough for random data)
+  var a = a_in;
+  for (var k=0u; k<2u && cmp(a, N) >= 0; k++){ a = sub_u256(a, N); }
+  if (is_zero(a)) { return InvResult(false, set_zero()); }
+
+  var u = a;
+  var v = N;
+  var x1 = set_one();  // coeff for a
+  var x2 = set_zero(); // coeff for N
+
+  for (var iter=0u; iter<20000u; iter++){
+    if (cmp(u, set_one()) == 0) { return InvResult(true, x1); }
+    if (cmp(v, set_one()) == 0) { return InvResult(true, x2); }
+    if (is_zero(u) || is_zero(v)) { break; }
+
+    while (is_even(u)) {
+      u = rshift1(u);
+      if (is_even(x1)) { x1 = rshift1(x1); }
+      else { x1 = rshift1(add_u256(x1, N)); }
+    }
+    while (is_even(v)) {
+      v = rshift1(v);
+      if (is_even(x2)) { x2 = rshift1(x2); }
+      else { x2 = rshift1(add_u256(x2, N)); }
+    }
+
+    if (cmp(u, v) >= 0) {
+      u = sub_u256(u, v);
+      x1 = sub_mod(x1, x2, N);
+    } else {
+      v = sub_u256(v, u);
+      x2 = sub_mod(x2, x1, N);
+    }
+  }
+  return InvResult(false, set_zero());
+}
+
+// --------------------------- Curve generation (Suyama) ---------------------------
+// Given sigma, compute X1 and A24 in Montgomery domain:
+//   u = σ^2 - 5
+//   v = 4σ
+//   X1 = (u/v)^3
+//   A24 = ((A+2)/4) where A+2 = (v-u)^3 (3u+v) / (4 u^3)
+//        => A24 = (v-u)^3 (3u+v) / (16 u^3)
+fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
+  // mont versions of constants and sigma
+  let sigma_m = to_mont(sigma, R2, N, n0inv32);
+  let five_m  = to_mont(u256_from_u32(5u),  R2, N, n0inv32);
+  let four_m  = to_mont(u256_from_u32(4u),  R2, N, n0inv32);
+  let three_m = to_mont(u256_from_u32(3u),  R2, N, n0inv32);
+  let sixteen_m = to_mont(u256_from_u32(16u), R2, N, n0inv32);
+
+  // u = σ^2 - 5  (mont)
+  let sigma_sq_m = mont_sqr(sigma_m, N, n0inv32);
+  let u_m = mont_sub(sigma_sq_m, five_m, N);
+
+  // v = 4σ       (mont)
+  let v_m = mont_mul(four_m, sigma_m, N, n0inv32);
+
+  // Make sure u and v are invertible modulo N (probable prime in ECM context)
+  let u_std = from_mont(u_m, N, n0inv32);
+  let v_std = from_mont(v_m, N, n0inv32);
+  let inv_u = mod_inverse(u_std, N);
+  let inv_v = mod_inverse(v_std, N);
+  if (!inv_u.ok || !inv_v.ok) {
+    return CurveResult(false, set_zero(), set_zero()); // caller may GCD later
+  }
+
+  // X1 = u^3 / v^3  (mont)
+  let u_sq_m = mont_sqr(u_m, N, n0inv32);
+  let u_cubed_m = mont_mul(u_m, u_sq_m, N, n0inv32);
+
+  let v_sq_m = mont_sqr(v_m, N, n0inv32);
+  let v_cubed_m = mont_mul(v_m, v_sq_m, N, n0inv32);
+
+  // inv(v^3) in mont: invert standard, hop back in
+  let v3_std = from_mont(v_cubed_m, N, n0inv32);
+  let inv_v3 = mod_inverse(v3_std, N);
+  if (!inv_v3.ok) { return CurveResult(false, set_zero(), set_zero()); }
+  let inv_v3_m = to_mont(inv_v3.val, R2, N, n0inv32);
+
+  let X1m = mont_mul(u_cubed_m, inv_v3_m, N, n0inv32);
+
+  // A24 = (v-u)^3 (3u+v) / (16 u^3)  (mont)
+  let vm_u_m = mont_sub(v_m, u_m, N);
+  let vm_u_sq_m = mont_sqr(vm_u_m, N, n0inv32);
+  let vm_u_cubed_m = mont_mul(vm_u_m, vm_u_sq_m, N, n0inv32);
+
+  let three_u_m = mont_mul(three_m, u_m, N, n0inv32);
+  let three_u_plus_v_m = mont_add(three_u_m, v_m, N);
+
+  let numerator_m = mont_mul(vm_u_cubed_m, three_u_plus_v_m, N, n0inv32);
+  let denom_m = mont_mul(sixteen_m, u_cubed_m, N, n0inv32);
+
+  let denom_std = from_mont(denom_m, N, n0inv32);
+  let inv_denom = mod_inverse(denom_std, N);
+  if (!inv_denom.ok) { return CurveResult(false, set_zero(), set_zero()); }
+  let inv_denom_m = to_mont(inv_denom.val, R2, N, n0inv32);
+
+  let A24m = mont_mul(numerator_m, inv_denom_m, N, n0inv32);
+
+  return CurveResult(true, A24m, X1m);
+}
+
+// --------------------------- GCD (slow) ---------------------------
 fn gcd_u256(a_in: U256, b_in: U256) -> U256 {
   var a = a_in; var b = b_in;
   if (is_zero(a)) { return b; }
   if (is_zero(b)) { return a; }
-  let shift = min(ctz_u256(a), ctz_u256(b));
-  a = rshiftk(a, ctz_u256(a));
-  loop {
-    b = rshiftk(b, ctz_u256(b));
-    if (cmp(a,b) > 0) { let t=a; a=b; b=t; }
-    b = sub_u256(b, a);
-    if (is_zero(b)) { break; }
+  for (var iter=0u; iter<4096u; iter++){
+    if (is_zero(a)) { return b; }
+    if (is_zero(b)) { return a; }
+    if (cmp(a,b) >= 0) { a = sub_u256(a,b); } else { b = sub_u256(b,a); }
   }
-  return lshiftk(a, shift);
+  if (is_zero(a)) { return b; }
+  return a;
 }
 
-// ---- main compute ----
-@compute @workgroup_size(256)
+
+fn lshift1_from_add(x: U256) -> U256 {
+  return add_u256(x, x);
+}
+
+// Left shift by 'k' using either your lshift1_u256 or the add-based fallback.
+fn lshiftk_u256(mut x: U256, k: u32) -> U256 {
+  for (var i: u32 = 0u; i < k; i++) {
+    #if defined(HAVE_LSHIFT1_U256)
+      x = lshift1_u256(x);
+    #else
+      x = lshift1_from_add(x);
+    #endif
+  }
+  return x;
+}
+
+
+// Optimized variant when the RIGHT operand is known odd (ECM case: N is odd).
+// In this case, the common power of two is zero, so we can skip restoring 2^shift.
+fn gcd_binary_u256_oddN(a_in: U256, N_odd: U256) -> U256 {
+  var a = a_in;
+  var b = N_odd;
+
+  // Preconditions (safe even if not enforced):
+  // - b must be odd (N is odd). If not, fall back to general version.
+  if (is_zero(a)) { return b; }
+  // a may be even; strip its factors of two
+  while (is_even(a)) { a = rshift1_u256(a); }
+
+  // Main loop as before, but no need to track 'shift' or reintroduce it
+  loop {
+    if (is_zero(b)) { return a; } // gcd is a (already odd)
+    while (is_even(b)) { b = rshift1_u256(b); }
+    if (cmp_u256(a, b) > 0) { let t = a; a = b; b = t; }
+    b = sub_u256(b, a);
+  }
+}
+
+// --------------------------- Entry ---------------------------
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
-  if (idx >= params.num_curves) { return; }
+  let h = getHeader();
+  if (idx >= h.n_curves) { return; }
 
-  let C = packed.consts; // local alias
-  let inC = curves[idx];
+  // Load constants
+  var off = constOffset();
+  var N: U256; var R2: U256; var mont_one: U256;
+  for (var i=0u;i<8u;i++){ N.limbs[i] = io.words[off+i]; }        off += 8u;
+  for (var i=0u;i<8u;i++){ R2.limbs[i] = io.words[off+i]; }       off += 8u;
+  for (var i=0u;i<8u;i++){ mont_one.limbs[i] = io.words[off+i]; } off += 8u;
+  let n0inv32 = io.words[off];                                    off += 4u; // +pad(3)
 
-  var A24m = to_mont(inC.A24, C);
-  var X1m  = to_mont(inC.X1,  C);
+  let pp_off = ppOffset();
+  let out_base = outOffset(h) + idx * (8u + 1u + 3u);
 
-  var P = PointXZ(X1m, C.mont_one);
-  var R = P;
+  // RNG state (per curve)
+  var rng: vec2<u32>;
+  rng.x = h.seed_lo ^ idx ^ h.base_curve;
+  rng.y = h.seed_hi ^ (idx * 0x9E3779B9u);
 
-  for (var i=0u; i<params.pp_count; i++) {
-    let s = packed.primes[i];
-    if (s <= 1u) { continue; }
-    let T = ladder(R, s, A24m, C);
-    R = T;
+  // Curve generation
+  var A24m: U256;
+  var X1m : U256;
+  var curve_ok = false;
+
+  for (var tries:u32=0u; tries<4u && !curve_ok; tries++){
+    let sigma = next_sigma(N, &rng);
+    let cr = generate_curve(sigma, N, R2, n0inv32);
+    if (cr.ok) {
+      A24m = cr.A24m;
+      X1m  = cr.X1m;
+      curve_ok = true;
+    }
   }
 
-  var result = set_zero();
-  var status: u32 = 999u;
-  // var status:u32 = 0u;
+  if (!curve_ok) {
+    // status=3 => bad curve / inverse failed
+    for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = 0u; }
+    io.words[out_base+8u] = 3u;
+    return;
+  }
 
-  if (params.compute_gcd == 1u) {
-    status = 777u;
-    let Zstd = from_mont(R.Z, C);
-    let g = gcd_u256(Zstd, C.N);
+  // Stage 1 ladder
+  var P = PointXZ(X1m, mont_one);
+  var R = P;
+
+  for (var i=0u; i<h.pp_count; i++){
+    let pp = io.words[pp_off + i];
+    if (pp <= 1u) { continue; }
+    R = ladder(R, pp, A24m, N, n0inv32, mont_one);
+  }
+
+  // Output
+  var result = set_zero();
+  var status: u32 = 1u; // default: completed, no factor found
+
+  if ((h.flags & 1u) != 0u) {
+    let Zstd = from_mont(R.Z, N, n0inv32);
+    let g = gcd_binary_u256_oddN(Zstd, N);
     result = g;
 
     let one = set_one();
-    if (!is_zero(g) && (cmp(g, C.N) < 0) && (cmp(g, one) > 0)) {
-      status = 2u; // Found a non-trivial factor!
+    if (!is_zero(g) && (cmp(g, N) < 0) && (cmp(g, one) > 0)) {
+      status = 2u; // non-trivial factor found
     } else {
-      status = 1u; // No factor found
+      status = 1u; // no factor
     }
   } else {
-    result = from_mont(R.Z, C);
-    status = 888u;
-    // status = 0u;
+    result = from_mont(R.Z, N, n0inv32);
+    status = 1u;
   }
 
-  outBuf[idx].result = result;
-  outBuf[idx].status = status;
+  for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = result.limbs[i]; }
+  io.words[out_base+8u] = status;
 }

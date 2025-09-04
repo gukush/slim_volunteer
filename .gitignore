@@ -1,7 +1,7 @@
 server/certificates/*
 server/storage/*
 !server/certificates/.gitkeep
-
+server/uploads/*
 server/custom_tasks.json
 .env
 remove_emojis.sh

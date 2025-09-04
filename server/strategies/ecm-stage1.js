@@ -212,76 +212,6 @@ function computeMontgomeryConstants(N) {
   };
 }
 
-/* -------------------------- Curve generation (ECM) ------------------------ */
-
-function mod(a, n){ a %= n; return a < 0n ? a + n : a; }
-
-function egcd(a, b){
-  a = mod(a, b);
-  let old_r = b, r = a;
-  let old_s = 1n, s = 0n;
-  let old_t = 0n, t = 1n;
-  while (r !== 0n) {
-    const q = old_r / r;
-    [old_r, r] = [r, old_r - q*r];
-    [old_s, s] = [s, old_s - q*s];
-    [old_t, t] = [t, old_t - q*t];
-  }
-  return [old_r, old_s, old_t];
-}
-
-function modInv(a, n){
-  a = mod(a, n);
-  if (a === 0n) return null;
-  const [g, x] = egcd(a, n);
-  if (g !== 1n) return null;
-  return mod(x, n);
-}
-
-// Suyama parametrization for (A24, X1) on a Montgomery curve
-function generateRandomCurve(N, seed) {
-  let rng = BigInt(seed) & 0x7fffffffn;
-  function rand32(){ rng = (rng * 1103515245n + 12345n) & 0x7fffffffn; return rng; }
-  function nextSigma(){
-    let s = 0n;
-    for (let i=0;i<3;i++) s = (s << 21n) | rand32();
-    return mod(s, N);
-  }
-
-  const inv4 = modInv(4n, N);
-  for (let tries = 0; tries < 32; tries++){
-    const sigma = nextSigma();
-    if (sigma===0n) continue;
-    if (sigma===1n || sigma===N-1n) continue;
-    if (sigma===2n || sigma===N-2n) continue;
-
-    const u = mod(sigma*sigma - 5n, N);
-    const v = mod(4n*sigma, N);
-
-    const invu = modInv(u, N);
-    const invv = modInv(v, N);
-    if (!invu || !invv || !inv4) continue;
-
-    const vm_u   = mod(v - u, N);
-    const num    = mod(vm_u*vm_u % N * vm_u % N * mod(3n*u + v, N), N);
-    const den    = mod(4n * (u*u % N * u % N) % N * v, N);
-    const invDen = modInv(den, N);
-    if (!invDen) continue;
-
-    const A      = mod(num * invDen - 2n, N);
-    const A24    = mod((A + 2n) * inv4, N);
-
-    const u3     = mod(u*u % N * u % N, N);
-    const vInv   = modInv(v, N);
-    if (!vInv) continue;
-    const vInv3  = mod(vInv*vInv % N * vInv % N, N);
-    const X1     = mod(u3 * vInv3, N);
-
-    return { A24: bigIntToLimbs(A24), X1: bigIntToLimbs(X1) };
-  }
-  return generateRandomCurve(N, Number((BigInt(seed) + 777n) % 0x7fffffffn));
-}
-
 /* ------------------------------ Factor bag -------------------------------- */
 
 class FactorBag {
@@ -358,34 +288,35 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
         const endCurve = Math.min(startCurve + chunk_size, total_curves);
         const curvesInChunk = endCurve - startCurve;
 
-        // Deterministic curve params against Nred
-        const curves = [];
-        for(let i = 0; i < curvesInChunk; i++){
-          const curveIndex = startCurve + i;
-          curves.push(generateRandomCurve(Nred, curveIndex + 12345));
-        }
+        // --- header sizes (VERSION 2) ---
+        const HEADER_WORDS_V2 = 12;
+        const CONST_WORDS = 8*3 + 4;            // unchanged
+        const CURVE_OUT_WORDS_PER = 8 + 1 + 3;  // unchanged
 
-        // Layout: header + constants + primePowers + curveInputs + curveOutputs
-        const HEADER_WORDS = 8;
-        const CONST_WORDS = 8*3 + 4;             // N(8) + R2(8) + mont_one(8) + n0inv32 + pad(3)
+        // RNG seed (deterministic per chunk)
+        //const taskSeed64 = BigInt.asUintN(64, (BigInt(taskId.replace(/-/g,''), 16) ^ 0x9e3779b97f4a7c15n) + BigInt(chunkIndex));
+        const taskSeed64 = BigInt.asUintN(64, (BigInt('0x' + taskId.replace(/-/g,'')) ^ 0x9e3779b97f4a7c15n) + BigInt(chunkIndex));
+        const seed_lo = Number(taskSeed64 & 0xffffffffn) >>> 0;
+        const seed_hi = Number((taskSeed64 >> 32n) & 0xffffffffn) >>> 0;
+
         const pp_count = primePowers.length;
-        const CURVE_IN_WORDS_PER = 8*2;          // A24(8) + X1(8)
-        const CURVE_OUT_WORDS_PER = 8 + 1 + 3;   // result(8) + status + pad(3)
-
-        const totalWords = HEADER_WORDS + CONST_WORDS + pp_count +
-                          curvesInChunk * CURVE_IN_WORDS_PER +
-                          curvesInChunk * CURVE_OUT_WORDS_PER;
+        const totalWords = HEADER_WORDS_V2 + CONST_WORDS + pp_count
+                         + curvesInChunk * CURVE_OUT_WORDS_PER;
 
         const buffer = new Uint32Array(totalWords);
         let offset = 0;
 
-        // Header: magic, version, reserved, reserved, pp_count, n_curves, reserved, reserved
-        buffer[offset++] = 0x45434D31; // "ECM1"
-        buffer[offset++] = 1;
+        // Header v2
+        buffer[offset++] = 0x45434D31;    // "ECM1"
+        buffer[offset++] = 2;             // version = 2
         buffer[offset++] = 0;
         buffer[offset++] = 0;
         buffer[offset++] = pp_count;
         buffer[offset++] = curvesInChunk;
+        buffer[offset++] = seed_lo;
+        buffer[offset++] = seed_hi;
+        buffer[offset++] = startCurve;    // base_curve
+        buffer[offset++] = (config?.gcdMode ? 1 : 0);
         buffer[offset++] = 0;
         buffer[offset++] = 0;
 
@@ -394,42 +325,27 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
         buffer.set(constants.R2, offset);        offset += 8;
         buffer.set(constants.mont_one, offset);  offset += 8;
         buffer[offset++] = constants.n0inv32;
-        buffer[offset++] = 0; // pad
-        buffer[offset++] = 0; // pad
-        buffer[offset++] = 0; // pad
+        buffer[offset++] = 0; buffer[offset++] = 0; buffer[offset++] = 0;
 
         // Prime powers
         buffer.set(primePowers, offset);         offset += pp_count;
 
-        // Curve inputs
-        for(const curve of curves){
-          buffer.set(curve.A24, offset);         offset += 8;
-          buffer.set(curve.X1,  offset);         offset += 8;
-        }
+        // No curve inputs anymore
 
         // Reserve output space
         offset += curvesInChunk * CURVE_OUT_WORDS_PER;
 
         const payload = {
           data: buffer.buffer.slice(0),
-          dims: {
-            n: curvesInChunk,
-            pp_count,
-            total_words: totalWords
-          }
+          dims: { n: curvesInChunk, pp_count, total_words: totalWords }
         };
-
         const meta = {
-          chunkIndex,
-          startCurve,
-          endCurve,
-          n: curvesInChunk,
-          pp_count,
-          total_words: totalWords,
-          N: N_hex,                               // original N (for reporting)
-          reducedN: '0x' + Nred.toString(16),     // reduced N used by GPU
+          chunkIndex, startCurve, endCurve,
+          n: curvesInChunk, pp_count, total_words: totalWords,
+          N: N_hex,
+          reducedN: '0x' + Nred.toString(16),
           B1,
-          smallPrimeFactors: [...smallFactors.entries()].map(([p,k]) => [ '0x'+p.toString(16), k ])
+          rngSeed: '0x' + taskSeed64.toString(16)
         };
 
         yield {
@@ -504,12 +420,20 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }){
       const { n, pp_count } = meta;
       logger.debug(`Integrate ${chunkId}: n=${n}, pp_count=${pp_count}`);
 
-      const HEADER_WORDS = 8;
+      // Version-aware assembler
+      const version = u32[1] >>> 0;
+      const HEADER_WORDS_V1 = 8;
+      const HEADER_WORDS_V2 = 12;
       const CONST_WORDS = 8*3 + 4;
-      const CURVE_IN_WORDS_PER = 8*2;
-      const CURVE_OUT_WORDS_PER = 8 + 1 + 3; // result(8) + status + pad(3)
+      const CURVE_IN_WORDS_PER = 8*2;         // only used for v1
+      const CURVE_OUT_WORDS_PER = 8 + 1 + 3;
 
-      const outStart = HEADER_WORDS + CONST_WORDS + pp_count + n * CURVE_IN_WORDS_PER;
+      let outStart;
+      if (version >= 2) {
+        outStart = HEADER_WORDS_V2 + CONST_WORDS + pp_count;
+      } else {
+        outStart = HEADER_WORDS_V1 + CONST_WORDS + pp_count + n * CURVE_IN_WORDS_PER;
+      }
       console.log(`Parsing results starting at word ${outStart}, buffer length: ${u32.length}`);
 
       const chunkResults = [];
