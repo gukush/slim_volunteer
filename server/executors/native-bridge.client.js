@@ -9,6 +9,19 @@ const logger = {
   debug: (msg, data) => console.log(`[${new Date().toISOString()}] [BRIDGE-DEBUG] ${msg}`, data || ''),
 };
 
+function computeVulkanGroups(uniforms, localSize) {
+  if (!uniforms || uniforms.length < 3) return null;
+  const rows = Number(uniforms[0]);
+  const cols = Number(uniforms[2]);
+  const lx = Math.max(1, Number(localSize?.x ?? 16));
+  const ly = Math.max(1, Number(localSize?.y ?? 16));
+  const lz = Math.max(1, Number(localSize?.z ?? 1));
+  const gx = Math.max(1, Math.ceil(cols / lx));
+  const gy = Math.max(1, Math.ceil(rows / ly));
+  const gz = 1; // single layer
+  return [gx, gy, gz];
+}
+
 export function createExecutor({ kernels, config }) {
   logger.debug('Configuration:', config);
   logger.debug('Kernels available:', kernels?.map(k => k.name) || []);
@@ -248,7 +261,7 @@ export function createExecutor({ kernels, config }) {
         action: 'compile_and_run',
         framework: 'opencl',
         source: src,
-        entry: config?.entry || 'main',
+        entry: config?.entry || 'execute_task',
         global, local, uniforms, inputs, outputSizes
       };
     }
@@ -289,6 +302,12 @@ export function createExecutor({ kernels, config }) {
       logger.info(`📦 Total inputs: ${inputs.length}`);
 
       const outputSizes = meta?.outputSizes || config?.outputSizes || [1024];
+      const localSize = {
+        x: Number(config?.localSizeX ?? 16),
+        y: Number(config?.localSizeY ?? 16),
+        z: Number(config?.localSizeZ ?? 1),
+      };
+      const g = computeVulkanGroups(uniforms, localSize);
       const groups = meta?.groups || config?.groups || [1,1,1];
 
       logger.debug('Vulkan parameters:', { groups, uniforms, outputSizes });

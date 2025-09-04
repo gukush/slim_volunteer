@@ -3,6 +3,7 @@ import * as blockMatmul from '../strategies/block-matmul.js';
 import * as blockMatmulFlex from '../strategies/block-matmul-flex.js';
 import * as nativeBlockMatmul from '../strategies/native-block-matmul.js';
 import * as ecmStage1 from '../strategies/ecm-stage1.js';
+import * as distributedSort from '../strategies/distributed-sort.js'; // Add this line
 
 const strategies = new Map();
 
@@ -12,8 +13,9 @@ function register(strategy) {
 
 register(blockMatmul);
 register(blockMatmulFlex);
-register(nativeBlockMatmul);  // Add the new native strategy
+register(nativeBlockMatmul);
 register(ecmStage1);
+register(distributedSort); // Add this line
 
 export function listStrategies() {
   return Array.from(strategies.keys());
