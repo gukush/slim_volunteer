@@ -49,7 +49,17 @@ const io = new SocketIOServer(server, {
 // Raw WebSocket server for native clients - IMPORTANT: different server instance
 const wss = new WebSocketServer({
   port: PORT + 1, // Use different port to avoid conflicts
-  path: '/ws-native'
+  path: '/ws-native',
+  maxPayload: 1e9
+});
+
+// Add debugging for WebSocket server events
+wss.on('listening', () => {
+  logger.info('🚀 WebSocket server is listening on port', PORT + 1);
+});
+
+wss.on('error', (error) => {
+  logger.error('❌ WebSocket server error:', error);
 });
 
 logger.info(`Socket.IO will be available on port ${PORT}`);
@@ -73,63 +83,167 @@ io.on('connection', (socket)=>{
 // Raw WebSocket handlers (native clients only)
 wss.on('connection', (ws, req) => {
   logger.info('Native client connected via WebSocket');
+  logger.info('WebSocket connection details:', { url: req.url, headers: req.headers });
 
-  // Generate a unique ID for this WebSocket connection
+  // Unique ID + mark as native
   ws.id = `native_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  ws.kind = 'native';
 
-  // FIXED: Properly add emit method without breaking native send
-  ws.emit = (event, data) => {
+  // Compact send helper (keeps your {type,data} envelope)
+  const send = (type, data) => {
     if (ws.readyState === ws.OPEN) {
-      const message = { type: event, data: data };
-      ws.send(JSON.stringify(message)); // Use native send method
+      const message = JSON.stringify({ type, data });
+      logger.debug(`Sending to native client ${ws.id}: ${type}`);
+      ws.send(message);
     }
   };
 
+  // Keep your "emit" shim (uses native send under the hood)
+  ws.emit = (event, data) => send(event, data);
+
+  // --- helper: announce workload (with artifacts) to this native client
+  const sendWorkloadNew = (taskId) => {
+    try {
+      const header = tm.getWorkloadHeader(taskId, { includeArtifacts: true });
+      const artifacts = (header.artifacts || []).map(a => ({
+        type: a.type,                         // 'binary' (future: 'text', etc.)
+        name: a.name,                         // filename
+        program: a.program,                   // logical program name
+        backend: a.backend,                   // 'opencl' | 'cuda' | 'vulkan'
+        exec: !!a.exec,                       // executable hint
+        size: Buffer.isBuffer(a.bytes) ? a.bytes.length : (a.bytes?.length || 0),
+        encoding: 'base64',
+        bytes: Buffer.isBuffer(a.bytes) ? a.bytes.toString('base64') : a.bytes // allow pre-base64
+      }));
+
+      send('workload:new', {
+        taskId: header.taskId,
+        framework: header.framework,          // e.g. 'native-opencl'
+        schema: header.schema,                // { order, uniforms, inputs, outputs }
+        kernels: header.kernels || [],        // optional FYI
+        artifacts                             // <-- shipped here
+      });
+
+      // Optional: explicit readiness ping back to client
+      send('workload:ready', { taskId: header.taskId });
+    } catch (err) {
+      logger.error('Failed to build/send workload header for native client:', err);
+      send('error', { message: err?.message || String(err) });
+    }
+  };
+
+  // SINGLE message handler - clean and simple
   ws.on('message', (data) => {
     try {
-      const message = JSON.parse(data.toString());
+      // Handle both string and Buffer data
+      let messageStr;
+      if (Buffer.isBuffer(data)) {
+        messageStr = data.toString('utf8');
+      } else {
+        messageStr = data.toString();
+      }
+
+      logger.info(`📨 Native client ${ws.id} message:`, messageStr.substring(0, 100) + '...');
+
+      const message = JSON.parse(messageStr);
       const { type, data: eventData } = message;
 
-      logger.debug('Native client message:', type);
+      logger.debug(`Processing message type: ${type}`);
 
       switch (type) {
-        case 'client:join':
-          tm.registerClient(ws, eventData || {}, 'native');
+        case 'client:join': {
+          const data = eventData || {};
+          // normalize frameworks & strategies
+          const frameworks = data.frameworks || data.supportedFrameworks || [];
+          const strategies = data.strategies || data.supportedStrategies || [];
+          const normalized = { ...data, frameworks, strategies };
+          logger.info(`Native client ${ws.id} joining with data:`, normalized);
+          tm.registerClient(ws, normalized, 'native');
+          send('client:join:ack', { clientId: ws.id });
+
+          // If client already knows which task it wants, announce immediately
+          if (eventData?.taskId) {
+            logger.info(`Client requested task ${eventData.taskId} on join`);
+            sendWorkloadNew(eventData.taskId);
+          }
           break;
-        case 'task:request':
-          // Handle task requests if needed
+        }
+
+        // Preferred explicit subscribe for a task's workload header + artifacts
+        case 'workload:subscribe': {
+          const taskId = eventData?.taskId;
+          if (!taskId) {
+            logger.warn('workload:subscribe missing taskId');
+            return send('error', { message: 'workload:subscribe requires taskId' });
+          }
+          logger.info(`Client ${ws.id} subscribing to workload ${taskId}`);
+          sendWorkloadNew(taskId);
           break;
+        }
+
+        // Back-compat: if client asks for a task and provides taskId, treat it like subscribe
+        case 'task:request': {
+          const taskId = eventData?.taskId;
+          if (taskId) {
+            logger.info(`Client ${ws.id} requesting task ${taskId}`);
+            sendWorkloadNew(taskId);
+          }
+          break;
+        }
+
         case 'task:complete':
+          logger.info(`Client ${ws.id} completed task`);
           tm.receiveTaskResult(ws.id, eventData);
           break;
+
         case 'workload:done':
+          logger.info(`Client ${ws.id} completed workload`);
           tm.receiveWorkloadResult(ws.id, eventData);
           break;
+
         case 'workload:chunk_done_enhanced':
+          logger.debug(`Client ${ws.id} completed chunk`);
           tm.receiveChunkResult(ws.id, eventData);
           break;
+
         case 'workload:error':
+          logger.error(`Client ${ws.id} reported error:`, eventData);
           tm.receiveError(ws.id, eventData);
           break;
+
         case 'workload:chunk_error':
+          logger.error(`Client ${ws.id} reported chunk error:`, eventData);
           tm.receiveChunkError(ws.id, eventData);
           break;
+
         default:
-          logger.warn('Unknown native client message type:', type);
+          logger.warn(`Unknown message type from ${ws.id}: ${type}`);
+          send('error', { message: `Unknown message type: ${type}` });
       }
     } catch (e) {
-      logger.error('Error parsing native client message:', e);
+      logger.error(`Error parsing message from ${ws.id}:`, e);
+      send('error', { message: 'Failed to parse message' });
     }
   });
 
-  ws.on('close', () => {
-    logger.info('Native client disconnected');
+  ws.on('close', (code, reason) => {
+    logger.info(`Native client ${ws.id} disconnected:`, code, reason?.toString());
     tm.removeClient(ws.id);
   });
 
   ws.on('error', (error) => {
-    logger.error('Native WebSocket error:', error);
+    logger.error(`Native WebSocket ${ws.id} error:`, error);
   });
+
+  // Send initial test message after connection established
+  setTimeout(() => {
+    logger.info(`Sending welcome message to ${ws.id}`);
+    send('welcome', {
+      message: 'Connected to server',
+      clientId: ws.id,
+      timestamp: Date.now()
+    });
+  }, 100);
 });
 
 // REST API endpoints (unchanged)
@@ -216,20 +330,25 @@ app.post('/tasks', (req, res)=>{
   bb.on('field', (name, val)=>{ fields[name] = val; });
 
   bb.on('finish', ()=>{
-    try{
-      const strategyId = fields.strategyId;
-      const K = fields.K ? parseInt(fields.K,10) : 1;
-      const label = fields.label || 'task';
-      const config = fields.config ? JSON.parse(fields.config) : {};
-      const inputArgs = fields.inputArgs ? JSON.parse(fields.inputArgs) : {};
-      getStrategy(strategyId);
-      const desc = tm.createTask({ strategyId, K, label, config, inputArgs, inputFiles: files });
-      res.json(desc);
-    }catch(e){
-      logger.error('Create task error', e);
-      res.status(400).json({ error: e.message });
-    }
+    // Use setTimeout to ensure all file processing is complete
+    setTimeout(() => {
+      logger.info(`Processing task: files.length=${files.length}, fields=${JSON.stringify(fields)}`);
+      try{
+        const strategyId = fields.strategyId;
+        const K = fields.K ? parseInt(fields.K,10) : 1;
+        const label = fields.label || 'task';
+        const config = fields.config ? JSON.parse(fields.config) : {};
+        const inputArgs = fields.inputArgs ? JSON.parse(fields.inputArgs) : {};
+        getStrategy(strategyId);
+        const desc = tm.createTask({ strategyId, K, label, config, inputArgs, inputFiles: files });
+        res.json(desc);
+      }catch(e){
+        logger.error('Create task error', e);
+        res.status(400).json({ error: e.message });
+      }
+    }, 500); // 500ms delay to ensure file processing completes
   });
+
 
   req.pipe(bb);
 });

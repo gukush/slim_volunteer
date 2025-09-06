@@ -19,7 +19,7 @@ const readyTasks = new Set();
 socket.on('connect', ()=>{
   statusEl.textContent = 'connected';
   log('info', 'Connected', socket.id);
-  const frameworks = ['cuda','vulkan','opencl'];
+  const frameworks = ['cuda','vulkan','opencl','cpp-wasm'];
   if('gpu' in navigator) frameworks.push('webgpu');
   const capacity = Number(qs.cap || qs.capacity || 1);
   socket.emit('hello', { workerId: qs.workerId || socket.id, frameworks, capacity });

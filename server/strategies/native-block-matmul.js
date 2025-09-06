@@ -1,29 +1,28 @@
-// strategies/native-block-matmul.js
+// strategies/native-block-matmul.js (Fixed version)
 import fs from 'fs';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../lib/logger.js';
 
 export const id = 'native-block-matmul';
-export const name = 'Native Block Matrix Multiplication (CPU/GPU Binary Execution)';
+export const name = 'Native Block Matrix Multiplication (Binary Execution)';
 
 export function getClientExecutorInfo(config) {
-  const framework = (config?.framework || 'cuda').toLowerCase();
+  const framework = (config?.framework || 'native-cuda').toLowerCase();
 
-  // For native clients, we return the kernel/binary info they need
   switch (framework) {
-    case 'cuda':
+    case 'native-cuda':
       return {
         framework: 'cuda',
-        path: 'executors/native-bridge.client.js', // Not used by native clients
+        path: 'executors/native-bridge.client.js',
         kernels: ['kernels/block_matrix_multiply_cuda_kernel.cu'],
         schema: {
           action: 'compile_and_run',
-          inputs: ['float32[]', 'float32[]', 'int32[]'], // A, B, dims
-          outputs: ['float32[]'] // result
+          inputs: ['float32[]', 'float32[]', 'int32[]'],
+          outputs: ['float32[]']
         }
       };
-    case 'opencl':
+    case 'native-opencl':
       return {
         framework: 'opencl',
         path: 'executors/native-bridge.client.js',
@@ -34,7 +33,7 @@ export function getClientExecutorInfo(config) {
           outputs: ['float32[]']
         }
       };
-    case 'vulkan':
+    case 'native-vulkan':
       return {
         framework: 'vulkan',
         path: 'executors/native-bridge.client.js',
@@ -49,7 +48,7 @@ export function getClientExecutorInfo(config) {
       return {
         framework: 'cpu',
         path: 'executors/native-bridge.client.js',
-        kernels: [], // CPU doesn't need kernels
+        kernels: [],
         schema: {
           action: 'cpu_matmul',
           inputs: ['float32[]', 'float32[]', 'int32[]'],
@@ -61,7 +60,7 @@ export function getClientExecutorInfo(config) {
   }
 }
 
-// Helper functions (reuse from block-matmul-flex.js)
+// Helper functions (copied from block-matmul-flex.js)
 function toF32(x) {
   if (x instanceof ArrayBuffer) return new Float32Array(x);
   if (ArrayBuffer.isView(x)) return new Float32Array(x.buffer, x.byteOffset, Math.floor(x.byteLength / 4));
@@ -73,153 +72,28 @@ function toF32(x) {
   throw new Error('Unsupported buffer type for Float32 view');
 }
 
-function readWindow(fd, rowStart, rowCount, colStart, colCount, rowLen, elementSize = 4) {
-  const out = Buffer.alloc(rowCount * colCount * elementSize);
-  const rowBytes = colCount * elementSize;
-  for (let r = 0; r < rowCount; r++) {
-    const srcOff = ((rowStart + r) * rowLen + colStart) * elementSize;
-    const dstOff = r * rowBytes;
-    fs.readSync(fd, out, dstOff, rowBytes, srcOff);
-  }
-  return out;
-}
-
+// ASYNC row-major window reader (fixed from sync version)
 async function readWindowAsync(filePath, rowStart, rowCount, colStart, colCount, rowLen, elementSize = 4) {
   const out = Buffer.alloc(rowCount * colCount * elementSize);
   const rowBytes = colCount * elementSize;
 
-  // Use streaming instead of synchronous reads
-  const fileHandle = await fs.open(filePath, 'r');
-
+  const fileHandle = await fs.promises.open(filePath, 'r');
   try {
     for (let r = 0; r < rowCount; r++) {
       const srcOff = ((rowStart + r) * rowLen + colStart) * elementSize;
       const dstOff = r * rowBytes;
-
-      // Async read with small buffer
-      const { buffer } = await fileHandle.read(out, dstOff, rowBytes, srcOff);
+      await fileHandle.read(out, dstOff, rowBytes, srcOff);
     }
   } finally {
     await fileHandle.close();
   }
-
   return out;
 }
-
-// Updated chunker with async operations and better memory management
-export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
-  const Afile = inputFiles.find(f => /A\.bin$/i.test(f.originalName))?.path || inputFiles[0]?.path;
-  const Bfile = inputFiles.find(f => /B\.bin$/i.test(f.originalName))?.path || inputFiles[1]?.path;
-  if (!Afile || !Bfile) throw new Error('Need A.bin and B.bin');
-
-  const { N, K: KK, M } = config;
-
-  // Use much larger chunks for massive matrices
-  const C = Number(config.chunk_size ?? config.C ?? 134217728); // Default 128MB
-  let baseRows, baseCols, kSpan;
-
-  if (config.tileSize || config.kTileSize) {
-    const ts = Math.max(1, Number(config.tileSize || 512)); // Increased default
-    const ks = Math.max(1, Number(config.kTileSize || Math.min(KK, ts)));
-    baseRows = ts; baseCols = ts; kSpan = Math.min(ks, KK);
-  } else {
-    const pick = pickTileParams({ N, M, K: KK, C });
-    baseRows = pick.rows; baseCols = pick.cols; kSpan = pick.kTileSize;
-  }
-
-  const nIB = Math.ceil(N / baseRows);
-  const nJB = Math.ceil(M / baseCols);
-  const totalChunks = nIB * nJB * Math.ceil(KK / kSpan);
-
-  logger.info(`Chunker: ${nIB}×${nJB}×${Math.ceil(KK/kSpan)} = ${totalChunks.toLocaleString()} chunks`);
-
-  // Prevent excessive chunk counts
-  if (totalChunks > 500000) {
-    throw new Error(`Too many chunks: ${totalChunks.toLocaleString()}. Increase chunk_size to at least ${Math.ceil(C * totalChunks / 500000)} bytes`);
-  }
-
-  return {
-    async *stream() {
-      let chunkCount = 0;
-
-      for (let ib = 0; ib < nIB; ib++) {
-        const rNow = Math.min(baseRows, N - ib * baseRows);
-
-        for (let jb = 0; jb < nJB; jb++) {
-          const cNow = Math.min(baseCols, M - jb * baseCols);
-
-          for (let kb = 0; kb < KK; kb += kSpan) {
-            const kNow = Math.min(kSpan, KK - kb);
-
-            try {
-              // ASYNC file reading - won't block event loop
-              const [Ablock, Bblock] = await Promise.all([
-                readWindowAsync(Afile, ib * baseRows, rNow, kb, kNow, KK, 4),
-                readWindowAsync(Bfile, kb, kNow, jb * baseCols, cNow, M, 4)
-              ]);
-
-              const payload = {
-                a: Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength),
-                b: Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength),
-                dims: { rows: rNow, K: kNow, cols: cNow },
-              };
-
-              const meta = {
-                ib, jb, kb, kSpan: kNow, rows: rNow, cols: cNow, baseRows, baseCols,
-                // Native execution parameters
-                outputSizes: [rNow * cNow * 4],
-                uniforms: [rNow, kNow, cNow]
-              };
-
-              // Add framework-specific parameters
-              const fw = (config.framework || '').toLowerCase();
-              if (fw === 'native-cuda') {
-                meta.grid = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
-                meta.block = [16, 16, 1];
-              } else if (fw === 'native-opencl') {
-                meta.global = [cNow, rNow, 1];
-                meta.local = [16, 16, 1];
-              } else if (fw === 'native-vulkan') {
-                meta.groups = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
-              }
-
-              yield {
-                id: `${taskId}_${ib}_${jb}_${kb}`,
-                payload,
-                meta,
-                tCreate: Date.now()
-              };
-
-              chunkCount++;
-
-              // Progress logging for large tasks
-              if (chunkCount % 1000 === 0) {
-                logger.info(`Generated ${chunkCount.toLocaleString()}/${totalChunks.toLocaleString()} chunks`);
-              }
-
-              // Yield control periodically to prevent event loop blocking
-              if (chunkCount % 100 === 0) {
-                await new Promise(resolve => setImmediate(resolve));
-              }
-
-            } catch (error) {
-              logger.error(`Chunk generation failed at (${ib},${jb},${kb}):`, error.message);
-              throw error;
-            }
-          }
-        }
-      }
-
-      logger.info(`block-matmul-flex chunker completed: ${chunkCount.toLocaleString()} chunks`);
-    }
-  };
-}
-
 
 function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }) {
   const Cn = Math.max(3, Math.floor(Number(C) || 0));
   if (!Cn || !Number.isFinite(Cn)) {
-    return { rows: Math.min(N, 256), cols: Math.min(M, 256), kTileSize: Math.min(K, 256) };
+    return { rows: Math.min(N, 512), cols: Math.min(M, 512), kTileSize: Math.min(K, 512) };
   }
   const C_out = Math.max(1, Math.floor(outFrac * Cn));
   const C_in = Math.max(1, Cn - C_out);
@@ -239,120 +113,167 @@ function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }) {
 
   return { rows, cols, kTileSize: kSpan };
 }
-/*
+
+function pickInputs(files, N, K, M) {
+  if (!files || files.length < 2) throw new Error('No input files uploaded');
+
+  const nameOf = f => f.originalName || (f.path ? path.basename(f.path) : '');
+  const endsWithA = f => /(^|[_\-])A\.bin$/i.test(nameOf(f));
+  const endsWithB = f => /(^|[_\-])B\.bin$/i.test(nameOf(f));
+
+  let Af = files.find(endsWithA);
+  let Bf = files.find(endsWithB);
+  if (Af && Bf) return [Af.path, Bf.path];
+
+  // Size-based fallback
+  const withSize = files.map(f => ({ ...f, size: f.size ?? (f.path ? fs.statSync(f.path).size : 0) }));
+  const targetA = BigInt(N) * BigInt(K) * 4n;
+  const targetB = BigInt(K) * BigInt(M) * 4n;
+  const closest = target => withSize.reduce((best, cur) => {
+    const s = BigInt(cur.size);
+    const d = s > target ? s - target : target - s;
+    return (!best || d < best.diff) ? { diff: d, f: cur } : best;
+  }, null)?.f;
+
+  Af = Af || closest(targetA);
+  Bf = Bf || closest(targetB);
+
+  if (!Af || !Bf || Af.path === Bf.path) {
+    if (files[0]?.path && files[1]?.path) return [files[0].path, files[1].path];
+    throw new Error('Need two input files');
+  }
+  return [Af.path, Bf.path];
+}
+
+// Fixed chunker with proper async operations
 export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
-  const Afile = inputFiles.find(f => /A\.bin$/i.test(f.originalName))?.path || inputFiles[0]?.path;
-  const Bfile = inputFiles.find(f => /B\.bin$/i.test(f.originalName))?.path || inputFiles[1]?.path;
-  if (!Afile || !Bfile) throw new Error('Need A.bin and B.bin input files');
-
+  const [Afile, Bfile] = pickInputs(inputFiles, config.N, config.K, config.M);
   const { N, K: KK, M } = config;
-  const framework = (config.framework || 'cuda').toLowerCase();
 
-  // Choose tile sizes
-  const C = Number(config.chunk_size ?? config.C);
+  // Use same tile parameter logic as block-matmul-flex.js
+  const C = Number(config.chunk_size ?? config.C ?? 16777216); // 16MB default
   let baseRows, baseCols, kSpan;
+
   if (config.tileSize || config.kTileSize) {
     const ts = Math.max(1, Number(config.tileSize || 256));
     const ks = Math.max(1, Number(config.kTileSize || Math.min(KK, ts)));
     baseRows = ts; baseCols = ts; kSpan = Math.min(ks, KK);
   } else {
-    const pick = pickTileParams({ N, M, K: KK, C: C || 8*1024*1024 });
+    const pick = pickTileParams({ N, M, K: KK, C });
     baseRows = pick.rows; baseCols = pick.cols; kSpan = pick.kTileSize;
   }
 
-  const fdA = fs.openSync(Afile, 'r');
-  const fdB = fs.openSync(Bfile, 'r');
   const nIB = Math.ceil(N / baseRows);
   const nJB = Math.ceil(M / baseCols);
+  const totalChunks = nIB * nJB * Math.ceil(KK / kSpan);
+
+  logger.info(`Native chunker: ${nIB}×${nJB}×${Math.ceil(KK/kSpan)} = ${totalChunks.toLocaleString()} chunks`);
 
   return {
     async *stream() {
+      let chunkCount = 0;
+
       for (let ib = 0; ib < nIB; ib++) {
         const rNow = Math.min(baseRows, N - ib * baseRows);
+
         for (let jb = 0; jb < nJB; jb++) {
           const cNow = Math.min(baseCols, M - jb * baseCols);
+
           for (let kb = 0; kb < KK; kb += kSpan) {
             const kNow = Math.min(kSpan, KK - kb);
 
-            // Read matrix blocks
-            const Ablock = readWindow(fdA, ib * baseRows, rNow, kb, kNow, KK, 4);
-            const Bblock = readWindow(fdB, kb, kNow, jb * baseCols, cNow, M, 4);
+            try {
+              // ASYNC file reading (fixed)
+              const [Ablock, Bblock] = await Promise.all([
+                readWindowAsync(Afile, ib * baseRows, rNow, kb, kNow, KK, 4),
+                readWindowAsync(Bfile, kb, kNow, jb * baseCols, cNow, M, 4)
+              ]);
 
-            // Create dimensions array for native clients
-            const dims = new Int32Array([rNow, kNow, cNow]);
-            const dimsBuffer = Buffer.from(dims.buffer);
+              // Prepare data for native client (compatible with server_client.cpp format)
+              const dims = new Int32Array([rNow, kNow, cNow]);
 
-            // Prepare payload for native clients
-            const payload = {
-              // For native clients: binary data + dimensions
-              action: framework === 'cpu' ? 'cpu_matmul' : 'compile_and_run',
-              framework: framework,
-              source: framework !== 'cpu' ? getKernelSource(framework) : undefined,
-              inputs: [
-                Array.from(new Uint8Array(Ablock)), // A matrix as byte array
-                Array.from(new Uint8Array(Bblock)), // B matrix as byte array
-                Array.from(new Uint8Array(dimsBuffer)) // dimensions as byte array
-              ],
-              outputSizes: [rNow * cNow * 4], // Expected output size in bytes
-              // Keep original format for compatibility with existing executors
-              a: Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength),
-              b: Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength),
-              dims: { rows: rNow, K: kNow, cols: cNow }
-            };
+              // Convert to base64 for JSON transport (matching server_client.cpp expectations)
+              const aBase64 = Ablock.toString('base64');
+              const bBase64 = Bblock.toString('base64');
+              const dimsBase64 = Buffer.from(dims.buffer).toString('base64');
 
-            const meta = {
-              ib, jb, kb,
-              kSpan: kNow,
-              rows: rNow,
-              cols: cNow,
-              baseRows,
-              baseCols,
-              framework,
-              // Native execution parameters
-              outputSizes: [rNow * cNow * 4],
-              uniforms: [rNow, kNow, cNow]
-            };
+              const framework = (config.framework || 'native-cuda').toLowerCase();
 
-            // Add framework-specific execution parameters
-            if (framework === 'cuda') {
-              meta.grid = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
-              meta.block = [16, 16, 1];
-            } else if (framework === 'opencl') {
-              meta.global = [cNow, rNow, 1];
-              meta.local = [16, 16, 1];
-            } else if (framework === 'vulkan') {
-              meta.groups = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
+              const payload = {
+                // Native client format (matching server_client.cpp)
+                action: framework === 'cpu' ? 'cpu_matmul' : 'compile_and_run',
+                framework: framework.replace('native-', ''),
+                entry: 'main',
+                inputs: [
+                  { data: aBase64 },  // A matrix
+                  { data: bBase64 },  // B matrix
+                  { data: dimsBase64 } // dimensions
+                ],
+                outputSizes: [rNow * cNow * 4],
+                uniforms: [rNow, kNow, cNow],
+
+                // Keep compatibility fields for other executors
+                a: Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength),
+                b: Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength),
+                dims: { rows: rNow, K: kNow, cols: cNow }
+              };
+
+              const meta = {
+                ib, jb, kb, kSpan: kNow, rows: rNow, cols: cNow, baseRows, baseCols,
+                framework,
+                outputSizes: [rNow * cNow * 4],
+                uniforms: [rNow, kNow, cNow]
+              };
+
+              // Add framework-specific execution parameters
+              if (framework === 'native-cuda') {
+                meta.grid = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
+                meta.block = [16, 16, 1];
+                payload.grid = meta.grid;
+                payload.block = meta.block;
+              } else if (framework === 'native-opencl') {
+                meta.global = [cNow, rNow, 1];
+                meta.local = [16, 16, 1];
+                payload.global = meta.global;
+                payload.local = meta.local;
+              } else if (framework === 'native-vulkan') {
+                meta.groups = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
+                payload.groups = meta.groups;
+              }
+
+              yield {
+                id: uuidv4(),
+                payload,
+                meta,
+                tCreate: Date.now()
+              };
+
+              chunkCount++;
+
+              // Progress logging
+              if (chunkCount % 100 === 0) {
+                logger.info(`Generated ${chunkCount.toLocaleString()}/${totalChunks.toLocaleString()} chunks`);
+              }
+
+              // Yield control to prevent event loop blocking
+              if (chunkCount % 25 === 0) {
+                await new Promise(resolve => setImmediate(resolve));
+              }
+
+            } catch (error) {
+              logger.error(`Native chunk generation failed at (${ib},${jb},${kb}):`, error.message);
+              throw error;
             }
-
-            yield { id: uuidv4(), payload, meta, tCreate: Date.now() };
           }
         }
       }
-      fs.closeSync(fdA);
-      fs.closeSync(fdB);
-      logger.info('native-block-matmul chunker done');
+
+      logger.info(`Native chunker completed: ${chunkCount.toLocaleString()} chunks`);
     }
   };
 }
-*/
-function getKernelSource(framework) {
-  const kernelPaths = {
-    'cuda': 'kernels/block_matrix_multiply_cuda_kernel.cu',
-    'opencl': 'kernels/block_matrix_multiply_opencl_kernel.cl',
-    'vulkan': 'kernels/block_matrix_multiply_vulkan_compute.glsl'
-  };
 
-  const kernelPath = kernelPaths[framework];
-  if (!kernelPath) return undefined;
-
-  try {
-    return fs.readFileSync(path.join(process.cwd(), kernelPath), 'utf-8');
-  } catch (e) {
-    logger.warn(`Could not read kernel source for ${framework}:`, e.message);
-    return undefined;
-  }
-}
-
+// Fixed assembler (same as block-matmul-flex.js)
 export function buildAssembler({ taskId, taskDir, config }) {
   const { N, M, K } = config;
   const outPath = path.join(taskDir, 'output.bin');
@@ -385,13 +306,18 @@ export function buildAssembler({ taskId, taskDir, config }) {
       const k = key(ib, jb);
       if (!sizes.has(k)) sizes.set(k, { rows, cols, baseRows, baseCols });
 
-      // Handle result from native clients (might be byte array)
+      // Handle result from native clients (base64 or binary)
       let part;
-      if (Array.isArray(result)) {
-        // Convert byte array back to Float32Array
+      if (typeof result === 'string') {
+        // Base64 encoded result from native client
+        const buffer = Buffer.from(result, 'base64');
+        part = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
+      } else if (Array.isArray(result)) {
+        // Byte array from native client
         const uint8Array = new Uint8Array(result);
         part = new Float32Array(uint8Array.buffer);
       } else {
+        // Direct binary data
         part = toF32(result);
       }
 
@@ -403,7 +329,9 @@ export function buildAssembler({ taskId, taskDir, config }) {
       }
 
       // Accumulate partial result
-      for (let i = 0; i < part.length; i++) tile[i] += part[i];
+      for (let i = 0; i < Math.min(part.length, tile.length); i++) {
+        tile[i] += part[i];
+      }
 
       const soFar = (progressedK.get(k) || 0) + kSpan;
       progressedK.set(k, soFar);
@@ -416,6 +344,7 @@ export function buildAssembler({ taskId, taskDir, config }) {
         sizes.delete(k);
       }
     },
+
     finalize() {
       // Flush remaining tiles
       for (const [k, tile] of acc) {

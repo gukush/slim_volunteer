@@ -11,28 +11,31 @@ export const name = 'Block Matmul (switchable framework, chunked, streaming)';
 // ---------- Executor selection (kept compatible with your previous version) ----------
 export function getClientExecutorInfo(config){
   const fw = (config?.framework || 'webgpu').toLowerCase();
+  if (fw === 'cpp-wasm') {
+    return { framework:'cpp-wasm', path:'executors/wasm-block-matmul.client.js', kernels:['kernels/cpp/block_matmul.js'] };
+  }
   if (fw === 'webgpu') {
-    return { framework:'webgpu', path:'executors/webgpu-block-matmul.client.js', kernels:['kernels/block_matmul.wgsl'] };
+    return { framework:'webgpu', path:'executors/webgpu-block-matmul.client.js', kernels:['kernels/webgpu/block_matmul.wgsl'] };
   }
   if (fw === 'webgl2') {
     return { framework:'webgl2', path:'executors/webgl2-block-matmul.client.js', kernels:[
-      'kernels/block_matrix_multiply_webgl_vertex.glsl',
-      'kernels/block_matrix_multiply_webgl_fragment.glsl'
+      'kernels/webgl/block_matrix_multiply_webgl_vertex.glsl',
+      'kernels/webgl/block_matrix_multiply_webgl_fragment.glsl'
     ]};
   }
   if (fw === 'native-cuda') {
     return { framework:'cuda', path:'executors/native-bridge.client.js', kernels:[
-      'kernels/block_matrix_multiply_cuda_kernel.cu'
+      'kernels/cuda/block_matrix_multiply_cuda_kernel.cu'
     ]};
   }
   if (fw === 'native-opencl') {
     return { framework:'opencl', path:'executors/native-bridge.client.js', kernels:[
-      'kernels/block_matrix_multiply_opencl_kernel.cl'
+      'kernels/opencl/block_matrix_multiply_opencl_kernel.cl'
     ]};
   }
   if (fw === 'native-vulkan') {
     return { framework:'vulkan', path:'executors/native-bridge.client.js', kernels:[
-      'kernels/block_matrix_multiply_vulkan_compute.glsl'
+      'kernels/vulkan/block_matrix_multiply_vulkan_compute.glsl'
     ]};
   }
   throw new Error('Unsupported framework in config.framework: '+fw);

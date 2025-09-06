@@ -1,5 +1,10 @@
 server/certificates/*
+server/scripts/emsdk/*
+server/scripts/emsdk
 server/storage/*
+server/data/
+server/data/*
+server/scripts/*.bin
 !server/certificates/.gitkeep
 server/uploads/*
 server/custom_tasks.json
