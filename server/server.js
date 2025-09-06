@@ -89,6 +89,21 @@ wss.on('connection', (ws, req) => {
   ws.id = `native_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
   ws.kind = 'native';
 
+  // Clean up ALL old native connections (only allow one at a time)
+  const existingConnections = Array.from(wss.clients).filter(client =>
+    client.kind === 'native' && client !== ws
+  );
+
+  // Close all old native connections
+  existingConnections.forEach(oldWs => {
+    if (oldWs.readyState === oldWs.OPEN) {
+      logger.info(`Closing old native connection ${oldWs.id} for new connection ${ws.id}`);
+      // Remove client from task manager before closing
+      tm.removeClient(oldWs.id);
+      oldWs.close();
+    }
+  });
+
   // Compact send helper (keeps your {type,data} envelope)
   const send = (type, data) => {
     if (ws.readyState === ws.OPEN) {

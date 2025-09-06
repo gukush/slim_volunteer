@@ -33,7 +33,7 @@ if (!['opencl', 'cuda', 'vulkan'].includes(backend)) {
 
 // Default binary paths if not specified
 const defaultBinaries = {
-  opencl: 'server/scripts/native/ocl_block_matmul',
+  opencl: 'server/scripts/native/ocl_block_matmul_chunked',
   cuda: 'server/scripts/native/cuda_block_matmul',
   vulkan: 'server/scripts/native/vk_block_matmul'
 };

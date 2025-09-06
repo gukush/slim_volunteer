@@ -42,30 +42,26 @@ export function getClientExecutorInfo(config){
 export function getArtifacts(config){
 	const backend = (config?.backend || 'opencl').toLowerCase();
 	const defaultBins = {
-		opencl: 'scripts/native/ocl_block_matmul', // built from this file
+		opencl: 'scripts/native/ocl_block_matmul_chunked', // built from this file
 		cuda: 'scripts/native/cuda_block_matmul', // if you add later
 		vulkan: 'scripts/native/vk_block_matmul' // if you add later
 	};
 	const rel = config.binary || defaultBins[backend];
 	const abs = path.isAbsolute(rel) ? rel : path.join(process.cwd(), 'server', rel);
 	const bytes = fs.readFileSync(abs);
+
+	// Debug output
+	console.log(`[DEBUG] getArtifacts - config.program: ${config.program}`);
+	console.log(`[DEBUG] getArtifacts - rel: ${rel}`);
+	console.log(`[DEBUG] getArtifacts - path.basename(rel): ${path.basename(rel)}`);
+
 	return [{
 		type: 'binary',
 		name: path.basename(rel),
-		program: config.program || 'block_matmul_native',
+		program: path.basename(rel), // Use the actual binary name as program name
 		backend,
 		bytes,
 		exec: true
-	}, {
-		type: 'input',
-		name: 'A.bin',
-		description: 'Matrix A (rows x K)',
-		required: true
-	}, {
-		type: 'input',
-		name: 'B.bin',
-		description: 'Matrix B (K x cols)',
-		required: true
 	}];
 }
 
@@ -85,6 +81,23 @@ function readWindow(fd, rowStart, rowCount, colStart, colCount, rowLen, elementS
     const srcOff = ((rowStart + r) * rowLen + colStart) * elementSize;
     const dstOff = r * rowBytes;
     fs.readSync(fd, out, dstOff, rowBytes, srcOff);
+  }
+  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+}
+
+// Async version to prevent event loop blocking
+async function readWindowAsync(fd, rowStart, rowCount, colStart, colCount, rowLen, elementSize=4){
+  const out = Buffer.alloc(rowCount * colCount * elementSize);
+  const rowBytes = colCount * elementSize;
+  for (let r = 0; r < rowCount; r++){
+    const srcOff = ((rowStart + r) * rowLen + colStart) * elementSize;
+    const dstOff = r * rowBytes;
+    await new Promise((resolve, reject) => {
+      fs.read(fd, out, dstOff, rowBytes, srcOff, (err, bytesRead) => {
+        if (err) reject(err);
+        else resolve(bytesRead);
+      });
+    });
   }
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
 }
@@ -129,6 +142,22 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const [Afile, Bfile] = pickInputs(inputFiles, N, KK, M);
   if (!Afile || !Bfile) throw new Error('Need A.bin and B.bin');
 
+  // Get the binary name for program reference
+  const backend = (config?.backend || 'opencl').toLowerCase();
+  const defaultBins = {
+    opencl: 'scripts/native/ocl_block_matmul_chunked',
+    cuda: 'scripts/native/cuda_block_matmul',
+    vulkan: 'scripts/native/vk_block_matmul'
+  };
+  const rel = config.binary || defaultBins[backend];
+  const binaryName = config.program || path.basename(rel);
+
+  // Debug output
+  console.log(`[DEBUG] buildChunker - config.program: ${config.program}`);
+  console.log(`[DEBUG] buildChunker - rel: ${rel}`);
+  console.log(`[DEBUG] buildChunker - path.basename(rel): ${path.basename(rel)}`);
+  console.log(`[DEBUG] buildChunker - binaryName: ${binaryName}`);
+
   const C = Number(config.chunk_size ?? config.C);
   let baseRows, baseCols, kSpan;
   if (config.tileSize || config.kTileSize){
@@ -147,6 +176,9 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
 
   return {
     async *stream(){
+      let chunkCount = 0;
+      const totalChunks = nIB * nJB * Math.ceil(KK / kSpan);
+
       for (let ib = 0; ib < nIB; ib++){
         const rNow = Math.min(baseRows, N - ib*baseRows);
         for (let jb = 0; jb < nJB; jb++){
@@ -158,14 +190,24 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
           for (let kb = 0; kb < KK; kb += kSpan){
             const kNow = Math.min(kSpan, KK - kb);
 
-            const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK);
-            const Bblock = readWindow(fdB, kb, kNow, jb*baseCols, cNow, M);
+            // Use async file reading to prevent event loop blocking
+            const [Ablock, Bblock] = await Promise.all([
+              readWindowAsync(fdA, ib*baseRows, rNow, kb, kNow, KK),
+              readWindowAsync(fdB, kb, kNow, jb*baseCols, cNow, M)
+            ]);
 
-            const uniforms = new Int32Array([rNow, kNow, cNow]).buffer;
+            // Convert uniforms to raw bytes (not base64 encoded)
+            const uniforms = new Int32Array([rNow, kNow, cNow]);
+            const uniformsBytes = new Uint8Array(uniforms.buffer);
 
             // Payload prepared in strict order: UNIFORMS, then INPUTS, then OUTPUTS (placeholder)
+            // Send as raw binary data, not base64 encoded
             const payload = {
-              buffers: [ uniforms, Ablock, Bblock ],
+              buffers: [
+                Array.from(uniformsBytes),  // Raw bytes for uniforms
+                Array.from(new Uint8Array(Ablock)),  // Raw bytes for A
+                Array.from(new Uint8Array(Bblock))   // Raw bytes for B
+              ],
               outputs: [ { byteLength: outputBytes } ]
             };
 
@@ -177,6 +219,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               // Helpful hints for different backends
               outputSizes: [outputBytes],
               uniforms: [rNow, kNow, cNow],
+              backend: config.backend || 'opencl',
               dispatch: {
                 opencl: { global: [cNow, rNow, 1], local: [16,16,1] },
                 cuda:   { grid:   [Math.ceil(cNow/16), Math.ceil(rNow/16), 1], block: [16,16,1] },
@@ -184,72 +227,117 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               }
             };
 
-            // (Optional) indicate the program name to run on the native client
-            // If omitted, the native client can choose its own default for this strategy/back-end.
-            if (config.program) meta.program = String(config.program);
+            // Set the program name to the actual binary name
+            meta.program = binaryName;
 
             yield { id: uuidv4(), payload, meta, tCreate: Date.now() };
+
+            chunkCount++;
+
+            // Yield control to event loop every 10 chunks to prevent blocking
+            if (chunkCount % 10 === 0) {
+              await new Promise(resolve => setImmediate(resolve));
+            }
+
+            // Log progress every 100 chunks
+            if (chunkCount % 100 === 0) {
+              logger.info(`Generated ${chunkCount}/${totalChunks} chunks (${Math.round(chunkCount/totalChunks*100)}%)`);
+            }
           }
         }
       }
       fs.closeSync(fdA);
       fs.closeSync(fdB);
-      logger.info(`${id} chunker done`);
+      logger.info(`${id} chunker done - generated ${chunkCount} chunks`);
     }
   };
 }
 
-// Assembler: collect partial tiles and stream to C.bin
-export function buildAssembler({ taskId, taskDir, K, config }){
+// Assembler: accumulate partial tiles per (ib,jb) and stream to C.bin
+export function buildAssembler({ taskId, taskDir, K, config }) {
   const { N, M } = config;
-  const outPath = path.join(taskDir, 'C.bin');
-  const fdC = fs.openSync(outPath, 'w');
-  const acc = new Map();
-  const sizes = new Map();
+  const outPath = path.join(taskDir, 'output.bin');
 
-  function writeTileToFile(tile, ib, jb, rows, cols, baseRows, baseCols){
-    const f32 = toF32(tile);
-    for (let r = 0; r < rows; r++){
-      const start = r * cols;
-      const end = start + cols;
-      const rowSlice = Buffer.from(f32.subarray(start, end).buffer);
-      const fileOffset = ((ib * baseRows + r) * M + jb * baseCols) * 4;
-      fs.writeSync(fdC, rowSlice, 0, rowSlice.length, fileOffset);
+  // Preallocate output
+  const fdC = fs.openSync(outPath, 'w+');
+  fs.ftruncateSync(fdC, Number(N) * Number(M) * 4);
+
+  // State
+  const acc = new Map();          // "ib,jb" -> Float32Array(rows*cols), accumulated sum
+  const progressedK = new Map();  // "ib,jb" -> total k covered so far
+  const sizes = new Map();        // "ib,jb" -> { rows, cols, baseRows, baseCols }
+
+  const key = (ib, jb) => `${ib},${jb}`;
+
+  const toF32 = (buf) => {
+    if (buf instanceof Float32Array) return buf;
+    if (Buffer.isBuffer(buf)) return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+    // ArrayBuffer or TypedArray-like
+    return new Float32Array(buf);
+  };
+
+  function writeTileToFile(tileF32, ib, jb, rows, cols, baseRows, baseCols) {
+    const rowBytes = cols * 4;
+    for (let r = 0; r < rows; r++) {
+      const globalRow = ib * baseRows + r;
+      const globalColStart = jb * baseCols;
+      const fileIndex = globalRow * M + globalColStart;
+      const fileOffsetBytes = fileIndex * 4;
+      const slice = Buffer.from(tileF32.buffer, tileF32.byteOffset + r * cols * 4, rowBytes);
+      fs.writeSync(fdC, slice, 0, rowBytes, fileOffsetBytes);
     }
   }
 
-  return {
-    onChunkResult({ chunkId, replica, status, result, checksum, timings, meta }){
-      if (status !== 'ok'){
-        logger.warn(`${id} chunk ${chunkId} replica ${replica} failed`);
-        return false; // let K-replication handle it
-      }
-      const key = `${meta.ib},${meta.jb}`;
-      const tile = acc.get(key) || new Float32Array(meta.baseRows * meta.baseCols);
-      const f32 = toF32(result);
-      // Accumulate into the tile at (kb-segment)
-      for (let r = 0; r < meta.rows; r++){
-        for (let c = 0; c < meta.cols; c++){
-          let sum = 0.0;
-          // Already summed K-slices on native side; this is a single slice result.
-          // If native returns the full sum per (ib,jb), we just overwrite; allow either by summing.
-          sum = tile[r*meta.baseCols + c] + f32[r*meta.cols + c];
-          tile[r*meta.baseCols + c] = sum;
-        }
-      }
-      acc.set(key, tile);
-      sizes.set(key, { rows: meta.rows, cols: meta.cols, baseRows: meta.baseRows, baseCols: meta.baseCols });
-      return true;
-    },
+  function onChunkResult({ chunkId, result, meta }) {
+    // meta MUST include: ib, jb, kSpan, rows, cols, baseRows, baseCols
+    const { ib, jb, kSpan, rows, cols, baseRows, baseCols } = meta;
+    const k = key(ib, jb);
+    if (!sizes.has(k)) sizes.set(k, { rows, cols, baseRows, baseCols });
 
-    finalize(){
-      for (const [k, tile] of acc){
-        const [ibS, jbS] = k.split(',').map(Number);
-        const s = sizes.get(k);
-        if (s) writeTileToFile(tile, ibS, jbS, s.rows, s.cols, s.baseRows, s.baseCols);
-      }
-      fs.closeSync(fdC);
-      return { outPath, elements: N*M };
+    console.log(`[ASSEMBLER] Chunk ${chunkId}: result type=${typeof result}, isBuffer=${Buffer.isBuffer(result)}, isArrayBuffer=${result instanceof ArrayBuffer}, length=${result?.length || 'N/A'}`);
+
+    const part = toF32(result);
+    let tile = acc.get(k);
+    if (!tile) {
+      tile = new Float32Array(rows * cols);
+      acc.set(k, tile);
+      progressedK.set(k, 0);
     }
+
+    // accumulate: tile += part
+    for (let i = 0; i < part.length; i++) tile[i] += part[i];
+
+    const soFar = (progressedK.get(k) || 0) + Number(kSpan || 0);
+    progressedK.set(k, soFar);
+
+    // When we've covered full K for this (ib,jb), flush the tile to disk
+    const fullK = Number(config.K ?? K ?? 0);
+    console.log(`[ASSEMBLER] Chunk ${chunkId}: ib=${ib}, jb=${jb}, kSpan=${kSpan}, soFar=${soFar}, fullK=${fullK}, resultLength=${part.length}`);
+
+    if (fullK > 0 && soFar >= fullK) {
+      console.log(`[ASSEMBLER] Writing tile for ${k}: ${sizes.get(k).rows}x${sizes.get(k).cols}`);
+      const s = sizes.get(k);
+      writeTileToFile(tile, ib, jb, s.rows, s.cols, s.baseRows, s.baseCols);
+      acc.delete(k);
+      progressedK.delete(k);
+      sizes.delete(k);
+    }
+  }
+
+  function finalize() {
+    // Flush anything that didn’t reach full K (best-effort)
+    for (const [k, tile] of acc) {
+      const [ibS, jbS] = k.split(',').map(Number);
+      const s = sizes.get(k);
+      if (s) writeTileToFile(tile, ibS, jbS, s.rows, s.cols, s.baseRows, s.baseCols);
+    }
+    fs.closeSync(fdC);
+    return { outPath, elements: Number(N) * Number(M) };
+  }
+
+  // IMPORTANT: shape expected by TaskManager
+  return {
+    integrate: ({ chunkId, result, meta }) => onChunkResult({ chunkId, result, meta }),
+    finalize
   };
 }

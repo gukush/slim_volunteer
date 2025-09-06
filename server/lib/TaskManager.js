@@ -158,7 +158,7 @@ export class TaskManager{
       for (const client of nativeClients) {
         // Prepare artifacts for native clients (including binary)
         const artifacts = [];
-        
+
         // Add binary as artifact if specified in config
         if (task.descriptor.config.binary) {
           const binaryPath = task.descriptor.config.binary;
@@ -177,7 +177,7 @@ export class TaskManager{
             logger.error(`Failed to read binary ${binaryPath}:`, error);
           }
         }
-        
+
         // Add input files as artifacts
         if (task.descriptor.inputFiles && task.descriptor.inputFiles.length > 0) {
           for (const file of task.descriptor.inputFiles) {
@@ -368,6 +368,29 @@ export class TaskManager{
     let assigned = false;
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) return;
+
+    // Check if chunk is stuck (assigned but not completed for too long)
+    const now = Date.now();
+    const stuckTimeout = 30000; // 30 seconds
+    if(entry.replicas >= task.K && !entry.completed) {
+      const timeSinceAssignment = now - (entry.tCreate || now);
+      if(timeSinceAssignment > stuckTimeout) {
+        console.log(`[DEBUG] Chunk ${chunkId} is stuck, reassigning...`);
+        // Reset client inFlight counts first
+        for(const clientId of entry.assignedTo) {
+          const client = this.clients.get(clientId);
+          if(client) {
+            client.inFlight = Math.max(0, (client.inFlight || 0) - 1);
+          }
+        }
+        // Reset the chunk assignment
+        entry.replicas = 0;
+        entry.assignedTo.clear();
+      } else {
+        return; // Chunk is assigned but not stuck yet
+      }
+    }
+
     if(entry.replicas >= task.K) return;
 
     // Check if we allow same client multiple replicas (for research/testing)
@@ -391,17 +414,41 @@ export class TaskManager{
       assigned = true;
 
       console.log(`[DEBUG] Assigning chunk ${chunkId} to client ${c.socket.id}, replica ${replica}`);
+      console.log(`[DEBUG] Client type: ${c.clientType}, has payload: ${!!entry.payload}, has buffers: ${!!(entry.payload && entry.payload.buffers)}`);
+
+      // Convert ArrayBuffers to base64 for native clients (unless already in raw format)
+      let serializedPayload = entry.payload;
+      if (c.clientType === 'native' && entry.payload && entry.payload.buffers) {
+        console.log(`[DEBUG] Converting ${entry.payload.buffers.length} buffers to base64 for native client`);
+        serializedPayload = {
+          ...entry.payload,
+          buffers: entry.payload.buffers.map((buf, i) => {
+            if (buf instanceof ArrayBuffer) {
+              const base64 = Buffer.from(buf).toString('base64');
+              console.log(`[DEBUG] Buffer ${i}: ArrayBuffer(${buf.byteLength}) -> base64(${base64.length})`);
+              return base64;
+            } else if (Array.isArray(buf)) {
+              // Already in raw byte array format, keep as is
+              console.log(`[DEBUG] Buffer ${i}: already raw byte array, length: ${buf.length}`);
+              return buf;
+            }
+            console.log(`[DEBUG] Buffer ${i}: not ArrayBuffer or array, type: ${typeof buf}, value:`, buf);
+            return buf;
+          })
+        };
+      }
+
       // Emit chunk assignment with replica ID
       c.socket.emit('chunk:assign', {
         taskId: task.id,
         chunkId,
         replica,
-        payload: entry.payload,
+        payload: serializedPayload,
         meta: entry.meta,
         tCreate: entry.tCreate,
       });
 
-      const tSent = now();
+      const tSent = Date.now();
       task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tSent });
 
       if(entry.replicas >= task.K) break;
@@ -449,9 +496,25 @@ export class TaskManager{
 
 
     for (const [cs, rec2] of entry.results){
+      // For native-block-matmul-flex, process each chunk result immediately
+      // The assembler handles K accumulation internally
+      console.log(`[TASKMANAGER] Processing chunk ${chunkId}, count: ${rec2.count}, K: ${task.K}`);
       if (rec2.count >= task.K){
         try{
-          task.assembler.integrate({ chunkId, result: rec2.buf, meta: entry.meta });
+          console.log(`[TASKMANAGER] Calling assembler.integrate for chunk ${chunkId}`);
+          // Decode base64 data for native clients
+          let resultData = rec2.buf;
+          console.log(`[TASKMANAGER] Result data type: ${typeof resultData}, isArray: ${Array.isArray(resultData)}, length: ${resultData?.length || 'N/A'}`);
+          if (Array.isArray(resultData) && resultData.length > 0) {
+            // Result is an array of base64 strings, take the first one
+            console.log(`[TASKMANAGER] First element type: ${typeof resultData[0]}, length: ${resultData[0]?.length || 'N/A'}`);
+            resultData = Buffer.from(resultData[0], 'base64');
+            console.log(`[TASKMANAGER] Decoded buffer length: ${resultData.length}`);
+          } else if (typeof resultData === 'string') {
+            resultData = Buffer.from(resultData, 'base64');
+            console.log(`[TASKMANAGER] Decoded string buffer length: ${resultData.length}`);
+          }
+          task.assembler.integrate({ chunkId, result: resultData, meta: entry.meta });
           const tAssembled = now();
           task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled });
           entry.completed = true;
@@ -539,6 +602,33 @@ export class TaskManager{
     console.log(`[DEBUG] Draining task queue for ${task.id}, ${task.queue.length} chunks in queue`);
     console.log(`[DEBUG] Task framework: ${task.framework}`);
     console.log(`[DEBUG] About to process chunks in queue`);
+
+    // Check for stuck chunks first
+    const now = Date.now();
+    const stuckTimeout = 10000; // 10 seconds
+    for(const chunkId of task.queue){
+      const entry = task.assignments.get(chunkId);
+      if(!entry || entry.completed) continue;
+
+      // Check if chunk is stuck (assigned but not completed for too long)
+      if(entry.replicas >= task.K && !entry.completed) {
+        const timeSinceAssignment = now - (entry.tCreate || now);
+        if(timeSinceAssignment > stuckTimeout) {
+          console.log(`[DEBUG] Chunk ${chunkId} is stuck (${timeSinceAssignment}ms), reassigning...`);
+          // Reset client inFlight counts first
+          for(const clientId of entry.assignedTo) {
+            const client = this.clients.get(clientId);
+            if(client) {
+              client.inFlight = Math.max(0, (client.inFlight || 0) - 1);
+            }
+          }
+          // Reset the chunk assignment
+          entry.replicas = 0;
+          entry.assignedTo.clear();
+        }
+      }
+    }
+
     // Iterate over queued chunks and try to assign replicas
     for(const chunkId of task.queue){
       const entry = task.assignments.get(chunkId);
