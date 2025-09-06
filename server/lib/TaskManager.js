@@ -156,6 +156,45 @@ export class TaskManager{
       }
 
       for (const client of nativeClients) {
+        // Prepare artifacts for native clients (including binary)
+        const artifacts = [];
+        
+        // Add binary as artifact if specified in config
+        if (task.descriptor.config.binary) {
+          const binaryPath = task.descriptor.config.binary;
+          try {
+            const binaryData = fs.readFileSync(binaryPath);
+            // Use the program name from config if available, otherwise use the binary filename
+            const artifactName = task.descriptor.config.program || path.basename(binaryPath);
+            artifacts.push({
+              name: artifactName,
+              type: 'binary',
+              bytes: binaryData.toString('base64'),
+              exec: true
+            });
+            logger.info(`Added binary artifact: ${binaryPath} as ${artifactName} (${binaryData.length} bytes)`);
+          } catch (error) {
+            logger.error(`Failed to read binary ${binaryPath}:`, error);
+          }
+        }
+        
+        // Add input files as artifacts
+        if (task.descriptor.inputFiles && task.descriptor.inputFiles.length > 0) {
+          for (const file of task.descriptor.inputFiles) {
+            try {
+              const fileData = fs.readFileSync(file.path);
+              artifacts.push({
+                name: file.originalName,
+                type: 'input',
+                bytes: fileData.toString('base64')
+              });
+              logger.info(`Added input file artifact: ${file.originalName} (${fileData.length} bytes)`);
+            } catch (error) {
+              logger.error(`Failed to read input file ${file.path}:`, error);
+            }
+          }
+        }
+
         this._sendToNativeClient(client.socket, 'workload:new', {
           id: id,
           strategyId: task.strategy.id,
@@ -164,7 +203,8 @@ export class TaskManager{
           config: task.descriptor.config,
           inputArgs: task.descriptor.inputArgs,
           schema: execInfo.schema || {},
-          type: 'computation'
+          type: 'computation',
+          artifacts: artifacts
         });
       }
 
@@ -302,13 +342,19 @@ export class TaskManager{
   }
 
   _eligibleClients(task){
+    console.log(`[DEBUG] _eligibleClients called for task ${task.id}`);
+    console.log(`[DEBUG] Task framework: ${task.framework}`);
+    console.log(`[DEBUG] All clients:`, Array.from(this.clients.values()).map(c => ({ id: c.socket.id, frameworks: c.frameworks })));
     // Only clients that support the framework
     const list = Array.from(this.clients.values()).filter(c=>{
       if(task.framework && c.frameworks){
-        return c.frameworks.includes(task.framework);
+        const supports = c.frameworks.includes(task.framework);
+        logger.info(`[DEBUG] Client ${c.socket.id} supports ${task.framework}: ${supports} (frameworks: ${JSON.stringify(c.frameworks)})`);
+        return supports;
       }
       return true;
     });
+    logger.info(`[DEBUG] Eligible clients after filtering: ${list.length}`);
     // Prefer clients with available capacity and lower load
     return list.sort((a,b)=>{
       const la = a.inFlight / (a.capacity||1);
@@ -318,6 +364,7 @@ export class TaskManager{
   }
 
   _assignChunkReplica(task, chunkId){
+    console.log(`[DEBUG] _assignChunkReplica called for task ${task.id}, chunk ${chunkId}`);
     let assigned = false;
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) return;
@@ -326,7 +373,11 @@ export class TaskManager{
     // Check if we allow same client multiple replicas (for research/testing)
     const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
 
-    for(const c of this._eligibleClients(task)){
+    console.log(`[DEBUG] About to call _eligibleClients for task ${task.id}`);
+    const eligibleClients = this._eligibleClients(task);
+    console.log(`[DEBUG] Eligible clients for task ${task.id}: ${eligibleClients.length}`);
+    for(const c of eligibleClients){
+      console.log(`[DEBUG] Checking client ${c.socket.id}, inFlight: ${c.inFlight||0}, capacity: ${c.capacity||1}, frameworks: ${JSON.stringify(c.frameworks)}`);
       // Skip if client already assigned to this chunk AND we don't allow same client replicas
       if(!allowSameClient && entry.assignedTo.has(c.socket.id)) continue;
 
@@ -339,6 +390,7 @@ export class TaskManager{
       c.tasks.add(task.id);
       assigned = true;
 
+      console.log(`[DEBUG] Assigning chunk ${chunkId} to client ${c.socket.id}, replica ${replica}`);
       // Emit chunk assignment with replica ID
       c.socket.emit('chunk:assign', {
         taskId: task.id,
@@ -473,15 +525,29 @@ export class TaskManager{
     };
   }
 
+  _sendToNativeClient(socket, eventType, data) {
+    // For native clients, use the custom emit mechanism that sends JSON messages
+    if (socket.emit) {
+      socket.emit(eventType, data);
+    } else {
+      console.error('Socket does not have emit method');
+    }
+  }
+
   _drainTaskQueue(task){
     if(!task || task.status!=='running') return;
+    console.log(`[DEBUG] Draining task queue for ${task.id}, ${task.queue.length} chunks in queue`);
+    console.log(`[DEBUG] Task framework: ${task.framework}`);
+    console.log(`[DEBUG] About to process chunks in queue`);
     // Iterate over queued chunks and try to assign replicas
     for(const chunkId of task.queue){
       const entry = task.assignments.get(chunkId);
       if(!entry || entry.completed) continue;
+      console.log(`[DEBUG] Processing chunk ${chunkId}, replicas: ${entry.replicas}/${task.K}`);
       // Try to assign as many replicas as needed (up to K)
       while(entry.replicas < task.K){
         const assigned = this._assignChunkReplica(task, chunkId);
+        console.log(`[DEBUG] Chunk ${chunkId} assignment attempt: ${assigned}`);
         if(!assigned) break; // No capacity right now
       }
     }

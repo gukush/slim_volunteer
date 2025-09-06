@@ -113,7 +113,7 @@ async function main(){
     tileSize: TS,
     kTileSize: KTS,
     chunk_size: chunkSize,
-    framework: `binary`, // Must match expected framework
+    framework: backend, // Must match expected framework
   };
 
   // Add binary path if specified

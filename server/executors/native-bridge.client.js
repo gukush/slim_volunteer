@@ -28,10 +28,10 @@ export function createExecutor({ kernels, config }) {
 
   // For HTTPS pages (WebGPU requirement), always use wss://
   const isSecure = window.location.protocol === 'https:';
-  const defaultPort = config?.nativePort || 8787;
+  const defaultPort = config?.nativePort || 3001;
   const defaultEndpoint = isSecure
-    ? `wss://127.0.0.1:${defaultPort}/native`  // SSL WebSocket for HTTPS pages
-    : `ws://127.0.0.1:${defaultPort}/native`;   // Plain WebSocket for HTTP pages
+    ? `wss://127.0.0.1:${defaultPort}/ws-native`  // SSL WebSocket for HTTPS pages
+    : `ws://127.0.0.1:${defaultPort}/ws-native`;   // Plain WebSocket for HTTP pages
 
   const endpoint = config?.nativeEndpoint || defaultEndpoint;
   const framework = config?.framework || 'native-cuda';

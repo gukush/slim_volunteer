@@ -98,8 +98,19 @@ wss.on('connection', (ws, req) => {
     }
   };
 
-  // Keep your "emit" shim (uses native send under the hood)
-  ws.emit = (event, data) => send(event, data);
+  // Keep your "emit" shim (uses native send under the hood) - but don't override 'message' events
+  const originalEmit = ws.emit.bind(ws);
+  ws.emit = (event, data) => {
+    // Don't send back 'message' events - those are incoming messages from the client
+    if (event === 'message') {
+      return originalEmit(event, data);
+    }
+    logger.debug(`WS emit called: ${event} for ${ws.id}`);
+    send(event, data);
+  };
+
+  // Debug: log when message handler is set up
+  logger.debug(`Setting up message handler for ${ws.id}`);
 
   // --- helper: announce workload (with artifacts) to this native client
   const sendWorkloadNew = (taskId) => {
@@ -134,6 +145,7 @@ wss.on('connection', (ws, req) => {
 
   // SINGLE message handler - clean and simple
   ws.on('message', (data) => {
+    logger.debug(`🔔 Message handler triggered for ${ws.id}, data length: ${data.length}`);
     try {
       // Handle both string and Buffer data
       let messageStr;
@@ -148,6 +160,7 @@ wss.on('connection', (ws, req) => {
       const message = JSON.parse(messageStr);
       const { type, data: eventData } = message;
 
+      logger.info(`🔍 Parsed message - type: ${type}, data keys:`, Object.keys(eventData || {}));
       logger.debug(`Processing message type: ${type}`);
 
       switch (type) {
@@ -203,7 +216,7 @@ wss.on('connection', (ws, req) => {
 
         case 'workload:chunk_done_enhanced':
           logger.debug(`Client ${ws.id} completed chunk`);
-          tm.receiveChunkResult(ws.id, eventData);
+          tm.receiveResult(ws.id, eventData);
           break;
 
         case 'workload:error':
@@ -214,6 +227,20 @@ wss.on('connection', (ws, req) => {
         case 'workload:chunk_error':
           logger.error(`Client ${ws.id} reported chunk error:`, eventData);
           tm.receiveChunkError(ws.id, eventData);
+          break;
+
+        case 'workload:ready':
+          logger.info(`Client ${ws.id} reported workload ready:`, eventData);
+          // Client is ready to receive chunks, drain the task queue to assign pending chunks
+          const taskId = eventData?.id;
+          if (taskId) {
+            const task = tm.getTask(taskId);
+            if (task && task.status === 'running') {
+              logger.info(`Draining task queue for ${taskId} after client ${ws.id} reported ready`);
+              console.log(`[DEBUG] About to call tm._drainTaskQueue for task ${taskId}`);
+              tm._drainTaskQueue(task);
+            }
+          }
           break;
 
         default:

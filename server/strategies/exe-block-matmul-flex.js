@@ -27,7 +27,7 @@ export function getClientExecutorInfo(config){
   }[backend];
 
   return {
-    framework: `native-${backend}`,
+    framework: backend,
     kernels,
     schema: {
       order: ['UNIFORMS','INPUTS','OUTPUTS'],
