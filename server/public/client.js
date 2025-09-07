@@ -4,6 +4,10 @@ const levels = ['error','warn','info','debug','trace'];
 const idx = levels.indexOf(logLevel);
 function log(kind, ...args){ if(levels.indexOf(kind)<=idx){ const el=document.getElementById('log'); el.textContent += `[${new Date().toISOString()}] ${kind.toUpperCase()} ${args.join(' ')}\n`; el.scrollTop=el.scrollHeight; console[kind==='trace'?'debug':kind](...args);}}
 
+// Listener functionality
+const enableListener = qs.listener === '1';
+let listenerWs = null;
+
 const statusEl = document.getElementById('status');
 
 function checksumHex(buffer){
@@ -16,6 +20,72 @@ const socket = io({ transports:['websocket'], auth:{ token: 'anon' }, forceNew: 
 const executors = new Map(); // taskId -> executor
 const readyTasks = new Set();
 
+// Listener connection functions
+function connectToListener() {
+  if (!enableListener) return;
+
+  try {
+    listenerWs = new WebSocket('ws://127.0.0.1:8765');
+
+    listenerWs.onopen = function() {
+      log('info', 'Connected to listener at ws://127.0.0.1:8765');
+    };
+
+    listenerWs.onclose = function() {
+      log('warn', 'Disconnected from listener');
+      listenerWs = null;
+    };
+
+    listenerWs.onerror = function(error) {
+      log('error', 'Listener connection error:', error);
+    };
+
+    listenerWs.onmessage = function(event) {
+      try {
+        const response = JSON.parse(event.data);
+        log('debug', 'Listener response:', response);
+      } catch (e) {
+        log('warn', 'Failed to parse listener response:', event.data);
+      }
+    };
+  } catch (error) {
+    log('error', 'Failed to connect to listener:', error);
+  }
+}
+
+function notifyListenerChunkArrival(chunkId, taskId) {
+  if (!enableListener || !listenerWs || listenerWs.readyState !== WebSocket.OPEN) return;
+
+  try {
+    const message = {
+      type: 'chunk_status',
+      chunk_id: chunkId,
+      task_id: taskId,
+      status: 0  // 0 = chunk arrival/start
+    };
+    listenerWs.send(JSON.stringify(message));
+    log('debug', 'Notified listener of chunk arrival:', chunkId);
+  } catch (error) {
+    log('error', 'Failed to notify listener of chunk arrival:', error);
+  }
+}
+
+function notifyListenerChunkComplete(chunkId, status) {
+  if (!enableListener || !listenerWs || listenerWs.readyState !== WebSocket.OPEN) return;
+
+  try {
+    const message = {
+      type: 'chunk_status',
+      chunk_id: chunkId,
+      status: status === 'completed' ? 1 : -1  // 1 = success, -1 = error
+    };
+    listenerWs.send(JSON.stringify(message));
+    log('debug', 'Notified listener of chunk completion:', chunkId, 'status:', status);
+  } catch (error) {
+    log('error', 'Failed to notify listener of chunk completion:', error);
+  }
+}
+
 socket.on('connect', ()=>{
   statusEl.textContent = 'connected';
   log('info', 'Connected', socket.id);
@@ -23,6 +93,11 @@ socket.on('connect', ()=>{
   if('gpu' in navigator) frameworks.push('webgpu');
   const capacity = Number(qs.cap || qs.capacity || 1);
   socket.emit('hello', { workerId: qs.workerId || socket.id, frameworks, capacity });
+
+  // Connect to listener if enabled
+  if (enableListener) {
+    connectToListener();
+  }
 });
 
 socket.on('disconnect', ()=>{
@@ -73,10 +148,15 @@ socket.on('task:init', (msg)=>{
 
 socket.on('chunk:assign', async (job)=>{
   const { taskId, chunkId, replica, payload, meta, tCreate } = job;
+
+  // Notify listener of chunk arrival
+  notifyListenerChunkArrival(chunkId, taskId);
+
   let exec = executors.get(taskId);
   if(!exec){
     log('warn', 'No executor for task', taskId);
     socket.emit('chunk:result', { taskId, chunkId, replica, status: 'no-exec' });
+    notifyListenerChunkComplete(chunkId, 'no-exec');
     return;
   }
 
@@ -87,6 +167,7 @@ socket.on('chunk:assign', async (job)=>{
     if(!exec){
       log('warn', 'Executor failed to initialize for task', taskId);
       socket.emit('chunk:result', { taskId, chunkId, replica, status: 'no-exec' });
+      notifyListenerChunkComplete(chunkId, 'no-exec');
       return;
     }
   }
@@ -99,8 +180,14 @@ socket.on('chunk:assign', async (job)=>{
       result: res.result, timings: res.timings
     });
     log('debug', 'chunk done', chunkId, 'cs', checksum.slice(0,8));
+
+    // Notify listener of successful completion
+    notifyListenerChunkComplete(chunkId, res.status);
   }catch(e){
     log('error', 'chunk failed', chunkId, e.message);
     socket.emit('chunk:result', { taskId, chunkId, replica, status: 'error', error: e.message });
+
+    // Notify listener of error
+    notifyListenerChunkComplete(chunkId, 'error');
   }
 });
