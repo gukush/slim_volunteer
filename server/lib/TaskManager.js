@@ -476,7 +476,7 @@ export class TaskManager{
     });
 
     if(status!=='ok'){
-      logger.warn('Replica failed', taskId, chunkId, replica, 'from', socketId);
+      logger.warn('Replica failed', taskId, chunkId, replica, 'from', socketId, 'error:', data?.error);
       // For same-client replicas, we might want to reassign differently
       const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
       if (!allowSameClient) {
