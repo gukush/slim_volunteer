@@ -245,63 +245,45 @@ fn cswap(a: ptr<function, PointXZ>, b: ptr<function, PointXZ>, bit: u32) {
   }
 }
 
-// Correct constant-time Montgomery ladder (with transition and final swap)
+// Simple Montgomery ladder (like working version)
 fn ladder(P: PointXZ, k: u32, A24: U256, N: U256, n0inv32: u32, mont_one: U256) -> PointXZ {
   var R0 = PointXZ(mont_one, set_zero()); // 0*P
   var R1 = P;                             // 1*P
-  var prev: u32 = 0u;
   var started = false;
 
   for (var i:i32=31; i>=0; i--) {
-    let b = (k >> u32(i)) & 1u;
-    if (!started && b == 0u) { continue; }
+    let bit = (k >> u32(i)) & 1u;
+    if (!started && bit == 0u) { continue; }
     started = true;
 
-    // swap on bit transition
-    cswap(&R0, &R1, b ^ prev);
-    prev = b;
-
-    let R0n = xADD(R0, R1, P, N, n0inv32); // R0 + R1
-    let R1n = xDBL(R1, A24, N, n0inv32);   // 2*R1
-    R0 = R0n;
-    R1 = R1n;
+    cswap(&R0, &R1, 1u - bit);
+    let T0 = xADD(R0, R1, P, N, n0inv32);
+    let T1 = xDBL(R1, A24, N, n0inv32);
+    R0 = T0;
+    R1 = T1;
   }
-  cswap(&R0, &R1, prev); // finalize
   return R0;
 }
 
-// --------------------------- RNG (64-bit LCG in u32) ---------------------------
-fn lcg64_u32(state: ptr<function, vec2<u32>>) -> vec2<u32> {
-  const A_LO:u32=0x4C957F2Du; const A_HI:u32=0x5851F42Du;
-  const C_LO:u32=0xF767814Fu; const C_HI:u32=0x14057B7Eu;
-
-  let s_lo = (*state).x; let s_hi = (*state).y;
-
-  let t = mul32x32_64(s_lo, A_LO); // (lo,hi)
-  var res_lo = t.x;
-  var res_hi = t.y;
-
-  let u = mul32x32_64(s_lo, A_HI);
-  res_hi = res_hi + u.x;
-
-  let v = mul32x32_64(s_hi, A_LO);
-  res_hi = res_hi + v.x;
-
-  let new_lo = res_lo + C_LO;
-  let carry0 : u32 = select(0u, 1u, new_lo < res_lo);
-  let new_hi = res_hi + C_HI + carry0;
-
-  (*state) = vec2<u32>(new_lo, new_hi);
-  return (*state);
+// --------------------------- RNG (Simple LCG) ---------------------------
+fn lcg32(state: ptr<function, u32>) -> u32 {
+  // Simple 32-bit LCG: state = (state * 1103515245 + 12345) mod 2^32
+  let new_state = ((*state) * 1103515245u + 12345u);
+  (*state) = new_state;
+  return new_state;
 }
 
 fn next_sigma(_N: U256, state: ptr<function, vec2<u32>>) -> U256 {
   var acc: U256;
-  for (var i:u32=0u;i<4u;i++){
-    let r = lcg64_u32(state);  // r.x=lo, r.y=hi
-    acc.limbs[2u*i+0u] = r.x;
-    acc.limbs[2u*i+1u] = r.y;
+  var lcg_state = (*state).x;
+  
+  for (var i:u32=0u;i<8u;i++){
+    acc.limbs[i] = lcg32(&lcg_state);
   }
+  
+  // Update the state
+  (*state).x = lcg_state;
+  
   var sigma = acc;
   if (is_zero(sigma)) { sigma.limbs[0]=6u; }
   let one = set_one();
@@ -355,16 +337,15 @@ fn mod_inverse(a_in: U256, N: U256) -> InvResult {
 // Given sigma, compute X1 and A24 in Montgomery domain:
 //   u = σ^2 - 5
 //   v = 4σ
-//   X1 = (u/v)^3
-//   A24 = ((A+2)/4) where A+2 = (v-u)^3 (3u+v) / (4 u^3)
-//        => A24 = (v-u)^3 (3u+v) / (16 u^3)
+//   X1 = (u^2 - v^2)^3 / (4uv)^2  (correct Suyama starting point)
+//   A24 = ((A+2)/4) where A = ((v-u)^3 * (3u+v)) / (4 u^3 v) - 2
 fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
   // mont versions of constants and sigma
   let sigma_m = to_mont(sigma, R2, N, n0inv32);
   let five_m  = to_mont(u256_from_u32(5u),  R2, N, n0inv32);
   let four_m  = to_mont(u256_from_u32(4u),  R2, N, n0inv32);
   let three_m = to_mont(u256_from_u32(3u),  R2, N, n0inv32);
-  let sixteen_m = to_mont(u256_from_u32(16u), R2, N, n0inv32);
+  let two_m   = to_mont(u256_from_u32(2u),  R2, N, n0inv32);
 
   // u = σ^2 - 5  (mont)
   let sigma_sq_m = mont_sqr(sigma_m, N, n0inv32);
@@ -373,31 +354,47 @@ fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
   // v = 4σ       (mont)
   let v_m = mont_mul(four_m, sigma_m, N, n0inv32);
 
-  // Make sure u and v are invertible modulo N (probable prime in ECM context)
+  // Check for degenerate cases (avoid σ ∈ {0, ±1, ±2})
+  let sigma_std = from_mont(sigma_m, N, n0inv32);
   let u_std = from_mont(u_m, N, n0inv32);
   let v_std = from_mont(v_m, N, n0inv32);
+
+  let one = set_one();
+  let two = u256_from_u32(2u);
+  let N_minus_1 = sub_u256(N, one);
+  let N_minus_2 = sub_u256(N, two);
+
+  if (is_zero(sigma_std) || cmp(sigma_std, one) == 0 || cmp(sigma_std, N_minus_1) == 0 ||
+      cmp(sigma_std, two) == 0 || cmp(sigma_std, N_minus_2) == 0) {
+    return CurveResult(false, set_zero(), set_zero());
+  }
+
+  // Check invertibility - if not invertible, we might have found a factor
+  // But don't reject the curve, let the GCD handle it
   let inv_u = mod_inverse(u_std, N);
   let inv_v = mod_inverse(v_std, N);
   if (!inv_u.ok || !inv_v.ok) {
     return CurveResult(false, set_zero(), set_zero()); // caller may GCD later
   }
 
-  // X1 = u^3 / v^3  (mont)
+  // X1 = (u^2 - v^2)^3 / (4uv)^2  (mont)
   let u_sq_m = mont_sqr(u_m, N, n0inv32);
-  let u_cubed_m = mont_mul(u_m, u_sq_m, N, n0inv32);
-
   let v_sq_m = mont_sqr(v_m, N, n0inv32);
-  let v_cubed_m = mont_mul(v_m, v_sq_m, N, n0inv32);
+  let u2_v2_m = mont_sub(u_sq_m, v_sq_m, N);
+  let u2_v2_sq_m = mont_sqr(u2_v2_m, N, n0inv32);
+  let u2_v2_cubed_m = mont_mul(u2_v2_m, u2_v2_sq_m, N, n0inv32);
 
-  // inv(v^3) in mont: invert standard, hop back in
-  let v3_std = from_mont(v_cubed_m, N, n0inv32);
-  let inv_v3 = mod_inverse(v3_std, N);
-  if (!inv_v3.ok) { return CurveResult(false, set_zero(), set_zero()); }
-  let inv_v3_m = to_mont(inv_v3.val, R2, N, n0inv32);
+  let four_uv_m = mont_mul(four_m, mont_mul(u_m, v_m, N, n0inv32), N, n0inv32);
+  let four_uv_sq_m = mont_sqr(four_uv_m, N, n0inv32);
 
-  let X1m = mont_mul(u_cubed_m, inv_v3_m, N, n0inv32);
+  let four_uv_sq_std = from_mont(four_uv_sq_m, N, n0inv32);
+  let inv_four_uv_sq = mod_inverse(four_uv_sq_std, N);
+  if (!inv_four_uv_sq.ok) { return CurveResult(false, set_zero(), set_zero()); }
+  let inv_four_uv_sq_m = to_mont(inv_four_uv_sq.val, R2, N, n0inv32);
 
-  // A24 = (v-u)^3 (3u+v) / (16 u^3)  (mont)
+  let X1m = mont_mul(u2_v2_cubed_m, inv_four_uv_sq_m, N, n0inv32);
+
+  // A24 = ((A+2)/4) where A = ((v-u)^3 * (3u+v)) / (4 u^3 v) - 2
   let vm_u_m = mont_sub(v_m, u_m, N);
   let vm_u_sq_m = mont_sqr(vm_u_m, N, n0inv32);
   let vm_u_cubed_m = mont_mul(vm_u_m, vm_u_sq_m, N, n0inv32);
@@ -405,15 +402,21 @@ fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
   let three_u_m = mont_mul(three_m, u_m, N, n0inv32);
   let three_u_plus_v_m = mont_add(three_u_m, v_m, N);
 
+  let u_cubed_m = mont_mul(u_m, u_sq_m, N, n0inv32);
+  let four_u3_v_m = mont_mul(four_m, mont_mul(u_cubed_m, v_m, N, n0inv32), N, n0inv32);
+
+  let four_u3_v_std = from_mont(four_u3_v_m, N, n0inv32);
+  let inv_four_u3_v = mod_inverse(four_u3_v_std, N);
+  if (!inv_four_u3_v.ok) { return CurveResult(false, set_zero(), set_zero()); }
+  let inv_four_u3_v_m = to_mont(inv_four_u3_v.val, R2, N, n0inv32);
+
   let numerator_m = mont_mul(vm_u_cubed_m, three_u_plus_v_m, N, n0inv32);
-  let denom_m = mont_mul(sixteen_m, u_cubed_m, N, n0inv32);
+  let A_plus_2_m = mont_mul(numerator_m, inv_four_u3_v_m, N, n0inv32);
+  let A_m = mont_sub(A_plus_2_m, two_m, N);
 
-  let denom_std = from_mont(denom_m, N, n0inv32);
-  let inv_denom = mod_inverse(denom_std, N);
-  if (!inv_denom.ok) { return CurveResult(false, set_zero(), set_zero()); }
-  let inv_denom_m = to_mont(inv_denom.val, R2, N, n0inv32);
-
-  let A24m = mont_mul(numerator_m, inv_denom_m, N, n0inv32);
+  // A24 = (A + 2) / 4 = A_plus_2 / 4
+  let inv4_m = to_mont(mod_inverse(u256_from_u32(4u), N).val, R2, N, n0inv32);
+  let A24m = mont_mul(A_plus_2_m, inv4_m, N, n0inv32);
 
   return CurveResult(true, A24m, X1m);
 }
@@ -486,6 +489,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   let h = getHeader();
   if (idx >= h.n_curves) { return; }
+  
 
   // Load constants
   var off = constOffset();
@@ -498,10 +502,18 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let pp_off = ppOffset();
   let out_base = outOffset(h) + idx * (8u + 1u + 3u);
 
-  // RNG state (per curve)
+  // RNG state (per curve) - ensure non-zero state
   var rng: vec2<u32>;
-  rng.x = h.seed_lo ^ idx ^ h.base_curve;
-  rng.y = h.seed_hi ^ (idx * 0x9E3779B9u);
+  let global_curve_idx = h.base_curve + idx;
+  rng.x = h.seed_lo ^ global_curve_idx ^ 0x12345678u;
+  rng.y = h.seed_hi ^ (global_curve_idx * 0x9E3779B9u) ^ 0x87654321u;
+  
+  // Ensure state is non-zero
+  if (rng.x == 0u && rng.y == 0u) {
+    rng.x = 0x12345678u + global_curve_idx;
+    rng.y = 0x87654321u + global_curve_idx;
+  }
+  
 
   // Curve generation
   var A24m: U256;
@@ -515,13 +527,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
       A24m = cr.A24m;
       X1m  = cr.X1m;
       curve_ok = true;
+      
+      // Debug: store sigma in output for debugging
+      // for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = sigma.limbs[i]; }
+      // io.words[out_base+8u] = 70u; // debug status - curve generated
     }
   }
 
   if (!curve_ok) {
     // status=3 => bad curve / inverse failed
     for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = 0u; }
-    io.words[out_base+8u] = 3u;
+    io.words[out_base+8u] = 71u; // debug status - curve generation failed
     return;
   }
 
