@@ -1,4 +1,4 @@
-// executors/webgpu-ecm-stage1.client.js
+// executors/webgpu-ecm-stage1.client.js - Version 3 with Resume Support
 
 // -------------------- Global cache (per tab/worker) --------------------
 const __WGPU_ECM_CACHE__ = (globalThis.__WGPU_ECM_CACHE__ ||= {
@@ -56,45 +56,44 @@ export function getPipeline(dev, kernelCode) {
     __WGPU_ECM_CACHE__.pipelinesByDevice.set(dev, perDev);
   }
 
-  // Key by code length; OK because you said path/name stays the same but contents changed
-  const key = 'ecm-stage1-v2:' + (kernelCode?.length || 0);
+  // Key by code length (or hash if you prefer)
+  const key = 'ecm-stage1-v3:' + (kernelCode?.length || 0);
   /** @type {CachedPipeline|undefined} */
   let cached = perDev.get(key);
   if (cached && cached.pipeline) return cached;
 
   const module = dev.createShaderModule({
-    label: 'ecm-stage1-module-v2',
+    label: 'ecm-stage1-module-v3',
     code: kernelCode
   });
 
-  // Updated bind group layout for version 2 (single storage buffer):
-  //  @binding(0) IO buffer (storage) - contains header + constants + primes + outputs
+  // Bind group layout for version 3 (single storage buffer)
   const bindGroupLayout = dev.createBindGroupLayout({
-    label: 'ecm-stage1-v2-layout',
+    label: 'ecm-stage1-v3-layout',
     entries: [
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ]
   });
 
   const pipelineLayout = dev.createPipelineLayout({
-    label: 'ecm-stage1-v2-pipeline-layout',
+    label: 'ecm-stage1-v3-pipeline-layout',
     bindGroupLayouts: [bindGroupLayout]
   });
 
   const pipeline = dev.createComputePipeline({
-    label: 'ecm-stage1-v2-pipeline',
+    label: 'ecm-stage1-v3-pipeline',
     layout: pipelineLayout,
     compute: { module, entryPoint: 'main' }
   });
 
   cached = { pipeline, bindGroupLayout, pipelineLayout, module };
   perDev.set(key, cached);
-  console.log('Creating new ECM v2 pipeline for device:', __WGPU_ECM_CACHE__.deviceId);
+  console.log('Creating new ECM v3 pipeline for device:', __WGPU_ECM_CACHE__.deviceId);
   return cached;
 }
 
 export function createExecutor({ kernels, config }){
-  // Keep the path/name EXACTLY like your example:
+  // Find the kernel - should be the v3 kernel now
   const kernel = kernels.find(k => k.name.endsWith('ecm_stage1_webgpu_compute.wgsl'));
   if(!kernel) throw new Error('ECM kernel missing');
 
@@ -115,106 +114,178 @@ export function createExecutor({ kernels, config }){
     const { data, dims } = payload;
     const { n, pp_count, total_words } = dims;
 
-    console.log(`Processing ECM chunk v2: ${n} curves, ${pp_count} prime powers with device ${__WGPU_ECM_CACHE__.deviceId}`);
+    console.log(`Processing ECM chunk v3: ${n} curves, ${pp_count} prime powers with device ${__WGPU_ECM_CACHE__.deviceId}`);
 
-    // Parse the incoming buffer structure (Version 2)
-    const u32 = new Uint32Array(data);
+    // Parse the incoming buffer structure (Version 3 expected)
+    let u32 = new Uint32Array(data);
     const version = u32[1] >>> 0;
 
-    DBG(`Buffer version: ${version}, expected: 2`);
-    if (version !== 2) {
-      ERR(`Unexpected buffer version: ${version}, expected 2`);
+    if (version < 3) {
+      console.warn(`Buffer version ${version}, expected 3 - upgrading header`);
+      // Upgrade to version 3 by adding pp_start and pp_len fields
+      const newU32 = new Uint32Array(u32.length);
+      newU32.set(u32);
+      newU32[1] = 3; // Update version
+      newU32[10] = 0; // pp_start = 0
+      newU32[11] = 0; // pp_len will be set in loop
+      u32 = newU32;
     }
 
-    const HEADER_WORDS_V2 = 12;
+    const HEADER_WORDS_V3 = 12;
     const CONST_WORDS = 8*3 + 4; // N(8) + R2(8) + mont_one(8) + n0inv32(1) + pad(3)
     const CURVE_OUT_WORDS_PER = 8 + 1 + 3; // result(8) + status(1) + pad(3)
+    const STATE_WORDS_PER_CURVE = 8 + 8 + 8 + 2; // X(8) + Z(8) + A24(8) + (sigma, curve_ok)
 
-    // Version 2 layout: no curve input data
-    const calcTotalWords = HEADER_WORDS_V2 + CONST_WORDS + pp_count + n * CURVE_OUT_WORDS_PER;
-    if (typeof total_words === 'number' && total_words !== calcTotalWords) {
-      ERR('Layout mismatch v2: total_words vs calculated', { total_words, calcTotalWords, n, pp_count });
-    }
+    const outputOffset = HEADER_WORDS_V3 + CONST_WORDS + pp_count;
+    const stateOffset = outputOffset + n * CURVE_OUT_WORDS_PER;
 
-    const outputOffset = HEADER_WORDS_V2 + CONST_WORDS + pp_count;
-    DBG('v2 layout', { HEADER_WORDS_V2, CONST_WORDS, CURVE_OUT_WORDS_PER, outputOffset, total_words });
+    // Calculate total buffer size with state storage
+    const totalBufferWords = stateOffset + n * STATE_WORDS_PER_CURVE;
+    const bufferSize = totalBufferWords * 4;
 
-    const checksumIn = u32sum(u32);
+    DBG('v3 layout', {
+      HEADER_WORDS_V3,
+      CONST_WORDS,
+      CURVE_OUT_WORDS_PER,
+      STATE_WORDS_PER_CURVE,
+      outputOffset,
+      stateOffset,
+      bufferSize
+    });
 
-    // --- Create WebGPU buffer (single storage buffer approach) ---
+    // --- RESUMABLE COMPUTATION LOOP ---
 
-    // Create a single storage buffer that contains the entire data
+    // Tuning parameters
+    const TARGET_MS = 50;  // Target time per GPU submit (well below watchdog)
+    let pp_len = Math.min(1500, pp_count); // Start conservative
+    let pp_start = 0;
+
+    // Create GPU buffer with space for state
     const ioBuffer = dev.createBuffer({
-      label: 'ecm-io-buffer-v2',
-      size: data.byteLength,
+      label: 'ecm-io-buffer-v3',
+      size: bufferSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC
     });
 
-    // Upload the entire buffer
-    dev.queue.writeBuffer(ioBuffer, 0, data);
+    // Extend u32 array if needed for state storage
+    if (u32.length < totalBufferWords) {
+      const extendedU32 = new Uint32Array(totalBufferWords);
+      extendedU32.set(u32);
+      u32 = extendedU32;
+    }
 
-    // Create bind group with single storage buffer
+    // Initial upload
+    dev.queue.writeBuffer(ioBuffer, 0, u32.buffer, 0, bufferSize);
+
+    // Create bind group once (reuse across iterations)
     const bindGroup = dev.createBindGroup({
-      label: 'ecm-bindgroup-v2',
+      label: 'ecm-bindgroup-v3',
       layout: bindGroupLayout,
       entries: [
         { binding: 0, resource: { buffer: ioBuffer } },
       ]
     });
 
-    // Dispatch compute shader — 1 curve per thread
-    const WG_SIZE = 64; // Updated to match WGSL @workgroup_size(64)
-    const numWorkgroups = Math.ceil(n / WG_SIZE);
+    console.log(`Starting ECM Stage 1 with B1 ≈ ${pp_count} prime powers`);
+    const overallStart = performance.now();
 
-    const encoder = dev.createCommandEncoder({ label: 'ecm-encoder-v2' });
-    const pass = encoder.beginComputePass({ label: 'ecm-pass-v2' });
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(numWorkgroups, 1, 1);
-    pass.end();
+    // Main resume loop
+    while (pp_start < pp_count) {
+      // Update header with current window
+      u32[10] = pp_start; // pp_start field
+      u32[11] = Math.min(pp_len, pp_count - pp_start); // pp_len field
 
-    // Copy output back to readable buffer
-    const readBuffer = dev.createBuffer({
-      label: 'ecm-read-buffer-v2',
-      size: data.byteLength,
-      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
-    });
-    encoder.copyBufferToBuffer(ioBuffer, 0, readBuffer, 0, data.byteLength);
+      // Write updated header to GPU
+      dev.queue.writeBuffer(ioBuffer, 0, u32.buffer, 0, 48); // Just update header (12 words * 4 bytes)
 
-    // Submit and wait
-    dev.queue.submit([encoder.finish()]);
-    await dev.queue.onSubmittedWorkDone().catch(e=>ERR('onSubmittedWorkDone error', e));
-    DBG('submitted & GPU done');
+      // Dispatch compute shader
+      const WG_SIZE = 64;
+      const numWorkgroups = Math.ceil(n / WG_SIZE);
 
-    await readBuffer.mapAsync(GPUMapMode.READ);
-    const outputData = readBuffer.getMappedRange();
+      const encoder = dev.createCommandEncoder({ label: `ecm-encoder-v3-pass-${pp_start}` });
+      const pass = encoder.beginComputePass({ label: `ecm-pass-v3-${pp_start}` });
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, bindGroup);
+      pass.dispatchWorkgroups(numWorkgroups, 1, 1);
+      pass.end();
 
-    // The output data already contains the full buffer with updated results
-    const fullResult = new Uint32Array(outputData);
+      // Time this submit
+      const t0 = performance.now();
+      dev.queue.submit([encoder.finish()]);
+      await dev.queue.onSubmittedWorkDone().catch(e => {
+        ERR('GPU submit error:', e);
+        throw e;
+      });
+      const dt = performance.now() - t0;
 
-    console.log('Output section starts at word', outputOffset);
-    for(let i = 0; i < Math.min(5, n); i++) {
-      const curveOffset = outputOffset + i * CURVE_OUT_WORDS_PER;
-      const status = fullResult[curveOffset + 8];
-      const sigma = fullResult[curveOffset + 9];  // Debug: sigma value
-      const curveIdx = fullResult[curveOffset + 10];  // Debug: curve index
+      const processed = u32[11];
+      console.log(`Pass: pp[${pp_start}:${pp_start + processed}] completed in ${dt.toFixed(1)}ms`);
 
-      console.log(`Curve ${i} (global ${curveIdx}): status=${status}, sigma=${sigma}, result limbs:`,
-        Array.from(fullResult.slice(curveOffset, curveOffset + 8)));
+      // Update position
+      pp_start += processed;
 
-      // Check if sigma values are different
-      if (i > 0) {
-        const prevSigma = fullResult[outputOffset + (i-1) * CURVE_OUT_WORDS_PER + 9];
-        if (sigma === prevSigma) {
-          console.warn(`WARNING: Curve ${i} has same sigma as curve ${i-1}: ${sigma}`);
-        }
+      // Adaptive tuning to stay near target time
+      if (dt < TARGET_MS / 2 && pp_len < pp_count / 10) {
+        pp_len = Math.min(pp_len * 2, 8000);
+        DBG(`Increasing pp_len to ${pp_len}`);
+      } else if (dt > TARGET_MS * 1.5) {
+        pp_len = Math.max(Math.floor(pp_len * TARGET_MS / dt), 100);
+        DBG(`Decreasing pp_len to ${pp_len}`);
+      }
+
+      // Progress reporting
+      if (pp_start % 10000 === 0 || pp_start === pp_count) {
+        const pct = (100 * pp_start / pp_count).toFixed(1);
+        const elapsed = ((performance.now() - overallStart) / 1000).toFixed(1);
+        console.log(`ECM Progress: ${pp_start}/${pp_count} (${pct}%) - ${elapsed}s elapsed`);
       }
     }
 
-    const checksumOut = u32sum(fullResult);
-    DBG('runChunk(): finished', { checksumIn, checksumOut, total_words, outputOffset });
+    const totalTime = ((performance.now() - overallStart) / 1000).toFixed(2);
+    console.log(`✅ ECM Stage 1 complete: ${pp_count} prime powers in ${totalTime}s`);
 
-    const result = fullResult.buffer.slice(0);
+    // Final readback
+    const readBuffer = dev.createBuffer({
+      label: 'ecm-read-buffer-v3',
+      size: bufferSize,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ
+    });
+
+    const finalEncoder = dev.createCommandEncoder({ label: 'ecm-final-encoder-v3' });
+    finalEncoder.copyBufferToBuffer(ioBuffer, 0, readBuffer, 0, bufferSize);
+    dev.queue.submit([finalEncoder.finish()]);
+    await dev.queue.onSubmittedWorkDone();
+
+    await readBuffer.mapAsync(GPUMapMode.READ);
+    const outputData = readBuffer.getMappedRange();
+    const fullResult = new Uint32Array(outputData);
+
+    // Log first few results for debugging
+    console.log('First 3 curve results:');
+    for(let i = 0; i < Math.min(3, n); i++) {
+      const curveOffset = outputOffset + i * CURVE_OUT_WORDS_PER;
+      const status = fullResult[curveOffset + 8];
+      const resultLimbs = Array.from(fullResult.slice(curveOffset, curveOffset + 8));
+
+      // Convert result to hex for easier reading (if non-zero)
+      let resultHex = '0x';
+      for(let j = 7; j >= 0; j--) {
+        resultHex += resultLimbs[j].toString(16).padStart(8, '0');
+      }
+      if (resultHex === '0x0000000000000000000000000000000000000000000000000000000000000000') {
+        resultHex = '0x0';
+      }
+
+      console.log(`  Curve ${i}: status=${status}, result=${resultHex.slice(0, 20)}...`);
+    }
+
+    const checksumOut = u32sum(fullResult);
+    DBG('runChunk(): finished', { checksumOut, totalTime });
+
+    // Return the complete buffer (header + constants + primes + results)
+    const resultSize = outputOffset + n * CURVE_OUT_WORDS_PER;
+    const result = fullResult.slice(0, resultSize).buffer.slice(0);
+
     readBuffer.unmap();
 
     // Cleanup buffers

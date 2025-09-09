@@ -1,11 +1,12 @@
-// kernels/ecm_stage1_webgpu_compute.wgsl - Version 2 (robust)
+// kernels/ecm_stage1_webgpu_compute.wgsl - Version 3 (resumable)
 //  - 256-bit big integers (8x u32, little-endian)
 //  - Montgomery math (CIOS, word=32, L=8)
 //  - Deterministic RNG via 64-bit LCG emulated with u32
 //  - Suyama parametrization
 //  - Binary modular inverse (u32)
 //  - Correct constant-time Montgomery ladder with final swap
-//  - Status codes: 1=no factor, 2=factor found, 3=bad curve/inverse failed
+//  - RESUMABLE: Supports splitting work across multiple GPU submits
+//  - Status codes: 0=needs_more, 1=no factor, 2=factor found, 3=bad curve/inverse failed
 
 // --------------------------- Types & IO ---------------------------
 struct U256 { limbs: array<u32, 8>, };
@@ -28,7 +29,7 @@ struct CurveResult {
 
 struct Header {
   magic      : u32, // "ECM1"
-  version    : u32, // 2
+  version    : u32, // 3 for resumable
   rsv0       : u32,
   rsv1       : u32,
   pp_count   : u32,
@@ -37,8 +38,16 @@ struct Header {
   seed_hi    : u32,
   base_curve : u32,
   flags      : u32,
-  rsv2       : u32,
-  rsv3       : u32,
+  pp_start   : u32, // NEW: starting index for this pass
+  pp_len     : u32, // NEW: number of pp to process this pass
+};
+
+struct CurveState {
+  X_limbs    : array<u32, 8>,
+  Z_limbs    : array<u32, 8>,
+  A24_limbs  : array<u32, 8>,
+  sigma      : u32,  // for debugging/reproducibility
+  curve_ok   : u32,  // 1 if curve is valid
 };
 
 struct IO { words: array<u32>, };
@@ -54,10 +63,14 @@ fn getHeader() -> Header {
 }
 
 fn constOffset() -> u32 { return 12u; }
-fn ppOffset()    -> u32 { return constOffset() + (8u*3u + 4u); } // N(8)+R2(8)+mont_one(8)+n0inv32(1)+pad(3)
+fn ppOffset()    -> u32 { return constOffset() + (8u*3u + 4u); }
 fn outOffset(h: Header) -> u32 { return ppOffset() + h.pp_count; }
+fn stateOffset(h: Header) -> u32 {
+  return outOffset(h) + h.n_curves * (8u + 1u + 3u); // after output section
+}
 
 const LIMBS : u32 = 8u;
+const STATE_WORDS_PER_CURVE : u32 = 8u + 8u + 8u + 2u; // X + Z + A24 + (sigma, curve_ok)
 
 // --------------------------- Small helpers ---------------------------
 fn set_zero() -> U256 { var r:U256; for (var i=0u;i<8u;i++){ r.limbs[i]=0u; } return r; }
@@ -69,6 +82,7 @@ fn is_zero(a: U256) -> bool {
   for (var i=0u;i<8u;i++){ x |= a.limbs[i]; }
   return x == 0u;
 }
+
 fn cmp(a: U256, b: U256) -> i32 {
   for (var i:i32=7; i>=0; i--) {
     let ai = a.limbs[u32(i)];
@@ -78,6 +92,7 @@ fn cmp(a: U256, b: U256) -> i32 {
   }
   return 0;
 }
+
 fn is_even(a: U256) -> bool { return (a.limbs[0] & 1u) == 0u; }
 
 fn rshift1(a: U256) -> U256 {
@@ -98,6 +113,7 @@ fn addc(a:u32, b:u32, cin:u32) -> vec2<u32> {
   let c2 = select(0u, 1u, s2 < cin);
   return vec2<u32>(s2, c1 + c2);
 }
+
 fn subb(a:u32, b:u32, bin:u32) -> vec2<u32> {
   let d = a - b;
   let b1 = select(0u, 1u, a < b);
@@ -115,6 +131,7 @@ fn add_u256(a: U256, b: U256) -> U256 {
   }
   return r;
 }
+
 fn sub_u256(a: U256, b: U256) -> U256 {
   var r: U256;
   var br:u32 = 0u;
@@ -124,21 +141,23 @@ fn sub_u256(a: U256, b: U256) -> U256 {
   }
   return r;
 }
+
 fn cond_sub_N(a: U256, N: U256) -> U256 {
   if (cmp(a, N) >= 0) { return sub_u256(a, N); }
   return a;
 }
+
 fn add_mod(a: U256, b: U256, N: U256) -> U256 {
   return cond_sub_N(add_u256(a, b), N);
 }
+
 fn sub_mod(a: U256, b: U256, N: U256) -> U256 {
   if (cmp(a, b) >= 0) { return sub_u256(a, b); }
-  // a < b  =>  N - (b - a)
   let diff = sub_u256(b, a);
   return sub_u256(N, diff);
 }
 
-// 32x32 -> 64 multiply via 16-bit split. Returns (lo, hi).
+// 32x32 -> 64 multiply via 16-bit split
 fn mul32x32_64(a: u32, b: u32) -> vec2<u32> {
   let a0 = a & 0xFFFFu; let a1 = a >> 16u;
   let b0 = b & 0xFFFFu; let b1 = b >> 16u;
@@ -164,7 +183,7 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
   for (var i=0u;i<8u;i++){
     var carry:u32 = 0u;
     for (var j=0u;j<8u;j++){
-      let prod = mul32x32_64(a.limbs[i], b.limbs[j]); // (lo,hi)
+      let prod = mul32x32_64(a.limbs[i], b.limbs[j]);
       let s1 = addc(t[j], prod.x, 0u);
       let s2 = addc(s1.x, carry, 0u);
       t[j] = s2.x;
@@ -196,16 +215,24 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
 fn mont_add(a: U256, b: U256, N: U256) -> U256 {
   return cond_sub_N(add_u256(a, b), N);
 }
+
 fn mont_sub(a: U256, b: U256, N: U256) -> U256 {
   if (cmp(a,b) >= 0) { return sub_u256(a,b); }
-  // a < b  =>  a - b (mod N) = N - (b - a)
   let diff = sub_u256(b, a);
   return sub_u256(N, diff);
 }
-fn mont_sqr(a: U256, N: U256, n0inv32: u32) -> U256 { return mont_mul(a, a, N, n0inv32); }
 
-fn to_mont(a: U256, R2: U256, N: U256, n0inv32: u32) -> U256 { return mont_mul(a, R2, N, n0inv32); }
-fn from_mont(a: U256, N: U256, n0inv32: u32) -> U256 { return mont_mul(a, set_one(), N, n0inv32); }
+fn mont_sqr(a: U256, N: U256, n0inv32: u32) -> U256 {
+  return mont_mul(a, a, N, n0inv32);
+}
+
+fn to_mont(a: U256, R2: U256, N: U256, n0inv32: u32) -> U256 {
+  return mont_mul(a, R2, N, n0inv32);
+}
+
+fn from_mont(a: U256, N: U256, n0inv32: u32) -> U256 {
+  return mont_mul(a, set_one(), N, n0inv32);
+}
 
 // --------------------------- X-only ops ---------------------------
 fn xDBL(P: PointXZ, A24: U256, N: U256, n0inv32: u32) -> PointXZ {
@@ -245,10 +272,9 @@ fn cswap(a: ptr<function, PointXZ>, b: ptr<function, PointXZ>, bit: u32) {
   }
 }
 
-// Simple Montgomery ladder (like working version)
 fn ladder(P: PointXZ, k: u32, A24: U256, N: U256, n0inv32: u32, mont_one: U256) -> PointXZ {
-  var R0 = PointXZ(mont_one, set_zero()); // 0*P
-  var R1 = P;                             // 1*P
+  var R0 = PointXZ(mont_one, set_zero());
+  var R1 = P;
   var started = false;
 
   for (var i:i32=31; i>=0; i--) {
@@ -267,7 +293,6 @@ fn ladder(P: PointXZ, k: u32, A24: U256, N: U256, n0inv32: u32, mont_one: U256) 
 
 // --------------------------- RNG (Simple LCG) ---------------------------
 fn lcg32(state: ptr<function, u32>) -> u32 {
-  // Simple 32-bit LCG: state = (state * 1103515245 + 12345) mod 2^32
   let new_state = ((*state) * 1103515245u + 12345u);
   (*state) = new_state;
   return new_state;
@@ -276,14 +301,13 @@ fn lcg32(state: ptr<function, u32>) -> u32 {
 fn next_sigma(_N: U256, state: ptr<function, vec2<u32>>) -> U256 {
   var acc: U256;
   var lcg_state = (*state).x;
-  
+
   for (var i:u32=0u;i<8u;i++){
     acc.limbs[i] = lcg32(&lcg_state);
   }
-  
-  // Update the state
+
   (*state).x = lcg_state;
-  
+
   var sigma = acc;
   if (is_zero(sigma)) { sigma.limbs[0]=6u; }
   let one = set_one();
@@ -292,19 +316,17 @@ fn next_sigma(_N: U256, state: ptr<function, vec2<u32>>) -> U256 {
 }
 
 // --------------------------- Binary modular inverse ---------------------------
-// Returns inverse of a mod N if gcd(a,N)==1
 fn mod_inverse(a_in: U256, N: U256) -> InvResult {
   if (is_zero(a_in)) { return InvResult(false, set_zero()); }
 
-  // reduce a mod N with up to two subs (good enough for random data)
   var a = a_in;
   for (var k=0u; k<2u && cmp(a, N) >= 0; k++){ a = sub_u256(a, N); }
   if (is_zero(a)) { return InvResult(false, set_zero()); }
 
   var u = a;
   var v = N;
-  var x1 = set_one();  // coeff for a
-  var x2 = set_zero(); // coeff for N
+  var x1 = set_one();
+  var x2 = set_zero();
 
   for (var iter=0u; iter<20000u; iter++){
     if (cmp(u, set_one()) == 0) { return InvResult(true, x1); }
@@ -334,27 +356,17 @@ fn mod_inverse(a_in: U256, N: U256) -> InvResult {
 }
 
 // --------------------------- Curve generation (Suyama) ---------------------------
-// Given sigma, compute X1 and A24 in Montgomery domain:
-//   u = σ^2 - 5
-//   v = 4σ
-//   X1 = (u^2 - v^2)^3 / (4uv)^2  (correct Suyama starting point)
-//   A24 = ((A+2)/4) where A = ((v-u)^3 * (3u+v)) / (4 u^3 v) - 2
 fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
-  // mont versions of constants and sigma
   let sigma_m = to_mont(sigma, R2, N, n0inv32);
   let five_m  = to_mont(u256_from_u32(5u),  R2, N, n0inv32);
   let four_m  = to_mont(u256_from_u32(4u),  R2, N, n0inv32);
   let three_m = to_mont(u256_from_u32(3u),  R2, N, n0inv32);
   let two_m   = to_mont(u256_from_u32(2u),  R2, N, n0inv32);
 
-  // u = σ^2 - 5  (mont)
   let sigma_sq_m = mont_sqr(sigma_m, N, n0inv32);
   let u_m = mont_sub(sigma_sq_m, five_m, N);
-
-  // v = 4σ       (mont)
   let v_m = mont_mul(four_m, sigma_m, N, n0inv32);
 
-  // Check for degenerate cases (avoid σ ∈ {0, ±1, ±2})
   let sigma_std = from_mont(sigma_m, N, n0inv32);
   let u_std = from_mont(u_m, N, n0inv32);
   let v_std = from_mont(v_m, N, n0inv32);
@@ -369,15 +381,12 @@ fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
     return CurveResult(false, set_zero(), set_zero());
   }
 
-  // Check invertibility - if not invertible, we might have found a factor
-  // But don't reject the curve, let the GCD handle it
   let inv_u = mod_inverse(u_std, N);
   let inv_v = mod_inverse(v_std, N);
   if (!inv_u.ok || !inv_v.ok) {
-    return CurveResult(false, set_zero(), set_zero()); // caller may GCD later
+    return CurveResult(false, set_zero(), set_zero());
   }
 
-  // X1 = (u^2 - v^2)^3 / (4uv)^2  (mont)
   let u_sq_m = mont_sqr(u_m, N, n0inv32);
   let v_sq_m = mont_sqr(v_m, N, n0inv32);
   let u2_v2_m = mont_sub(u_sq_m, v_sq_m, N);
@@ -394,7 +403,6 @@ fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
 
   let X1m = mont_mul(u2_v2_cubed_m, inv_four_uv_sq_m, N, n0inv32);
 
-  // A24 = ((A+2)/4) where A = ((v-u)^3 * (3u+v)) / (4 u^3 v) - 2
   let vm_u_m = mont_sub(v_m, u_m, N);
   let vm_u_sq_m = mont_sqr(vm_u_m, N, n0inv32);
   let vm_u_cubed_m = mont_mul(vm_u_m, vm_u_sq_m, N, n0inv32);
@@ -412,62 +420,14 @@ fn generate_curve(sigma: U256, N: U256, R2: U256, n0inv32: u32) -> CurveResult {
 
   let numerator_m = mont_mul(vm_u_cubed_m, three_u_plus_v_m, N, n0inv32);
   let A_plus_2_m = mont_mul(numerator_m, inv_four_u3_v_m, N, n0inv32);
-  let A_m = mont_sub(A_plus_2_m, two_m, N);
 
-  // A24 = (A + 2) / 4 = A_plus_2 / 4
   let inv4_m = to_mont(mod_inverse(u256_from_u32(4u), N).val, R2, N, n0inv32);
   let A24m = mont_mul(A_plus_2_m, inv4_m, N, n0inv32);
 
   return CurveResult(true, A24m, X1m);
 }
 
-// --------------------------- GCD (slow) ---------------------------
-fn gcd_u256(a_in: U256, b_in: U256) -> U256 {
-  var a = a_in; var b = b_in;
-  if (is_zero(a)) { return b; }
-  if (is_zero(b)) { return a; }
-  for (var iter=0u; iter<4096u; iter++){
-    if (is_zero(a)) { return b; }
-    if (is_zero(b)) { return a; }
-    if (cmp(a,b) >= 0) { a = sub_u256(a,b); } else { b = sub_u256(b,a); }
-  }
-  if (is_zero(a)) { return b; }
-  return a;
-}
-
-
-fn lshift1_from_add(x: U256) -> U256 {
-  return add_u256(x, x);
-}
-
-override HAVE_LSHIFT1_U256: bool = true;
-
-fn lshift1_u256(a: U256) -> U256 {
-  var r: U256;
-  var carry: u32 = 0u;
-  for (var i: u32 = 0u; i < 8u; i++) {
-    let w = a.limbs[i];
-    r.limbs[i] = (w << 1u) | carry;
-    carry = w >> 31u;
-  }
-  return r;
-}
-
-fn lshiftk_u256(x: U256, k: u32) -> U256 {
-  var r = x;
-  for (var i: u32 = 0u; i < k; i++) {
-    if (HAVE_LSHIFT1_U256) {
-      r = lshift1_u256(r);
-    } else {
-      r = lshift1_from_add(r);
-    }
-  }
-  return r;
-}
-
-
-// Optimized variant when the RIGHT operand is known odd (ECM case: N is odd).
-// In this case, the common power of two is zero, so we can skip restoring 2^shift.
+// --------------------------- GCD (binary, optimized for odd N) ---------------------------
 fn gcd_binary_u256_oddN(a_in: U256, N_odd: U256) -> U256 {
   var a = a_in;
   var b = N_odd;
@@ -483,13 +443,48 @@ fn gcd_binary_u256_oddN(a_in: U256, N_odd: U256) -> U256 {
   }
 }
 
+// --------------------------- State management ---------------------------
+fn load_state(idx: u32, h: Header) -> CurveState {
+  let state_base = stateOffset(h) + idx * STATE_WORDS_PER_CURVE;
+  var state: CurveState;
+
+  for (var i = 0u; i < 8u; i++) {
+    state.X_limbs[i] = io.words[state_base + i];
+  }
+  for (var i = 0u; i < 8u; i++) {
+    state.Z_limbs[i] = io.words[state_base + 8u + i];
+  }
+  for (var i = 0u; i < 8u; i++) {
+    state.A24_limbs[i] = io.words[state_base + 16u + i];
+  }
+  state.sigma = io.words[state_base + 24u];
+  state.curve_ok = io.words[state_base + 25u];
+
+  return state;
+}
+
+fn save_state(idx: u32, h: Header, state: CurveState) {
+  let state_base = stateOffset(h) + idx * STATE_WORDS_PER_CURVE;
+
+  for (var i = 0u; i < 8u; i++) {
+    io.words[state_base + i] = state.X_limbs[i];
+  }
+  for (var i = 0u; i < 8u; i++) {
+    io.words[state_base + 8u + i] = state.Z_limbs[i];
+  }
+  for (var i = 0u; i < 8u; i++) {
+    io.words[state_base + 16u + i] = state.A24_limbs[i];
+  }
+  io.words[state_base + 24u] = state.sigma;
+  io.words[state_base + 25u] = state.curve_ok;
+}
+
 // --------------------------- Entry ---------------------------
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   let h = getHeader();
   if (idx >= h.n_curves) { return; }
-  
 
   // Load constants
   var off = constOffset();
@@ -497,80 +492,117 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   for (var i=0u;i<8u;i++){ N.limbs[i] = io.words[off+i]; }        off += 8u;
   for (var i=0u;i<8u;i++){ R2.limbs[i] = io.words[off+i]; }       off += 8u;
   for (var i=0u;i<8u;i++){ mont_one.limbs[i] = io.words[off+i]; } off += 8u;
-  let n0inv32 = io.words[off];                                    off += 4u; // +pad(3)
+  let n0inv32 = io.words[off];                                    off += 4u;
 
   let pp_off = ppOffset();
   let out_base = outOffset(h) + idx * (8u + 1u + 3u);
 
-  // RNG state (per curve) - ensure non-zero state
-  var rng: vec2<u32>;
-  let global_curve_idx = h.base_curve + idx;
-  rng.x = h.seed_lo ^ global_curve_idx ^ 0x12345678u;
-  rng.y = h.seed_hi ^ (global_curve_idx * 0x9E3779B9u) ^ 0x87654321u;
-  
-  // Ensure state is non-zero
-  if (rng.x == 0u && rng.y == 0u) {
-    rng.x = 0x12345678u + global_curve_idx;
-    rng.y = 0x87654321u + global_curve_idx;
-  }
-  
-
-  // Curve generation
+  var R: PointXZ;
   var A24m: U256;
-  var X1m : U256;
-  var curve_ok = false;
+  var sigma_val: u32 = 0u;
+  var curve_ok: bool = false;
 
-  for (var tries:u32=0u; tries<4u && !curve_ok; tries++){
-    let sigma = next_sigma(N, &rng);
-    let cr = generate_curve(sigma, N, R2, n0inv32);
-    if (cr.ok) {
-      A24m = cr.A24m;
-      X1m  = cr.X1m;
-      curve_ok = true;
-      
-      // Debug: store sigma in output for debugging
-      // for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = sigma.limbs[i]; }
-      // io.words[out_base+8u] = 70u; // debug status - curve generated
+  // Check if this is a fresh start or resume
+  if (h.pp_start == 0u) {
+    // Fresh start - generate curve
+    var rng: vec2<u32>;
+    let global_curve_idx = h.base_curve + idx;
+    rng.x = h.seed_lo ^ global_curve_idx ^ 0x12345678u;
+    rng.y = h.seed_hi ^ (global_curve_idx * 0x9E3779B9u) ^ 0x87654321u;
+
+    if (rng.x == 0u && rng.y == 0u) {
+      rng.x = 0x12345678u + global_curve_idx;
+      rng.y = 0x87654321u + global_curve_idx;
     }
+
+    // Try generating a valid curve
+    for (var tries:u32=0u; tries<4u && !curve_ok; tries++){
+      let sigma = next_sigma(N, &rng);
+      sigma_val = sigma.limbs[0]; // Store first limb for debugging
+      let cr = generate_curve(sigma, N, R2, n0inv32);
+      if (cr.ok) {
+        A24m = cr.A24m;
+        R = PointXZ(cr.X1m, mont_one);
+        curve_ok = true;
+      }
+    }
+
+    if (!curve_ok) {
+      // Bad curve - write error status
+      for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = 0u; }
+      io.words[out_base+8u] = 3u; // bad curve status
+      return;
+    }
+  } else {
+    // Resume - load saved state
+    let state = load_state(idx, h);
+    var X: U256;
+    var Z: U256;
+    for (var i = 0u; i < 8u; i++) {
+      X.limbs[i] = state.X_limbs[i];
+      Z.limbs[i] = state.Z_limbs[i];
+      A24m.limbs[i] = state.A24_limbs[i];
+    }
+    R = PointXZ(X, Z);
+    sigma_val = state.sigma;
+    curve_ok = (state.curve_ok == 1u);
   }
 
   if (!curve_ok) {
-    // status=3 => bad curve / inverse failed
+    // Shouldn't happen on resume, but be safe
     for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = 0u; }
-    io.words[out_base+8u] = 71u; // debug status - curve generation failed
+    io.words[out_base+8u] = 3u;
     return;
   }
 
-  // Stage 1 ladder
-  var P = PointXZ(X1m, mont_one);
-  var R = P;
+  // Process prime powers in this window
+  let pp_end = min(h.pp_start + h.pp_len, h.pp_count);
 
-  for (var i=0u; i<h.pp_count; i++){
+  for (var i = h.pp_start; i < pp_end; i++) {
     let pp = io.words[pp_off + i];
-    if (pp <= 1u) { continue; }
-    R = ladder(R, pp, A24m, N, n0inv32, mont_one);
-  }
-
-  // Output
-  var result = set_zero();
-  var status: u32 = 1u; // default: completed, no factor found
-
-  if ((h.flags & 1u) != 0u) {
-    let Zstd = from_mont(R.Z, N, n0inv32);
-    let g = gcd_binary_u256_oddN(Zstd, N);
-    result = g;
-
-    let one = set_one();
-    if (!is_zero(g) && (cmp(g, N) < 0) && (cmp(g, one) > 0)) {
-      status = 2u; // non-trivial factor found
-    } else {
-      status = 1u; // no factor
+    if (pp > 1u) {
+      R = ladder(R, pp, A24m, N, n0inv32, mont_one);
     }
-  } else {
-    result = from_mont(R.Z, N, n0inv32);
-    status = 1u;
   }
 
-  for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = result.limbs[i]; }
-  io.words[out_base+8u] = status;
+  // Check if we're done or need more passes
+  if (pp_end < h.pp_count) {
+    // Not done - save state for next pass
+    var state: CurveState;
+    for (var i = 0u; i < 8u; i++) {
+      state.X_limbs[i] = R.X.limbs[i];
+      state.Z_limbs[i] = R.Z.limbs[i];
+      state.A24_limbs[i] = A24m.limbs[i];
+    }
+    state.sigma = sigma_val;
+    state.curve_ok = 1u;
+    save_state(idx, h, state);
+
+    // Write status 0 (needs more) to output
+    io.words[out_base+8u] = 0u;
+  } else {
+    // Done - compute final result
+    var result = set_zero();
+    var status: u32 = 1u; // default: no factor
+
+    if ((h.flags & 1u) != 0u) {
+      let Zstd = from_mont(R.Z, N, n0inv32);
+      let g = gcd_binary_u256_oddN(Zstd, N);
+      result = g;
+
+      let one = set_one();
+      if (!is_zero(g) && (cmp(g, N) < 0) && (cmp(g, one) > 0)) {
+        status = 2u; // factor found
+      } else {
+        status = 1u; // no factor
+      }
+    } else {
+      result = from_mont(R.Z, N, n0inv32);
+      status = 1u;
+    }
+
+    // Write final result
+    for (var i:u32=0u;i<8u;i++){ io.words[out_base+i] = result.limbs[i]; }
+    io.words[out_base+8u] = status;
+  }
 }
