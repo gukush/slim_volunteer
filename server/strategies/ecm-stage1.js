@@ -13,7 +13,9 @@ export function getClientExecutorInfo(config, inputArgs){
   return {
     framework,
     path: 'executors/webgpu-ecm-stage1.client.js',
-    kernels: ['kernels/ecm_stage1_webgpu_compute.wgsl'],
+    kernels: ['kernels/webgpu/ecm_stage1_webgpu_compute.wgsl','kernels/cuda/ecm_stage1_cuda.cu',
+      'kernels/opencl/ecm_stage1_opencl.cl'
+    ],
     schema: { output: 'Uint32Array' },
   };
 }
