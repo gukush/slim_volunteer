@@ -93,13 +93,42 @@ function notifyListenerChunkComplete(chunkId, status) {
   }, 0);
 }
 
-socket.on('connect', ()=>{
+socket.on('connect', async ()=>{
   statusEl.textContent = 'connected';
   log('info', 'Connected', socket.id);
   const frameworks = ['cuda','vulkan','opencl','cpp-wasm'];
-  if('gpu' in navigator) frameworks.push('webgpu');
+  let gpuInfo = null;
+
+  if('gpu' in navigator) {
+    frameworks.push('webgpu');
+    try {
+      // Collect GPU adapter information
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) {
+        gpuInfo = {
+          vendor: adapter.info?.vendor || 'unknown',
+          architecture: adapter.info?.architecture || 'unknown',
+          device: adapter.info?.device || 'unknown',
+          description: adapter.info?.description || 'unknown',
+          // Check for SwiftShader (software renderer)
+          isSwiftShader: adapter.info?.vendor?.toLowerCase().includes('swiftshader') ||
+                        adapter.info?.description?.toLowerCase().includes('swiftshader') ||
+                        adapter.info?.device?.toLowerCase().includes('swiftshader')
+        };
+        log('info', 'GPU Info collected:', gpuInfo);
+      }
+    } catch (error) {
+      log('warn', 'Failed to collect GPU info:', error);
+    }
+  }
+
   const capacity = Number(qs.cap || qs.capacity || 1);
-  socket.emit('hello', { workerId: qs.workerId || socket.id, frameworks, capacity });
+  socket.emit('hello', {
+    workerId: qs.workerId || socket.id,
+    frameworks,
+    capacity,
+    gpuInfo
+  });
 
   // Connect to listener if enabled
   if (enableListener) {

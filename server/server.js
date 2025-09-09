@@ -75,7 +75,31 @@ const tm = new TaskManager({
 // Socket.IO handlers (unchanged - this is what your browser uses)
 io.on('connection', (socket)=>{
   logger.info('Browser client connected via Socket.IO:', socket.id);
-  socket.on('hello', (info)=>tm.registerClient(socket, info||{}, 'socketio'));
+  socket.on('hello', (info)=>{
+    // Log GPU information if available
+    if (info.gpuInfo) {
+      const gpuInfo = info.gpuInfo;
+      logger.info('🖥️  GPU Information from browser client:', {
+        clientId: socket.id,
+        vendor: gpuInfo.vendor,
+        architecture: gpuInfo.architecture,
+        device: gpuInfo.device,
+        description: gpuInfo.description,
+        isSwiftShader: gpuInfo.isSwiftShader
+      });
+
+      // Special warning for SwiftShader
+      if (gpuInfo.isSwiftShader) {
+        logger.warn('⚠️  WARNING: Client is using SwiftShader (software renderer) - performance will be significantly reduced');
+      } else {
+        logger.info('✅ Client is using hardware GPU acceleration');
+      }
+    } else {
+      logger.info('ℹ️  No GPU information available from client:', socket.id);
+    }
+
+    tm.registerClient(socket, info||{}, 'socketio');
+  });
   socket.on('disconnect', ()=>tm.removeClient(socket.id));
   socket.on('chunk:result', (data)=>tm.receiveResult(socket.id, data));
 });
