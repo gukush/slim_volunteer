@@ -196,8 +196,19 @@ export function createExecutor({ kernels, config }){
     for(let i = 0; i < Math.min(5, n); i++) {
       const curveOffset = outputOffset + i * CURVE_OUT_WORDS_PER;
       const status = fullResult[curveOffset + 8];
-      console.log(`Curve ${i}: status=${status}, result limbs:`,
+      const sigma = fullResult[curveOffset + 9];  // Debug: sigma value
+      const curveIdx = fullResult[curveOffset + 10];  // Debug: curve index
+
+      console.log(`Curve ${i} (global ${curveIdx}): status=${status}, sigma=${sigma}, result limbs:`,
         Array.from(fullResult.slice(curveOffset, curveOffset + 8)));
+
+      // Check if sigma values are different
+      if (i > 0) {
+        const prevSigma = fullResult[outputOffset + (i-1) * CURVE_OUT_WORDS_PER + 9];
+        if (sigma === prevSigma) {
+          console.warn(`WARNING: Curve ${i} has same sigma as curve ${i-1}: ${sigma}`);
+        }
+      }
     }
 
     const checksumOut = u32sum(fullResult);

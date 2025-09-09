@@ -437,16 +437,29 @@ fn lshift1_from_add(x: U256) -> U256 {
   return add_u256(x, x);
 }
 
-// Left shift by 'k' using either your lshift1_u256 or the add-based fallback.
-fn lshiftk_u256(mut x: U256, k: u32) -> U256 {
-  for (var i: u32 = 0u; i < k; i++) {
-    #if defined(HAVE_LSHIFT1_U256)
-      x = lshift1_u256(x);
-    #else
-      x = lshift1_from_add(x);
-    #endif
+override HAVE_LSHIFT1_U256: bool = true;
+
+fn lshift1_u256(a: U256) -> U256 {
+  var r: U256;
+  var carry: u32 = 0u;
+  for (var i: u32 = 0u; i < 8u; i++) {
+    let w = a.limbs[i];
+    r.limbs[i] = (w << 1u) | carry;
+    carry = w >> 31u;
   }
-  return x;
+  return r;
+}
+
+fn lshiftk_u256(x: U256, k: u32) -> U256 {
+  var r = x;
+  for (var i: u32 = 0u; i < k; i++) {
+    if (HAVE_LSHIFT1_U256) {
+      r = lshift1_u256(r);
+    } else {
+      r = lshift1_from_add(r);
+    }
+  }
+  return r;
 }
 
 
@@ -456,17 +469,13 @@ fn gcd_binary_u256_oddN(a_in: U256, N_odd: U256) -> U256 {
   var a = a_in;
   var b = N_odd;
 
-  // Preconditions (safe even if not enforced):
-  // - b must be odd (N is odd). If not, fall back to general version.
   if (is_zero(a)) { return b; }
-  // a may be even; strip its factors of two
-  while (is_even(a)) { a = rshift1_u256(a); }
+  while (is_even(a)) { a = rshift1(a); }
 
-  // Main loop as before, but no need to track 'shift' or reintroduce it
   loop {
-    if (is_zero(b)) { return a; } // gcd is a (already odd)
-    while (is_even(b)) { b = rshift1_u256(b); }
-    if (cmp_u256(a, b) > 0) { let t = a; a = b; b = t; }
+    if (is_zero(b)) { return a; }
+    while (is_even(b)) { b = rshift1(b); }
+    if (cmp(a, b) > 0) { let t = a; a = b; b = t; }
     b = sub_u256(b, a);
   }
 }
