@@ -13,6 +13,7 @@ import { TaskManager } from './lib/TaskManager.js';
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = Number(process.env.PORT || 3000);
 const ALLOW_INSECURE = process.env.ALLOW_INSECURE === '1';
+const STORAGE_DIR = process.env.STORAGE_DIR || 'storage';
 
 const app = express();
 app.disable('x-powered-by');
@@ -68,8 +69,8 @@ logger.info(`Native WebSocket server will be available on port ${PORT + 1}`);
 const tm = new TaskManager({
   io,
   wss,
-  storageDir: path.join(process.cwd(), 'storage'),
-  timingDir: path.join(process.cwd(), 'storage', 'timing')
+  storageDir: path.join(process.cwd(), STORAGE_DIR),
+  timingDir: path.join(process.cwd(), STORAGE_DIR, 'timing')
 });
 
 // Socket.IO handlers (unchanged - this is what your browser uses)
@@ -327,7 +328,7 @@ app.get('/tasks/:id/output', (req,res)=>{
   const t = tm.getTask(req.params.id);
   if(!t) return res.status(404).json({error:'not found'});
   try {
-    const taskDir = path.join(process.cwd(),'storage','tasks', req.params.id);
+    const taskDir = path.join(process.cwd(), STORAGE_DIR, 'tasks', req.params.id);
     const outPath = path.join(taskDir,'output.bin');
     if(!fs.existsSync(outPath)) return res.status(404).json({error:'output not found'});
     res.setHeader('Content-Type','application/octet-stream');
@@ -381,7 +382,7 @@ app.post('/tasks', (req, res)=>{
 
   bb.on('file', (name, file, info)=>{
     const { filename } = info;
-    const tmpDir = path.join(process.cwd(), 'uploads');
+    const tmpDir = path.join(process.cwd(), STORAGE_DIR, 'uploads');
     fs.mkdirSync(tmpDir, { recursive: true });
     const tmpPath = path.join(tmpDir, `${Date.now()}_${Math.random().toString(16).slice(2)}_${filename}`);
     const ws = fs.createWriteStream(tmpPath);
