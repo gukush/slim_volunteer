@@ -156,7 +156,7 @@ export function createExecutor({ kernels, config }){
     // --- RESUMABLE COMPUTATION LOOP ---
 
     // Tuning parameters
-    const TARGET_MS = 50;  // Target time per GPU submit (well below watchdog)
+    const TARGET_MS = 500;  // Target time per GPU submit
     let pp_len = Math.min(1500, pp_count); // Start conservative
     let pp_start = 0;
 
@@ -226,7 +226,7 @@ export function createExecutor({ kernels, config }){
 
       // Adaptive tuning to stay near target time
       if (dt < TARGET_MS / 2 && pp_len < pp_count / 10) {
-        pp_len = Math.min(pp_len * 2, 8000);
+        pp_len = Math.min(pp_len * 2, 10000);
         DBG(`Increasing pp_len to ${pp_len}`);
       } else if (dt > TARGET_MS * 1.5) {
         pp_len = Math.max(Math.floor(pp_len * TARGET_MS / dt), 100);
@@ -242,7 +242,7 @@ export function createExecutor({ kernels, config }){
     }
 
     const totalTime = ((performance.now() - overallStart) / 1000).toFixed(2);
-    console.log(`✅ ECM Stage 1 complete: ${pp_count} prime powers in ${totalTime}s`);
+    console.log(`ECM Stage 1 complete: ${pp_count} prime powers in ${totalTime}s`);
 
     // Final readback
     const readBuffer = dev.createBuffer({
