@@ -96,7 +96,7 @@ function notifyListenerChunkComplete(chunkId, status) {
 socket.on('connect', async ()=>{
   statusEl.textContent = 'connected';
   log('info', 'Connected', socket.id);
-  const frameworks = ['cuda','vulkan','opencl','cpp-wasm'];
+  const frameworks = ['cuda','vulkan','opencl','cpp-wasm','webgpu'];
   let gpuInfo = null;
 
   if('gpu' in navigator) {
