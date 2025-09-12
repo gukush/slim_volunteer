@@ -128,7 +128,7 @@ async function main(){
 
   // Create FormData for multipart upload
   const fd = new FormData();
-  fd.append('strategyId', 'native-block-matmul-flex'); // Strategy ID from exe-block-matmul-flex.js
+  fd.append('strategyId', 'exe-block-matmul-flex'); // Strategy ID from exe-block-matmul-flex.js
   fd.append('K', String(Krep));
   fd.append('label', `native-binary-test`);
   fd.append('config', JSON.stringify(config));
@@ -157,8 +157,8 @@ async function main(){
   const desc = await resp.json();
   const taskId = desc.id;
   console.log(`  Task created: ${taskId}`);
-  console.log(`  Strategy: native-block-matmul-flex`);
-  console.log(`  Framework: native-${backend}`);
+  console.log(`  Strategy: exe-block-matmul-flex`);
+  console.log(`  Framework: binary`);
 
   console.log('\nStep 4: Starting task (will send binary to native client)...');
   resp = await fetch(`${host}/tasks/${taskId}/start`, {

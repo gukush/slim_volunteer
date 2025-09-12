@@ -7,62 +7,69 @@ import fs from 'fs';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../lib/logger.js';
+import { framework } from './block-matmul.js';
 
-export const id = 'native-block-matmul-flex';
+export const id = 'exe-block-matmul-flex';
 export const name = 'Block Matmul (native binary, chunked, streaming)';
 
-// Native client: we just declare the framework and the buffer schema.
-// No browser executor path is returned.
 export function getClientExecutorInfo(config){
   const backend = (config?.backend || 'opencl').toLowerCase();
   if (!['opencl','cuda','vulkan'].includes(backend)) {
     throw new Error(`Unsupported native backend: ${backend}`);
   }
-  // We still pass kernels for reference (e.g., OpenCL kernel source) in case the native runtime wants it,
-  // but the native client is free to ignore this and use its compiled binary instead.
-  const kernels = {
-    opencl: ['kernels/block_matrix_multiply_opencl_kernel.cl'],
-    cuda:   ['kernels/block_matrix_multiply_cuda_kernel.cu'],
-    vulkan: ['kernels/block_matrix_multiply_vulkan_compute.glsl']
-  }[backend];
 
   return {
-    framework: backend,
-    kernels,
+    framework: 'exe',
+    kernels: [],
     schema: {
       order: ['UNIFORMS','INPUTS','OUTPUTS'],
       uniforms: [ { name: 'rows', type: 'i32' }, { name: 'K', type: 'i32' }, { name: 'cols', type: 'i32' } ],
       // two inputs: A (rows x K), B (K x cols); one output: C (rows x cols)
       inputs:  [ { name: 'A', type: 'f32' }, { name: 'B', type: 'f32' } ],
       outputs: [ { name: 'C', type: 'f32' } ]
-    }
+    },
+    artifacts: getArtifacts(config)
   };
 }
 
 export function getArtifacts(config){
 	const backend = (config?.backend || 'opencl').toLowerCase();
-	const defaultBins = {
-		opencl: 'scripts/native/ocl_block_matmul_chunked', // built from this file
-		cuda: 'scripts/native/cuda_block_matmul', // if you add later
-		vulkan: 'scripts/native/vk_block_matmul' // if you add later
+	const artifacts = [];
+
+	// Framework-specific binary paths
+	const frameworkBinaries = {
+		opencl: config.openclBinary || config.binary || 'scripts/native/ocl_block_matmul_chunked',
+		cuda: config.cudaBinary || 'scripts/native/cuda_block_matmul',
+		vulkan: config.vulkanBinary || 'scripts/native/vk_block_matmul'
 	};
-	const rel = config.binary || defaultBins[backend];
-	const abs = path.isAbsolute(rel) ? rel : path.join(process.cwd(), 'server', rel);
-	const bytes = fs.readFileSync(abs);
 
-	// Debug output
-	console.log(`[DEBUG] getArtifacts - config.program: ${config.program}`);
-	console.log(`[DEBUG] getArtifacts - rel: ${rel}`);
-	console.log(`[DEBUG] getArtifacts - path.basename(rel): ${path.basename(rel)}`);
+	const binaryPath = frameworkBinaries[backend];
+	if (!binaryPath) {
+		console.log(`[DEBUG] getArtifacts - Unknown backend ${backend}`);
+		return [];
+	}
 
-	return [{
-		type: 'binary',
-		name: path.basename(rel),
-		program: path.basename(rel), // Use the actual binary name as program name
-		backend,
-		bytes,
-		exec: true
-	}];
+	try {
+		const abs = path.isAbsolute(binaryPath) ? binaryPath : path.join(process.cwd(), 'server', binaryPath);
+		const bytes = fs.readFileSync(abs).toString('base64');
+		const artifactName = config.program || path.basename(binaryPath);
+
+		console.log(`[DEBUG] getArtifacts - Adding binary: ${artifactName} for ${backend}`);
+
+		artifacts.push({
+			type: 'binary',
+			name: artifactName,
+			program: artifactName,
+			backend,
+			bytes,
+			exec: true
+		});
+	} catch (error) {
+		console.error(`[DEBUG] getArtifacts - Failed to read binary ${binaryPath}:`, error.message);
+		throw new Error(`Binary not found for ${backend}: ${binaryPath}`);
+	}
+
+	return artifacts;
 }
 
 function toF32(x){
@@ -196,13 +203,15 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               readWindowAsync(fdB, kb, kNow, jb*baseCols, cNow, M)
             ]);
 
-            // Convert uniforms to raw bytes (not base64 encoded)
+            // Binary mode: prepare raw binary data for stdin
             const uniforms = new Int32Array([rNow, kNow, cNow]);
             const uniformsBytes = new Uint8Array(uniforms.buffer);
 
             // Payload prepared in strict order: UNIFORMS, then INPUTS, then OUTPUTS (placeholder)
             // Send as raw binary data, not base64 encoded
             const payload = {
+              action: 'exec',
+              framework: 'exe',
               buffers: [
                 Array.from(uniformsBytes),  // Raw bytes for uniforms
                 Array.from(new Uint8Array(Ablock)),  // Raw bytes for A
@@ -220,15 +229,13 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               outputSizes: [outputBytes],
               uniforms: [rNow, kNow, cNow],
               backend: config.backend || 'opencl',
+              program: binaryName,
               dispatch: {
                 opencl: { global: [cNow, rNow, 1], local: [16,16,1] },
                 cuda:   { grid:   [Math.ceil(cNow/16), Math.ceil(rNow/16), 1], block: [16,16,1] },
                 vulkan: { groups: [Math.ceil(cNow/16), Math.ceil(rNow/16), 1] }
               }
             };
-
-            // Set the program name to the actual binary name
-            meta.program = binaryName;
 
             yield { id: uuidv4(), payload, meta, tCreate: Date.now() };
 

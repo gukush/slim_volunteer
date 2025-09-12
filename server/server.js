@@ -329,10 +329,19 @@ app.get('/tasks/:id/output', (req,res)=>{
   if(!t) return res.status(404).json({error:'not found'});
   try {
     const taskDir = path.join(process.cwd(), STORAGE_DIR, 'tasks', req.params.id);
-    const outPath = path.join(taskDir,'output.bin');
+    const fileName = req.query.name || 'output.bin';
+    const outPath = path.join(taskDir, fileName);
+
     if(!fs.existsSync(outPath)) return res.status(404).json({error:'output not found'});
-    res.setHeader('Content-Type','application/octet-stream');
-    fs.createReadStream(outPath).pipe(res);
+
+    if (fileName.endsWith('.json')) {
+      res.setHeader('Content-Type','application/json');
+      const data = fs.readFileSync(outPath, 'utf8');
+      res.send(JSON.parse(data));
+    } else {
+      res.setHeader('Content-Type','application/octet-stream');
+      fs.createReadStream(outPath).pipe(res);
+    }
   } catch (e) {
     res.status(500).json({error:e.message});
   }

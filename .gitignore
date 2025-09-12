@@ -15,3 +15,9 @@ server/custom_chunks.json
 server/matrix_16.bin/
 server/test_matrices/
 server/workload1_bigger_matrix_input.txt
+*/*.bin
+server/ecm-test-results*
+*.tar.gz
+.vscode
+server/scripts/tmp
+*.bin

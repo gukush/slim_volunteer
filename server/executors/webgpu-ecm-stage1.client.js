@@ -1,4 +1,4 @@
-// executors/webgpu-ecm-stage1.client.js - Version 3 with Resume Support
+// executors/webgpu-ecm-stage1.client.js - Version 3 with Resume Support + Timestamp Queries
 
 // -------------------- Global cache (per tab/worker) --------------------
 const __WGPU_ECM_CACHE__ = (globalThis.__WGPU_ECM_CACHE__ ||= {
@@ -6,11 +6,24 @@ const __WGPU_ECM_CACHE__ = (globalThis.__WGPU_ECM_CACHE__ ||= {
   deviceId: null,
   // Per-device pipeline caches
   pipelinesByDevice: new WeakMap(), // WeakMap<GPUDevice, Map<string, CachedPipeline>>
+  // Timing infrastructure
+  timingByDevice: new WeakMap(), // WeakMap<GPUDevice, TimingContext>
 });
 
 /**
  * Cached pipeline record
  * @typedef {{ pipeline: GPUComputePipeline, bindGroupLayout: GPUBindGroupLayout, pipelineLayout: GPUPipelineLayout, module: GPUShaderModule }} CachedPipeline
+ */
+
+/**
+ * Timing context for GPU measurements
+ * @typedef {{
+ *   querySet: GPUQuerySet,
+ *   resolveBuffer: GPUBuffer,
+ *   resultBuffer: GPUBuffer,
+ *   capacity: number,
+ *   supportsTimestamps: boolean
+ * }} TimingContext
  */
 
 // Lightweight debug helpers
@@ -21,7 +34,108 @@ const u32sum = (u32) => {
   for (let i = 0; i < u32.length; i++) x ^= (u32[i] >>> 0);
   return ('00000000' + x.toString(16)).slice(-8);
 };
+
 // ----------------------------------------------------------------------
+
+function createTimingContext(device, capacity = 64) {
+  try {
+    const querySet = device.createQuerySet({
+      label: 'ecm-timing-queries',
+      type: 'timestamp',
+      count: capacity,
+    });
+
+    const resolveBuffer = device.createBuffer({
+      label: 'ecm-timing-resolve',
+      size: capacity * 8, // 8 bytes per timestamp
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+
+    const resultBuffer = device.createBuffer({
+      label: 'ecm-timing-result',
+      size: capacity * 8,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    console.log('[ECM] Created timing context with', capacity, 'query slots');
+
+    return {
+      querySet,
+      resolveBuffer,
+      resultBuffer,
+      capacity,
+      supportsTimestamps: true,
+    };
+  } catch (error) {
+    console.warn('[ECM] Timestamp queries not supported:', error.message);
+    return {
+      querySet: null,
+      resolveBuffer: null,
+      resultBuffer: null,
+      capacity: 0,
+      supportsTimestamps: false,
+    };
+  }
+}
+
+function getTimingContext(device) {
+  let timing = __WGPU_ECM_CACHE__.timingByDevice.get(device);
+  if (!timing) {
+    timing = createTimingContext(device);
+    __WGPU_ECM_CACHE__.timingByDevice.set(device, timing);
+  }
+  return timing;
+}
+
+async function measureTimestamps(device, timingCtx, queryStart, queryEnd) {
+  if (!timingCtx.supportsTimestamps) return null;
+
+  try {
+    // Resolve timestamps to buffer
+    const encoder = device.createCommandEncoder({ label: 'timing-resolve' });
+    encoder.resolveQuerySet(
+      timingCtx.querySet,
+      queryStart,
+      queryEnd - queryStart + 1,
+      timingCtx.resolveBuffer,
+      queryStart * 8
+    );
+    encoder.copyBufferToBuffer(
+      timingCtx.resolveBuffer,
+      queryStart * 8,
+      timingCtx.resultBuffer,
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
+    );
+    device.queue.submit([encoder.finish()]);
+
+    // Read back results
+    await timingCtx.resultBuffer.mapAsync(
+      GPUMapMode.READ,
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
+    );
+
+    const arrayBuffer = timingCtx.resultBuffer.getMappedRange(
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
+    );
+    const timestamps = new BigUint64Array(arrayBuffer);
+    const startTime = timestamps[0];
+    const endTime = timestamps[1];
+
+    timingCtx.resultBuffer.unmap();
+
+    // Convert to milliseconds (timestamps are in nanoseconds)
+    const elapsedNs = endTime - startTime;
+    const elapsedMs = Number(elapsedNs) / 1_000_000;
+
+    return elapsedMs;
+  } catch (error) {
+    ERR('Failed to measure GPU timestamps:', error);
+    return null;
+  }
+}
 
 export async function getDevice() {
   DBG('getDevice()');
@@ -31,11 +145,26 @@ export async function getDevice() {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('No WebGPU adapter');
 
-  const device = await adapter.requestDevice();
+  // Request device with timestamp-query feature
+  const requiredFeatures = [];
+  if (adapter.features.has('timestamp-query')) {
+    requiredFeatures.push('timestamp-query');
+    console.log('[ECM] Requesting timestamp-query feature');
+  } else {
+    console.warn('[ECM] timestamp-query feature not available');
+  }
+
+  const device = await adapter.requestDevice({
+    requiredFeatures,
+  });
+
   __WGPU_ECM_CACHE__.device = device;
   __WGPU_ECM_CACHE__.deviceId = Math.random().toString(36).slice(2, 11);
 
   console.log('Created WebGPU device for ECM:', __WGPU_ECM_CACHE__.deviceId);
+
+  // Initialize timing context
+  getTimingContext(device);
 
   // If the device is lost, clear our caches so we can rebuild later
   device.lost.then((info) => {
@@ -43,6 +172,7 @@ export async function getDevice() {
     __WGPU_ECM_CACHE__.device = null;
     __WGPU_ECM_CACHE__.deviceId = null;
     __WGPU_ECM_CACHE__.pipelinesByDevice = new WeakMap();
+    __WGPU_ECM_CACHE__.timingByDevice = new WeakMap();
   }).catch(()=>{ /* no-op */ });
 
   return device;
@@ -110,6 +240,7 @@ export function createExecutor({ kernels, config }){
 
     const dev = await getDevice();
     const { pipeline, bindGroupLayout } = getPipeline(dev, kernelCode);
+    const timingCtx = getTimingContext(dev);
 
     const { data, dims } = payload;
     const { n, pp_count, total_words } = dims;
@@ -189,6 +320,11 @@ export function createExecutor({ kernels, config }){
     console.log(`Starting ECM Stage 1 with B1 ≈ ${pp_count} prime powers`);
     const overallStart = performance.now();
 
+    // Timing accumulation
+    let totalGpuTime = 0;
+    let passCount = 0;
+    let queryIndex = 0;
+
     // Main resume loop
     while (pp_start < pp_count) {
       // Update header with current window
@@ -198,33 +334,62 @@ export function createExecutor({ kernels, config }){
       // Write updated header to GPU
       dev.queue.writeBuffer(ioBuffer, 0, u32.buffer, 0, 48); // Just update header (12 words * 4 bytes)
 
-      // Dispatch compute shader
+      // Dispatch compute shader with timing
       const WG_SIZE = 64;
       const numWorkgroups = Math.ceil(n / WG_SIZE);
 
       const encoder = dev.createCommandEncoder({ label: `ecm-encoder-v3-pass-${pp_start}` });
-      const pass = encoder.beginComputePass({ label: `ecm-pass-v3-${pp_start}` });
+
+      // Set up timestamp queries if available
+      const timestampWrites = timingCtx.supportsTimestamps && queryIndex + 1 < timingCtx.capacity
+        ? {
+            querySet: timingCtx.querySet,
+            beginningOfPassWriteIndex: queryIndex,
+            endOfPassWriteIndex: queryIndex + 1,
+          }
+        : undefined;
+
+      const pass = encoder.beginComputePass({
+        label: `ecm-pass-v3-${pp_start}`,
+        timestampWrites
+      });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bindGroup);
       pass.dispatchWorkgroups(numWorkgroups, 1, 1);
       pass.end();
 
-      // Time this submit
+      // Time this submit (CPU time)
       const t0 = performance.now();
       dev.queue.submit([encoder.finish()]);
       await dev.queue.onSubmittedWorkDone().catch(e => {
         ERR('GPU submit error:', e);
         throw e;
       });
-      const dt = performance.now() - t0;
+      const cpuTime = performance.now() - t0;
+
+      // Measure GPU time if available
+      let gpuTime = null;
+      if (timestampWrites) {
+        gpuTime = await measureTimestamps(dev, timingCtx, queryIndex, queryIndex + 1);
+        if (gpuTime !== null) {
+          totalGpuTime += gpuTime;
+        }
+        queryIndex = (queryIndex + 2) % timingCtx.capacity; // Advance query index
+      }
 
       const processed = u32[11];
-      console.log(`Pass: pp[${pp_start}:${pp_start + processed}] completed in ${dt.toFixed(1)}ms`);
+      const timingInfo = gpuTime !== null
+        ? `CPU: ${cpuTime.toFixed(1)}ms, GPU: ${gpuTime.toFixed(1)}ms`
+        : `CPU: ${cpuTime.toFixed(1)}ms`;
+
+      console.log(`Pass ${passCount}: pp[${pp_start}:${pp_start + processed}] - ${timingInfo}`);
 
       // Update position
       pp_start += processed;
+      passCount++;
 
-      // Adaptive tuning to stay near target time
+      // Adaptive tuning to stay near target time (use CPU time for now)
+      const dt = cpuTime;
       if (dt < TARGET_MS / 2 && pp_len < pp_count / 10) {
         pp_len = Math.min(pp_len * 2, 10000);
         DBG(`Increasing pp_len to ${pp_len}`);
@@ -242,7 +407,8 @@ export function createExecutor({ kernels, config }){
     }
 
     const totalTime = ((performance.now() - overallStart) / 1000).toFixed(2);
-    console.log(`ECM Stage 1 complete: ${pp_count} prime powers in ${totalTime}s`);
+    const avgGpuTime = passCount > 0 && totalGpuTime > 0 ? (totalGpuTime / passCount).toFixed(1) : 'N/A';
+    console.log(`ECM Stage 1 complete: ${pp_count} prime powers in ${totalTime}s (avg GPU: ${avgGpuTime}ms/pass)`);
 
     // Final readback
     const readBuffer = dev.createBuffer({
@@ -280,7 +446,7 @@ export function createExecutor({ kernels, config }){
     }
 
     const checksumOut = u32sum(fullResult);
-    DBG('runChunk(): finished', { checksumOut, totalTime });
+    DBG('runChunk(): finished', { checksumOut, totalTime, totalGpuTime: totalGpuTime.toFixed(1) + 'ms' });
 
     // Return the complete buffer (header + constants + primes + results)
     const resultSize = outputOffset + n * CURVE_OUT_WORDS_PER;
@@ -296,7 +462,13 @@ export function createExecutor({ kernels, config }){
     return {
       status: 'ok',
       result,
-      timings: { tClientRecv, tClientDone }
+      timings: {
+        tClientRecv,
+        tClientDone,
+        totalGpuTimeMs: totalGpuTime,
+        avgGpuTimeMs: passCount > 0 ? totalGpuTime / passCount : 0,
+        passCount
+      }
     };
   }
 

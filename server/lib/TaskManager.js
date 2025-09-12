@@ -3,7 +3,7 @@ import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { getStrategy } from './StrategyRegistry.js';
 import { logger } from './logger.js';
-import { ensureDir, now, writeJSON } from './utils.js';
+import { ensureDir, now, writeJSON, sleep } from './utils.js';
 import { TaskTimers } from './metrics.js';
 import { OSUsageTracker } from './osMetrics.js';
 
@@ -76,8 +76,8 @@ export class TaskManager{
         throw new Error('input file missing buffer/path');
       }
       // NOTE: your original snippet appended a second time here; left as-is if intentional.
-      const size = f.size ?? fs.statSync(dest).size;
-      descriptor.inputFiles.push({ path: dest, originalName: f.originalName, size });
+      //const size = f.size ?? fs.statSync(dest).size;
+      //descriptor.inputFiles.push({ path: dest, originalName: f.originalName, size });
     }
     writeJSON(path.join(taskDir, `task_descriptor_${id}.json`), descriptor);
 
@@ -158,7 +158,10 @@ export class TaskManager{
       for (const client of nativeClients) {
         // Prepare artifacts for native clients (including binary)
         const artifacts = [];
-
+        if (Array.isArray(execInfo.artifacts) && execInfo.artifacts.length) {
+            artifacts.push(...execInfo.artifacts);
+        }
+        /*
         // Add binary as artifact if specified in config
         if (task.descriptor.config.binary) {
           const binaryPath = task.descriptor.config.binary;
@@ -177,8 +180,9 @@ export class TaskManager{
             logger.error(`Failed to read binary ${binaryPath}:`, error);
           }
         }
-
-        // Add input files as artifacts
+        */
+        // Dont add files as part of artifacts, data is read via chunks
+        /*
         if (task.descriptor.inputFiles && task.descriptor.inputFiles.length > 0) {
           for (const file of task.descriptor.inputFiles) {
             try {
@@ -194,7 +198,7 @@ export class TaskManager{
             }
           }
         }
-
+        */
         this._sendToNativeClient(client.socket, 'workload:new', {
           id: id,
           strategyId: task.strategy.id,
@@ -239,8 +243,13 @@ export class TaskManager{
   }
 
   getWorkloadHeader(taskId, { includeArtifacts = false } = {}) {
+    console.log(`[DEBUG] getWorkloadHeader called with taskId: '${taskId}'`);
     const task = this.tasks.get(taskId);
-    if (!task) throw new Error(`Unknown task: ${taskId}`);
+    if (!task) {
+      console.log(`[DEBUG] Task ${taskId} not found in tasks map`);
+      throw new Error(`Unknown task: ${taskId}`);
+    }
+    console.log(`[DEBUG] Found task ${taskId}, task.id: '${task.id}'`);
     const header = {
       taskId: task.id,
       framework: task.clientInfo?.framework || null,
@@ -250,6 +259,7 @@ export class TaskManager{
     if (includeArtifacts && Array.isArray(task.artifacts) && task.artifacts.length) {
       header.artifacts = task.artifacts;
     }
+    console.log(`[DEBUG] Returning header:`, header);
     return header;
   }
 
@@ -263,6 +273,10 @@ export class TaskManager{
     const startTime = Date.now();
     let lastLogTime = startTime;
 
+    // Send metrics:prepare message to listener (1 second advance)
+    this.io.emit('metrics:start', { taskId: task.id });
+    logger.info(`Task ${task.id}: Sent metrics:start to listener`);
+    sleep(500); // allow listener to start collecting metrics
     try {
       for await (const chunk of task.chunker.stream()) {
         if (task.cancelRequested) {
@@ -282,7 +296,10 @@ export class TaskManager{
 
         task.assignments.set(chunk.id, entry);
         task.queue.push(chunk.id);
-        task.timers.chunkRow({ chunkId: chunk.id, replica: -1, tCreate: entry.tCreate });
+        task.timers.chunkRow({
+            chunkId: chunk.id, replica: -1,
+            tCreate: entry.tCreate
+        });
 
         // Try to assign immediately
         this._assignChunkReplica(task, chunk.id);
@@ -544,6 +561,10 @@ export class TaskManager{
 
         // OSUsageTracker: stop on success
         try { task.osTracker?.stop('completed'); } catch {}
+
+        // Send metrics:stop message to listener
+        this.io.emit('metrics:stop', { taskId, outInfo });
+        logger.info(`Task ${taskId}: Sent metrics:stop to listener`);
 
         this.io.emit('task:done', { taskId, outInfo });
         logger.info('Task completed', taskId, outInfo);

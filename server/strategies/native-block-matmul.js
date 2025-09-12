@@ -1,91 +1,154 @@
-// strategies/native-block-matmul.js (Fixed version)
+// strategies/native-block-matmul.js
+// Runtime-dispatched block matmul for native clients (OpenCL / CUDA / Vulkan / CPU via LuaJIT host)
+//
+// Key design points:
+// - Emits chunks with { payload: { action, framework, entry, inputs[], outputSizes[], uniforms[] } }.
+// - Ships a Lua host script as an artifact (host.lua) that selects backend and compiles a kernel at runtime.
+// - Optionally ships kernel sources as artifacts if present (CL/CU/GLSL/SPIR-V).
+// - Assembler writes the final C.bin in row-major order and supports base64 or raw byte return.
+
 import fs from 'fs';
 import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../lib/logger.js';
 
 export const id = 'native-block-matmul';
-export const name = 'Native Block Matrix Multiplication (Binary Execution)';
+export const name = 'Native Block Matrix Multiplication (Native backends via LuaJIT)';
 
-export function getClientExecutorInfo(config) {
-  const framework = (config?.framework || 'native-cuda').toLowerCase();
+// --------- helpers to resolve optional artifacts (kernels + host.lua) ----------
+function tryRead(p){
+  try { return fs.readFileSync(p); } catch { return null; }
+}
 
+function findFirstExisting(paths){
+  for(const p of paths){
+    const b = tryRead(p);
+    if(b) return { path: p, bytes: b };
+  }
+  return null;
+}
+
+// Resolve project root-ish paths: try CWD, strategies/, kernels/, etc.
+function resolveCandidates(rel){
+  const cwd = process.cwd();
+  const here = path.dirname(new URL(import.meta.url).pathname);
+  return [
+    path.join(cwd, rel),
+    path.join(cwd, 'strategies', rel),
+    path.join(cwd, 'kernels', rel),
+    path.join(here, rel),
+    path.join(here, '..', rel),
+    path.join(here, '..', 'kernels', rel),
+  ];
+}
+
+function b64(buf){ return Buffer.isBuffer(buf) ? buf.toString('base64') : Buffer.from(buf).toString('base64'); }
+
+// Build a minimal artifact entry shaped for server.js -> wss.send('workload:new', { artifacts: [...] })
+function makeArtifact({ type='text', name, program, backend, exec=false, bytes }){
+  return { type, name, program, backend, exec, bytes };
+}
+
+// Return framework/backend info + optional artifacts (host.lua + kernels if available)
+export function getClientExecutorInfo(config){
+  const framework = String(config?.framework || 'native-opencl').toLowerCase();
+
+  // Always try to include host.lua so native client can route + compile at runtime.
+  const hostCandidates = resolveCandidates('lua/host_block_matmul.lua');
+  const host = findFirstExisting(hostCandidates);
+
+  // Optional kernels (these are just hints; Lua host can also generate or use its own)
+  const ku = findFirstExisting(resolveCandidates('cuda/block_matrix_multiply_cuda_kernel.cu'));
+  const kl = findFirstExisting(resolveCandidates('opencl/block_matrix_multiply.cl'));
+  const kv = findFirstExisting(resolveCandidates('vulkan/block_matrix_multiply_vulkan_compute.glsl'));
+  //const kspv = findFirstExisting(resolveCandidates('kernels/block_matrix_multiply_vulkan_compute.spv'));
+
+  const artifacts = [];
+  if (host) artifacts.push(makeArtifact({
+    type: 'lua', name: 'host.lua', program: 'host', backend: 'host', bytes: b64(host.bytes)
+  }));
+  if (kl) artifacts.push(makeArtifact({
+    type: 'text', name: path.basename(kl.path), program: 'block_matmul', backend: 'opencl', bytes: b64(kl.bytes)
+  }));
+  if (ku) artifacts.push(makeArtifact({
+    type: 'text', name: path.basename(ku.path), program: 'block_matmul', backend: 'cuda', bytes: b64(ku.bytes)
+  }));
+  if (kv) artifacts.push(makeArtifact({
+    type: 'text', name: path.basename(kv.path), program: 'block_matmul', backend: 'vulkan', bytes: b64(kv.bytes)
+  }));
+  //if (kspv) artifacts.push(makeArtifact({
+  //  type: 'binary', name: path.basename(kspv.path), program: 'block_matmul', backend: 'vulkan', exec: true, bytes: kspv.bytes
+  //}));
+  const schema = {
+    action: 'compile_and_run',
+    order: ['UNIFORMS','INPUTS','OUTPUTS'],
+    uniforms: [
+      { name: 'rows', type: 'i32' },
+      { name: 'K',    type: 'i32' },
+      { name: 'cols', type: 'i32' },
+    ],
+    inputs: [
+      { name: 'A', type: 'f32' }, // rows x K
+      { name: 'B', type: 'f32' }, // K x cols
+    ],
+    outputs: [
+      { name: 'C', type: 'f32' }, // rows x cols
+    ],
+  };
   switch (framework) {
     case 'native-cuda':
       return {
         framework: 'cuda',
-        path: 'executors/native-bridge.client.js',
-        kernels: ['kernels/block_matrix_multiply_cuda_kernel.cu'],
-        schema: {
-          action: 'compile_and_run',
-          inputs: ['float32[]', 'float32[]', 'int32[]'],
-          outputs: ['float32[]']
-        }
+        kernels: ku ? [path.basename(ku.path)] : [],
+        schema,
+        artifacts,
       };
     case 'native-opencl':
       return {
         framework: 'opencl',
-        path: 'executors/native-bridge.client.js',
-        kernels: ['kernels/block_matrix_multiply_opencl_kernel.cl'],
-        schema: {
-          action: 'compile_and_run',
-          inputs: ['float32[]', 'float32[]', 'int32[]'],
-          outputs: ['float32[]']
-        }
+        kernels: kl ? [path.basename(kl.path)] : [],
+        schema,
+        artifacts,
       };
     case 'native-vulkan':
       return {
         framework: 'vulkan',
-        path: 'executors/native-bridge.client.js',
-        kernels: ['kernels/block_matrix_multiply_vulkan_compute.glsl'],
-        schema: {
-          action: 'compile_and_run',
-          inputs: ['float32[]', 'float32[]', 'int32[]'],
-          outputs: ['float32[]']
-        }
+        kernels: kv ? [ path.basename(kv.path) ] : [], //kspv || kv
+        schema,
+        artifacts,
       };
     case 'cpu':
       return {
         framework: 'cpu',
-        path: 'executors/native-bridge.client.js',
         kernels: [],
-        schema: {
-          action: 'cpu_matmul',
-          inputs: ['float32[]', 'float32[]', 'int32[]'],
-          outputs: ['float32[]']
-        }
+        schema,
+        artifacts,
       };
     default:
-      throw new Error(`Unsupported framework for native execution: ${framework}`);
+      throw new Error(`Unsupported framework: ${framework}`);
   }
 }
 
-// Helper functions (copied from block-matmul-flex.js)
-function toF32(x) {
+// ----------------- numeric helpers -----------------
+function toF32(x){
   if (x instanceof ArrayBuffer) return new Float32Array(x);
-  if (ArrayBuffer.isView(x)) return new Float32Array(x.buffer, x.byteOffset, Math.floor(x.byteLength / 4));
-  if (typeof Buffer !== 'undefined' && x instanceof Buffer) return new Float32Array(x.buffer, x.byteOffset, Math.floor(x.byteLength / 4));
-  if (x && x.type === 'Buffer' && Array.isArray(x.data)) {
-    const u8 = Uint8Array.from(x.data);
-    return new Float32Array(u8.buffer);
-  }
+  if (ArrayBuffer.isView(x)) return new Float32Array(x.buffer, x.byteOffset, Math.floor(x.byteLength/4));
+  if (Array.isArray(x)) return Float32Array.from(x);
   throw new Error('Unsupported buffer type for Float32 view');
 }
 
-// ASYNC row-major window reader (fixed from sync version)
-async function readWindowAsync(filePath, rowStart, rowCount, colStart, colCount, rowLen, elementSize = 4) {
+async function readWindowAsync(filePath, rowStart, rowCount, colStart, colCount, rowLen, elementSize=4){
   const out = Buffer.alloc(rowCount * colCount * elementSize);
   const rowBytes = colCount * elementSize;
-
-  const fileHandle = await fs.promises.open(filePath, 'r');
-  try {
-    for (let r = 0; r < rowCount; r++) {
-      const srcOff = ((rowStart + r) * rowLen + colStart) * elementSize;
-      const dstOff = r * rowBytes;
-      await fileHandle.read(out, dstOff, rowBytes, srcOff);
+  const fh = await fs.promises.open(filePath, 'r');
+  try{
+    for(let r=0;r<rowCount;r++){
+      const src = ((rowStart + r) * rowLen + colStart) * elementSize;
+      const dst = r * rowBytes;
+      await fh.read(out, dst, rowBytes, src);
     }
   } finally {
-    await fileHandle.close();
+    await fh.close();
   }
   return out;
 }
@@ -98,7 +161,7 @@ function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }) {
   const C_out = Math.max(1, Math.floor(outFrac * Cn));
   const C_in = Math.max(1, Cn - C_out);
 
-  let cols = Math.min(M, Math.max(1, Math.floor(Math.sqrt(C_out))));
+  let cols = Math.min(M, Math.max(1, Math.floor(C_out / Math.max(1, Math.floor(Math.sqrt(C_out))))));
   if (align > 1) cols -= (cols % align);
   if (cols < 1) cols = Math.min(M, 1);
 
@@ -114,46 +177,24 @@ function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }) {
   return { rows, cols, kTileSize: kSpan };
 }
 
-function pickInputs(files, N, K, M) {
-  if (!files || files.length < 2) throw new Error('No input files uploaded');
-
-  const nameOf = f => f.originalName || (f.path ? path.basename(f.path) : '');
-  const endsWithA = f => /(^|[_\-])A\.bin$/i.test(nameOf(f));
-  const endsWithB = f => /(^|[_\-])B\.bin$/i.test(nameOf(f));
-
-  let Af = files.find(endsWithA);
-  let Bf = files.find(endsWithB);
-  if (Af && Bf) return [Af.path, Bf.path];
-
-  // Size-based fallback
-  const withSize = files.map(f => ({ ...f, size: f.size ?? (f.path ? fs.statSync(f.path).size : 0) }));
-  const targetA = BigInt(N) * BigInt(K) * 4n;
-  const targetB = BigInt(K) * BigInt(M) * 4n;
-  const closest = target => withSize.reduce((best, cur) => {
-    const s = BigInt(cur.size);
-    const d = s > target ? s - target : target - s;
-    return (!best || d < best.diff) ? { diff: d, f: cur } : best;
-  }, null)?.f;
-
-  Af = Af || closest(targetA);
-  Bf = Bf || closest(targetB);
-
-  if (!Af || !Bf || Af.path === Bf.path) {
-    if (files[0]?.path && files[1]?.path) return [files[0].path, files[1].path];
-    throw new Error('Need two input files');
-  }
-  return [Af.path, Bf.path];
+function pickInputs(files, N, K, M){
+  // prefer exact names A.bin/B.bin, else fallback to 2 largest .bin
+  const bins = files.filter(f => f.originalName && /\.bin$/i.test(f.originalName));
+  const byNameA = bins.find(f => /(^|\/)A\.bin$/i.test(f.originalName) || /(^|\/)a\.bin$/i.test(f.originalName));
+  const byNameB = bins.find(f => /(^|\/)B\.bin$/i.test(f.originalName) || /(^|\/)b\.bin$/i.test(f.originalName));
+  if (byNameA && byNameB) return [byNameA.path, byNameB.path];
+  const sorted = bins.slice().sort((a,b)=>b.size-a.size);
+  if (sorted.length >= 2) return [sorted[0].path, sorted[1].path];
+  throw new Error('Need two input files (A.bin and B.bin)');
 }
 
-// Fixed chunker with proper async operations
-export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
+// ----------------- chunker -----------------
+export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const [Afile, Bfile] = pickInputs(inputFiles, config.N, config.K, config.M);
   const { N, K: KK, M } = config;
 
-  // Use same tile parameter logic as block-matmul-flex.js
-  const C = Number(config.chunk_size ?? config.C ?? 16777216); // 16MB default
+  const C = Number(config.chunk_size ?? config.C ?? 16*1024*1024); // ~16MB default
   let baseRows, baseCols, kSpan;
-
   if (config.tileSize || config.kTileSize) {
     const ts = Math.max(1, Number(config.tileSize || 256));
     const ks = Math.max(1, Number(config.kTileSize || Math.min(KK, ts)));
@@ -166,194 +207,152 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
   const nIB = Math.ceil(N / baseRows);
   const nJB = Math.ceil(M / baseCols);
   const totalChunks = nIB * nJB * Math.ceil(KK / kSpan);
-
   logger.info(`Native chunker: ${nIB}×${nJB}×${Math.ceil(KK/kSpan)} = ${totalChunks.toLocaleString()} chunks`);
 
   return {
-    async *stream() {
+    async *stream(){
       let chunkCount = 0;
-
-      for (let ib = 0; ib < nIB; ib++) {
+      for(let ib=0; ib<nIB; ib++){
         const rNow = Math.min(baseRows, N - ib * baseRows);
-
-        for (let jb = 0; jb < nJB; jb++) {
+        for(let jb=0; jb<nJB; jb++){
           const cNow = Math.min(baseCols, M - jb * baseCols);
-
-          for (let kb = 0; kb < KK; kb += kSpan) {
+          for(let kb=0; kb<KK; kb += kSpan){
             const kNow = Math.min(kSpan, KK - kb);
 
-            try {
-              // ASYNC file reading (fixed)
-              const [Ablock, Bblock] = await Promise.all([
-                readWindowAsync(Afile, ib * baseRows, rNow, kb, kNow, KK, 4),
-                readWindowAsync(Bfile, kb, kNow, jb * baseCols, cNow, M, 4)
-              ]);
+            // read tiles
+            const [Ablock, Bblock] = await Promise.all([
+              readWindowAsync(Afile, ib*baseRows, rNow, kb,   kNow, KK, 4),
+              readWindowAsync(Bfile, kb,          kNow, jb*baseCols, cNow, M, 4),
+            ]);
 
-              // Prepare data for native client (compatible with server_client.cpp format)
-              const dims = new Int32Array([rNow, kNow, cNow]);
+            const dims = new Int32Array([rNow, kNow, cNow]);
+            const aBase64 = Ablock.toString('base64');
+            const bBase64 = Bblock.toString('base64');
+            const dBase64 = Buffer.from(dims.buffer).toString('base64');
+            const framework = String(config.framework || 'native-opencl').toLowerCase().replace(/^native-/, '');
 
-              // Convert to base64 for JSON transport (matching server_client.cpp expectations)
-              const aBase64 = Ablock.toString('base64');
-              const bBase64 = Bblock.toString('base64');
-              const dimsBase64 = Buffer.from(dims.buffer).toString('base64');
+            const payload = {
+              action: framework === 'cpu' ? 'cpu_matmul' : 'compile_and_run',
+              framework, // 'opencl' | 'cuda' | 'vulkan' | 'cpu'
+              entry: 'execute_task',
+              // For OpenCL/CUDA, pass only A and B. Dims go via uniforms.
+              inputs: [{ data: aBase64 }, { data: bBase64 }],
+              outputSizes: [rNow * cNow * 4],
+              uniforms: [rNow, kNow, cNow],
+            };
 
-              const framework = (config.framework || 'native-cuda').toLowerCase();
+            // If you later add a Vulkan path that *requires* a uniform buffer,
+            // you can opt-in to append it here behind a flag:
+            // if (framework === 'vulkan' && config.useUniformBuffer) {
+            //   payload.inputs.push({ data: dBase64 });
+            // }
 
-              const payload = {
-                // Native client format (matching server_client.cpp)
-                action: framework === 'cpu' ? 'cpu_matmul' : 'compile_and_run',
-                framework: framework.replace('native-', ''),
-                entry: 'main',
-                inputs: [
-                  { data: aBase64 },  // A matrix
-                  { data: bBase64 },  // B matrix
-                  { data: dimsBase64 } // dimensions
-                ],
-                outputSizes: [rNow * cNow * 4],
-                uniforms: [rNow, kNow, cNow],
+            const meta = {
+              ib, jb, kb,
+              rows: rNow, cols: cNow, kSpan: kNow,
+              baseRows, baseCols,
+            };
 
-                // Keep compatibility fields for other executors
-                a: Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength),
-                b: Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength),
-                dims: { rows: rNow, K: kNow, cols: cNow }
-              };
-
-              const meta = {
-                ib, jb, kb, kSpan: kNow, rows: rNow, cols: cNow, baseRows, baseCols,
-                framework,
-                outputSizes: [rNow * cNow * 4],
-                uniforms: [rNow, kNow, cNow]
-              };
-
-              // Add framework-specific execution parameters
-              if (framework === 'native-cuda') {
-                meta.grid = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
-                meta.block = [16, 16, 1];
-                payload.grid = meta.grid;
-                payload.block = meta.block;
-              } else if (framework === 'native-opencl') {
-                meta.global = [cNow, rNow, 1];
-                meta.local = [16, 16, 1];
-                payload.global = meta.global;
-                payload.local = meta.local;
-              } else if (framework === 'native-vulkan') {
-                meta.groups = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1];
-                payload.groups = meta.groups;
-              }
-
-              yield {
-                id: uuidv4(),
-                payload,
-                meta,
-                tCreate: Date.now()
-              };
-
-              chunkCount++;
-
-              // Progress logging
-              if (chunkCount % 100 === 0) {
-                logger.info(`Generated ${chunkCount.toLocaleString()}/${totalChunks.toLocaleString()} chunks`);
-              }
-
-              // Yield control to prevent event loop blocking
-              if (chunkCount % 25 === 0) {
-                await new Promise(resolve => setImmediate(resolve));
-              }
-
-            } catch (error) {
-              logger.error(`Native chunk generation failed at (${ib},${jb},${kb}):`, error.message);
-              throw error;
-            }
+            yield {  id: uuidv4(), payload, meta, tCreate: Date.now() };
+            chunkCount++;
+            if (chunkCount % 50 === 0) await new Promise(r=>setImmediate(r));
           }
         }
       }
-
       logger.info(`Native chunker completed: ${chunkCount.toLocaleString()} chunks`);
     }
   };
 }
 
-// Fixed assembler (same as block-matmul-flex.js)
-export function buildAssembler({ taskId, taskDir, config }) {
-  const { N, M, K } = config;
-  const outPath = path.join(taskDir, 'output.bin');
-
+// ----------------- assembler -----------------
+export function buildAssembler({ taskId, taskDir, config }){
+  const { N, M } = config;
+  const outPath = path.join(taskDir, `C_${uuidv4()}.bin`);
   const fdC = fs.openSync(outPath, 'w+');
-  const totalBytes = Number(N) * Number(M) * 4;
-  fs.ftruncateSync(fdC, totalBytes);
+  fs.ftruncateSync(fdC, N * M * 4);
 
   const acc = new Map();
-  const progressedK = new Map();
   const sizes = new Map();
+  const key = (i,j)=>`${i},${j}`;
 
-  const key = (ib, jb) => `${ib},${jb}`;
-
-  function writeTileToFile(tileF32, ib, jb, rows, cols, baseRows, baseCols) {
+  function writeTileToFile(tileF32, ib, jb, rows, cols, baseRows, baseCols){
     const rowBytes = cols * 4;
-    for (let r = 0; r < rows; r++) {
-      const globalRow = ib * baseRows + r;
-      const globalColStart = jb * baseCols;
+    for(let r=0;r<rows;r++){
+      const globalRow = ib*baseRows + r;
+      const globalColStart = jb*baseCols;
       const fileIndex = globalRow * M + globalColStart;
       const fileOffsetBytes = fileIndex * 4;
-      const buf = Buffer.from(tileF32.buffer, tileF32.byteOffset + r * cols * 4, rowBytes);
+      const buf = Buffer.from(tileF32.buffer, tileF32.byteOffset + r*cols*4, rowBytes);
       fs.writeSync(fdC, buf, 0, rowBytes, fileOffsetBytes);
     }
   }
 
   return {
-    integrate({ result, meta }) {
-      const { ib, jb, kSpan, rows, cols, baseRows, baseCols } = meta;
+    integrate({ result, meta }){
+      const { ib, jb, rows, cols, baseRows, baseCols } = meta;
       const k = key(ib, jb);
       if (!sizes.has(k)) sizes.set(k, { rows, cols, baseRows, baseCols });
 
-      // Handle result from native clients (base64 or binary)
       let part;
       if (typeof result === 'string') {
-        // Base64 encoded result from native client
         const buffer = Buffer.from(result, 'base64');
-        part = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
+        part = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength/4);
+      } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer && Buffer.isBuffer(result)) {
+      // Node Buffer (what TaskManager passes after decoding base64)
+      part = new Float32Array(result.buffer, result.byteOffset, Math.floor(result.byteLength / 4));
       } else if (Array.isArray(result)) {
-        // Byte array from native client
-        const uint8Array = new Uint8Array(result);
-        part = new Float32Array(uint8Array.buffer);
+        const u8 = new Uint8Array(result);
+        part = new Float32Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength/4));
+      } else if (result && result.type === 'Buffer' && Array.isArray(result.data)) {
+        const u8 = Uint8Array.from(result.data);
+        part = new Float32Array(u8.buffer);
+      } else if (result instanceof ArrayBuffer) {
+        part = new Float32Array(result);
       } else {
-        // Direct binary data
-        part = toF32(result);
+        throw new Error('Unknown result format from native client');
       }
 
       let tile = acc.get(k);
       if (!tile) {
-        tile = new Float32Array(rows * cols);
+        tile = new Float32Array(baseRows * baseCols);
         acc.set(k, tile);
-        progressedK.set(k, 0);
       }
 
-      // Accumulate partial result
-      for (let i = 0; i < Math.min(part.length, tile.length); i++) {
-        tile[i] += part[i];
+      for(let r=0;r<rows;r++){
+        for(let c=0;c<cols;c++){
+          const idx = r*cols + c;
+          tile[r*baseCols + c] += part[idx];
+        }
       }
 
-      const soFar = (progressedK.get(k) || 0) + kSpan;
-      progressedK.set(k, soFar);
-
-      if (soFar >= K) {
-        const s = sizes.get(k);
-        writeTileToFile(tile, ib, jb, s.rows, s.cols, s.baseRows, s.baseCols);
-        acc.delete(k);
-        progressedK.delete(k);
-        sizes.delete(k);
+      if (acc.size > 32) {
+        for (const [kk, t] of acc) {
+          if (kk !== k) {
+            const s = sizes.get(kk);
+            if (s) writeTileToFile(t, ...kk.split(',').map(Number), s.rows, s.cols, s.baseRows, s.baseCols);
+            acc.delete(kk);
+          }
+        }
       }
     },
-
-    finalize() {
-      // Flush remaining tiles
+    finalize(){
       for (const [k, tile] of acc) {
         const [ibS, jbS] = k.split(',').map(Number);
         const s = sizes.get(k);
         if (s) writeTileToFile(tile, ibS, jbS, s.rows, s.cols, s.baseRows, s.baseCols);
       }
       fs.closeSync(fdC);
-      return { outPath, elements: N * M };
+   try {
+     const alias = path.join(taskDir, 'output.bin');
+     try { fs.unlinkSync(alias); } catch {}
+     try {
+       fs.symlinkSync(outPath, alias);
+     } catch {
+       // containers or Windows without symlink perms → copy
+       fs.copyFileSync(outPath, alias);
+     }
+   } catch {}
+   return { outPath, elements: N*M };
     }
   };
 }

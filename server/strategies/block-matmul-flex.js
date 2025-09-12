@@ -23,21 +23,6 @@ export function getClientExecutorInfo(config){
       'kernels/webgl/block_matrix_multiply_webgl_fragment.glsl'
     ]};
   }
-  if (fw === 'native-cuda') {
-    return { framework:'cuda', path:'executors/native-bridge.client.js', kernels:[
-      'kernels/cuda/block_matrix_multiply_cuda_kernel.cu'
-    ]};
-  }
-  if (fw === 'native-opencl') {
-    return { framework:'opencl', path:'executors/native-bridge.client.js', kernels:[
-      'kernels/opencl/block_matrix_multiply_opencl_kernel.cl'
-    ]};
-  }
-  if (fw === 'native-vulkan') {
-    return { framework:'vulkan', path:'executors/native-bridge.client.js', kernels:[
-      'kernels/vulkan/block_matrix_multiply_vulkan_compute.glsl'
-    ]};
-  }
   throw new Error('Unsupported framework in config.framework: '+fw);
 }
 
@@ -173,15 +158,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
 
             const meta = { ib, jb, kb, kSpan: kNow, rows: rNow, cols: cNow, baseRows, baseCols };
 
-            // Native backends: inform expected output size & dispatcher uniforms
-            const fw = (config.framework || '').toLowerCase();
-            if (fw === 'native-cuda' || fw === 'native-opencl' || fw === 'native-vulkan') {
-              meta.outputSizes = [rNow * cNow * 4];      // bytes for one output tile
-              meta.uniforms    = [rNow, kNow, cNow];     // note: K is kNow here
-              if (fw === 'native-cuda')   { meta.grid   = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1]; meta.block = [16,16,1]; }
-              if (fw === 'native-opencl') { meta.global = [cNow, rNow, 1];                             meta.local = [16,16,1]; }
-              if (fw === 'native-vulkan'){ meta.groups  = [Math.ceil(cNow/16), Math.ceil(rNow/16), 1]; }
-            }
 
             yield { id: uuidv4(), payload, meta, tCreate: Date.now() };
           }

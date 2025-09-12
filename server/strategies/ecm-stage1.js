@@ -10,6 +10,18 @@ export const name = 'ECM Stage 1 (WebGPU)';
 export const framework = 'webgpu';
 
 export function getClientExecutorInfo(config, inputArgs){
+  // Check if native execution is requested
+  const useNative = config?.framework === 'native-opencl' || config?.useNative;
+
+  if (useNative) {
+    return {
+      framework: 'opencl', // Use 'opencl' so browser client can support it
+      path: 'executors/native-ecm-stage1.client.js',
+      kernels: ['kernels/opencl/ecm_stage1_opencl.cl'],
+      schema: { output: 'Uint32Array' }
+    };
+  }
+
   return {
     framework,
     path: 'executors/webgpu-ecm-stage1.client.js',

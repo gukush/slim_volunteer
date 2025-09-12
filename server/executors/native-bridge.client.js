@@ -1,5 +1,7 @@
 // Enhanced native-bridge.client.js with comprehensive logging
 // Talks to local native client at wss://127.0.0.1:8787/native
+// Focused on block-matmul and other non-ECM tasks
+// Note: ECM Stage 1 tasks use native-ecm-stage1.client.js instead
 
 // Simple logging utility
 const logger = {
@@ -30,8 +32,8 @@ export function createExecutor({ kernels, config }) {
   const isSecure = window.location.protocol === 'https:';
   const defaultPort = config?.nativePort || 8787;
   const defaultEndpoint = isSecure
-    ? `wss://127.0.0.1:${defaultPort}/ws-native`  // SSL WebSocket for HTTPS pages
-    : `ws://127.0.0.1:${defaultPort}/ws-native`;   // Plain WebSocket for HTTP pages
+    ? `wss://127.0.0.1:${defaultPort}/native`  // SSL WebSocket for HTTPS pages
+    : `ws://127.0.0.1:${defaultPort}/native`;   // Plain WebSocket for HTTP pages
 
   const endpoint = config?.nativeEndpoint || defaultEndpoint;
   const framework = config?.framework || 'native-cuda';
@@ -232,8 +234,26 @@ export function createExecutor({ kernels, config }) {
       }
       logger.info(`✓ OpenCL kernel loaded: ${src.length} characters`);
 
-      const global = meta?.global || config?.global || [1,1,1];
-      const local  = meta?.local  || config?.local  || [1,1,1];
+      // Check if this is an ECM task - if so, redirect to native-ecm-stage1 executor
+      if (src.includes('ecm_stage1')) {
+        const error = 'ECM tasks should use native-ecm-stage1.client.js executor. This native-bridge is for block-matmul and other non-ECM tasks.';
+        logger.error('❌ ' + error);
+        throw new Error(error);
+      }
+
+      // Set appropriate work sizes for block-matmul tasks
+      let global = meta?.global || config?.global || [1,1,1];
+      let local  = meta?.local  || config?.local  || [1,1,1];
+
+      // For block-matmul tasks, set work size based on matrix dimensions
+      if (src.includes('block_matrix_multiply') && meta?.rows && meta?.cols) {
+        const rows = meta.rows;
+        const cols = meta.cols;
+        global = [cols, rows, 1];
+        local = [16, 16, 1]; // Standard workgroup size for matrix multiplication
+        logger.info(`🔧 Block-matmul task detected: setting work sizes to global=[${global[0]},${global[1]},${global[2]}], local=[${local[0]},${local[1]},${local[2]}] for ${rows}x${cols} matrix`);
+      }
+
       const uniforms = meta?.uniforms || config?.uniforms || [];
 
       logger.debug('OpenCL parameters:', { global, local, uniforms });

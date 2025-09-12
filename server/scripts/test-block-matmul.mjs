@@ -14,7 +14,7 @@ const args = Object.fromEntries(process.argv.slice(2).map(s=>{
 }));
 
 const host = args.host || 'https://localhost:3000';
-const framework = args.framework || 'webgpu'; // 'webgpu' | 'webgl2' | 'native-cuda' | 'native-opencl' | 'native-vulkan'
+const framework = args.framework || 'webgpu'; // 'webgpu' | 'webgl2' | 'cpp-wasm'
 const N = parseInt(args.N||'64',10), K = parseInt(args.K||'64',10), M = parseInt(args.M||'64',10);
 const TS = parseInt(args.tileSize||'32',10);
 const Krep = parseInt(args.Krep||'1',10);

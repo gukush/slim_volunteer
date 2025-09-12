@@ -6,12 +6,26 @@ const __WGPU_SORT_CACHE__ = (globalThis.__WGPU_SORT_CACHE__ ||= {
   deviceId: null,
   // Per-device pipeline caches
   pipelinesByDevice: new WeakMap(), // WeakMap<GPUDevice, Map<string, CachedPipeline>>
+  // Timing infrastructure
+  timingByDevice: new WeakMap(), // WeakMap<GPUDevice, TimingContext>
 });
 
 /**
  * Cached pipeline record
  * @typedef {{ pipeline: GPUComputePipeline, bgl: GPUBindGroupLayout, layout: GPUPipelineLayout, module: GPUShaderModule }} CachedPipeline
  */
+
+/**
+ * Timing context for GPU measurements
+ * @typedef {{
+ *   querySet: GPUQuerySet,
+ *   resolveBuffer: GPUBuffer,
+ *   resultBuffer: GPUBuffer,
+ *   capacity: number,
+ *   supportsTimestamps: boolean
+ * }} TimingContext
+ */
+
 // ----------------------------------------------------------------------
 
 // Flip to true while debugging; or pass ?validate=1 in the URL; or set config.validateChunks=true
@@ -77,6 +91,106 @@ function toArrayBuffer(x) {
   throw new Error('toArrayBuffer: unsupported payload type');
 }
 
+function createTimingContext(device, capacity = 64) {
+  try {
+    const querySet = device.createQuerySet({
+      label: 'sort-timing-queries',
+      type: 'timestamp',
+      count: capacity,
+    });
+
+    const resolveBuffer = device.createBuffer({
+      label: 'sort-timing-resolve',
+      size: capacity * 8, // 8 bytes per timestamp
+      usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+    });
+
+    const resultBuffer = device.createBuffer({
+      label: 'sort-timing-result',
+      size: capacity * 8,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    console.log('[Sort] Created timing context with', capacity, 'query slots');
+
+    return {
+      querySet,
+      resolveBuffer,
+      resultBuffer,
+      capacity,
+      supportsTimestamps: true,
+    };
+  } catch (error) {
+    console.warn('[Sort] Timestamp queries not supported:', error.message);
+    return {
+      querySet: null,
+      resolveBuffer: null,
+      resultBuffer: null,
+      capacity: 0,
+      supportsTimestamps: false,
+    };
+  }
+}
+
+function getTimingContext(device) {
+  let timing = __WGPU_SORT_CACHE__.timingByDevice.get(device);
+  if (!timing) {
+    timing = createTimingContext(device);
+    __WGPU_SORT_CACHE__.timingByDevice.set(device, timing);
+  }
+  return timing;
+}
+
+async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
+  if (!timingCtx.supportsTimestamps) return null;
+
+  try {
+    // Resolve timestamps to buffer
+    const encoder = device.createCommandEncoder({ label: 'sort-timing-resolve' });
+    encoder.resolveQuerySet(
+      timingCtx.querySet,
+      queryStart,
+      queryEnd - queryStart + 1,
+      timingCtx.resolveBuffer,
+      queryStart * 8
+    );
+    encoder.copyBufferToBuffer(
+      timingCtx.resolveBuffer,
+      queryStart * 8,
+      timingCtx.resultBuffer,
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
+    );
+    device.queue.submit([encoder.finish()]);
+
+    // Read back results
+    await timingCtx.resultBuffer.mapAsync(
+      GPUMapMode.READ,
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
+    );
+
+    const arrayBuffer = timingCtx.resultBuffer.getMappedRange(
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
+    );
+    const timestamps = new BigUint64Array(arrayBuffer);
+    const startTime = timestamps[0];
+    const endTime = timestamps[1];
+
+    timingCtx.resultBuffer.unmap();
+
+    // Convert to milliseconds (timestamps are in nanoseconds)
+    const elapsedNs = endTime - startTime;
+    const elapsedMs = Number(elapsedNs) / 1_000_000;
+
+    return elapsedMs;
+  } catch (error) {
+    console.error('[Sort] Failed to measure GPU timestamps:', error);
+    return null;
+  }
+}
+
 async function getDevice() {
   if (__WGPU_SORT_CACHE__.device) return __WGPU_SORT_CACHE__.device;
 
@@ -84,18 +198,34 @@ async function getDevice() {
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('No WebGPU adapter');
 
-  const device = await adapter.requestDevice();
+  // Request device with timestamp-query feature
+  const requiredFeatures = [];
+  if (adapter.features.has('timestamp-query')) {
+    requiredFeatures.push('timestamp-query');
+    console.log('[Sort] Requesting timestamp-query feature');
+  } else {
+    console.warn('[Sort] timestamp-query feature not available');
+  }
+
+  const device = await adapter.requestDevice({
+    requiredFeatures,
+  });
+
   __WGPU_SORT_CACHE__.device = device;
   __WGPU_SORT_CACHE__.deviceId = Math.random().toString(36).slice(2, 11);
 
-  console.log('Created WebGPU device:', __WGPU_SORT_CACHE__.deviceId);
+  console.log('Created WebGPU device for Sort:', __WGPU_SORT_CACHE__.deviceId);
+
+  // Initialize timing context
+  getTimingContext(device);
 
   // If the device is lost, clear our caches so we can rebuild later
   device.lost.then((info) => {
-    console.warn('WebGPU device lost:', info?.message || info);
+    console.warn('WebGPU device lost (Sort):', info?.message || info);
     __WGPU_SORT_CACHE__.device = null;
     __WGPU_SORT_CACHE__.deviceId = null;
     __WGPU_SORT_CACHE__.pipelinesByDevice = new WeakMap();
+    __WGPU_SORT_CACHE__.timingByDevice = new WeakMap();
   }).catch(()=>{ /* no-op */ });
 
   return device;
@@ -114,7 +244,10 @@ function getPipeline(dev, kernelCode) {
   let cached = perDev.get(key);
   if (cached && cached.pipeline) return cached;
 
-  const module = dev.createShaderModule({ code: kernelCode });
+  const module = dev.createShaderModule({
+    label: 'bitonic-sort-module',
+    code: kernelCode
+  });
 
   const bgl = dev.createBindGroupLayout({
     label: 'bitonic-sort-layout',
@@ -124,7 +257,10 @@ function getPipeline(dev, kernelCode) {
     ],
   });
 
-  const layout = dev.createPipelineLayout({ bindGroupLayouts: [bgl] });
+  const layout = dev.createPipelineLayout({
+    label: 'bitonic-sort-pipeline-layout',
+    bindGroupLayouts: [bgl]
+  });
 
   const pipeline = dev.createComputePipeline({
     label: 'bitonic-sort-pipeline',
@@ -134,7 +270,7 @@ function getPipeline(dev, kernelCode) {
 
   cached = { pipeline, bgl, layout, module };
   perDev.set(key, cached);
-  console.log('Creating new pipeline for device:', __WGPU_SORT_CACHE__.deviceId);
+  console.log('Creating new sort pipeline for device:', __WGPU_SORT_CACHE__.deviceId);
   return cached;
 }
 
@@ -164,6 +300,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
 
     const dev = await getDevice();
     const { pipeline, bgl } = getPipeline(dev, kernelCode);
+    const timingCtx = getTimingContext(dev);
 
     console.log(`Processing chunk: ${originalSize} integers (padded to ${paddedSize}) with device ${__WGPU_SORT_CACHE__.deviceId}`);
 
@@ -216,9 +353,13 @@ export function createExecutor({ kernels, config, inputArgs }) {
       ],
     });
 
-    // --- Execute bitonic sort with proper synchronization ---
+    // --- Execute bitonic sort with proper synchronization and timing ---
     const workgroupSize = 256;
     const numGroups = Math.ceil(paddedSize / workgroupSize);
+
+    let totalGpuTime = 0;
+    let stageCount = 0;
+    let queryIndex = 0;
 
     // CRITICAL: Execute each stage separately and wait for completion
     for (let k = 2; k <= paddedSize; k <<= 1) {
@@ -233,8 +374,18 @@ export function createExecutor({ kernels, config, inputArgs }) {
           label: `sort-stage-${k}-step-${j}`
         });
 
+        // Set up timestamp queries if available
+        const timestampWrites = timingCtx.supportsTimestamps && queryIndex + 1 < timingCtx.capacity
+          ? {
+              querySet: timingCtx.querySet,
+              beginningOfPassWriteIndex: queryIndex,
+              endOfPassWriteIndex: queryIndex + 1,
+            }
+          : undefined;
+
         const pass = encoder.beginComputePass({
-          label: `sort-pass-${k}-${j}`
+          label: `sort-pass-${k}-${j}`,
+          timestampWrites
         });
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bindGroup);
@@ -247,6 +398,17 @@ export function createExecutor({ kernels, config, inputArgs }) {
         // CRITICAL: Wait for this stage to complete before proceeding
         // This ensures sequential execution of stages
         await dev.queue.onSubmittedWorkDone();
+
+        // Measure GPU time for this stage if available
+        if (timestampWrites) {
+          const stageTime = await measureStageTime(dev, timingCtx, queryIndex, queryIndex + 1);
+          if (stageTime !== null) {
+            totalGpuTime += stageTime;
+          }
+          queryIndex = (queryIndex + 2) % timingCtx.capacity; // Advance query index
+        }
+
+        stageCount++;
       }
     }
 
@@ -274,6 +436,11 @@ export function createExecutor({ kernels, config, inputArgs }) {
     try { readBuf.destroy?.(); } catch {}
 
     const tClientDone = performance.now();
+    const totalTime = tClientDone - tClientRecv;
+
+    // Log timing results
+    const avgGpuTime = stageCount > 0 && totalGpuTime > 0 ? (totalGpuTime / stageCount).toFixed(2) : 'N/A';
+    console.log(`[Sort] Completed ${originalSize} integers in ${totalTime.toFixed(1)}ms (total GPU: ${totalGpuTime.toFixed(1)}ms, avg: ${avgGpuTime}ms/stage)`);
 
     // Validate if enabled
     if (isValidateEnabled(config)) {
@@ -288,7 +455,14 @@ export function createExecutor({ kernels, config, inputArgs }) {
     return {
       status: 'ok',
       result,
-      timings: { tClientRecv, tClientDone },
+      timings: {
+        tClientRecv,
+        tClientDone,
+        totalTimeMs: totalTime,
+        totalGpuTimeMs: totalGpuTime,
+        avgGpuTimeMs: stageCount > 0 ? totalGpuTime / stageCount : 0,
+        stageCount
+      },
     };
   }
 
