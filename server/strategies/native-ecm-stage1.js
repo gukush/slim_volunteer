@@ -79,6 +79,33 @@ export function getClientExecutorInfo(config, inputArgs) {
   };
 }
 
+// Helper functions for trial division
+function parseBig(value) {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') return BigInt(value);
+  if (typeof value === 'string' && value.trim().length) {
+    const s = value.trim().toLowerCase();
+    return s.startsWith('0x') ? BigInt(s) : BigInt(s);
+  }
+  throw new Error('Cannot parse BigInt from: ' + String(value));
+}
+
+function trialDivideSmallPrimes(Nbig, maxPrime = 7919n) {
+  const factors = new Map(); // BigInt -> multiplicity
+  let N = parseBig(Nbig);
+
+  // Only check for factor 2 (most common case)
+  const p = 2n;
+  if (N % p === 0n) {
+    let k = 0n;
+    while (N % p === 0n) { N /= p; k++; }
+    factors.set(p, Number(k));
+  }
+  if (N === 1n) return { reducedN: N, smallFactors: factors };
+
+  return { reducedN: N, smallFactors: factors };
+}
+
 // Copy WebGPU chunker logic verbatim and modify just the payload format for native client
 export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles }) {
   const N_hex = inputArgs.N;
@@ -155,8 +182,19 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
   const CURVE_OUT_WORDS_PER = 8 + 1 + 3; // result(8) + status(1) + padding(3)
   const STATE_WORDS_PER_CURVE = 8 + 8 + 8 + 2; // X + Z + A24 + (sigma, curve_ok)
 
-  // Compute Montgomery constants
-  const constants = computeMontgomeryConstants(N0);
+  // Pre-pass: strip tiny primes (especially factor 2)
+  const { reducedN: Nred, smallFactors } = trialDivideSmallPrimes(N0);
+  console.log(`[native-ecm-stage1] Trial division: N reduced from 0x${N0.toString(16)} to 0x${Nred.toString(16)}`);
+  if (smallFactors.size > 0) {
+    console.log(`[native-ecm-stage1] Small factors found:`, Array.from(smallFactors.entries()));
+  }
+  if (Nred === 1n) {
+    console.log('[native-ecm-stage1] All factors were tiny; skipping GPU stage.');
+    return { async *stream() {} };
+  }
+
+  // Compute Montgomery constants on reduced N (now guaranteed to be odd)
+  const constants = computeMontgomeryConstants(Nred);
 
   return {
     async *stream() {
