@@ -5,6 +5,8 @@
 --   { data: "base64_encoded_buffer", originalSize: N, paddedSize: P, ascending: bool }
 -- The buffer contains uint32 integers to be sorted
 
+print("[lua/sort] *** UPDATED VERSION LOADED ***")
+
 ----------------------------------------------------------------------
 -- util: normalize framework tag
 ----------------------------------------------------------------------
@@ -157,6 +159,7 @@ end
 ----------------------------------------------------------------------
 function compile_and_run(chunk)
   print("[lua/sort] compile_and_run - CUDA bitonic sort")
+  print("[lua/sort] *** DEBUG: Starting compile_and_run with updated version ***")
 
   local fw = norm_fw(workload_framework or
                      (chunk.payload and chunk.payload.framework) or
