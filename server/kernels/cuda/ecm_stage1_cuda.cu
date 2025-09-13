@@ -51,12 +51,20 @@ static const uint32_t LIMBS = 8u;
 static const uint32_t STATE_WORDS_PER_CURVE = 8u + 8u + 8u + 2u; // X + Z + A24 + (sigma, curve_ok)
 
 // --------------------------- Small helpers ---------------------------
-__device__ __forceinline__ U256 set_zero(){ U256 r; #pragma unroll for(int i=0;i<8;i++) r.limbs[i]=0u; return r; }
+__device__ __forceinline__ U256 set_zero(){
+    U256 r;
+    #pragma unroll
+    for (int i=0;i<8;i++) { r.limbs[i]=0u; }
+    return r;
+}
 __device__ __forceinline__ U256 set_one(){ U256 r = set_zero(); r.limbs[0]=1u; return r; }
 __device__ __forceinline__ U256 u256_from_u32(uint32_t x){ U256 r=set_zero(); r.limbs[0]=x; return r; }
 
 __device__ __forceinline__ bool is_zero(const U256& a){
-    uint32_t x=0u; #pragma unroll for (int i=0;i<8;i++) x |= a.limbs[i]; return x==0u;
+    uint32_t x=0u;
+    #pragma unroll
+    for (int i=0;i<8;i++) { x |= a.limbs[i]; }
+    return x==0u;
 }
 
 __device__ __forceinline__ int cmp(const U256& a, const U256& b){
@@ -142,7 +150,9 @@ __device__ __forceinline__ void mul32x32_64(uint32_t a, uint32_t b, uint32_t& lo
 
 // --------------------------- Montgomery math (CIOS) ---------------------------
 __device__ __forceinline__ U256 mont_mul(const U256& a, const U256& b, const U256& N, uint32_t n0inv32){
-    uint32_t t[9]; #pragma unroll for (int i=0;i<9;i++) t[i]=0u;
+    uint32_t t[9];
+    #pragma unroll
+    for (int i=0;i<9;i++) { t[i]=0u; }
 
     for (int i=0;i<8;i++){
         uint32_t carry=0u;
@@ -168,11 +178,13 @@ __device__ __forceinline__ U256 mont_mul(const U256& a, const U256& b, const U25
         t[8] = t[8] + carry;
 
         #pragma unroll
-        for (int k=0;k<8;k++) t[k] = t[k+1];
+        for (int k=0;k<8;k++) { t[k] = t[k+1]; }
         t[8] = 0u;
     }
 
-    U256 r; #pragma unroll for (int i=0;i<8;i++) r.limbs[i]=t[i];
+    U256 r;
+    #pragma unroll
+    for (int i=0;i<8;i++) { r.limbs[i]=t[i]; }
     return cond_sub_N(r, N);
 }
 
@@ -256,7 +268,7 @@ __device__ __forceinline__ uint32_t lcg32(uint32_t& state){
 __device__ __forceinline__ U256 next_sigma(const U256& /*N*/, uint32_t& lcg_state){
     U256 acc;
     #pragma unroll
-    for (int i=0;i<8;i++) acc.limbs[i] = lcg32(lcg_state);
+    for (int i=0;i<8;i++) { acc.limbs[i] = lcg32(lcg_state); }
 
     U256 sigma = acc;
     if (is_zero(sigma)) sigma.limbs[0] = 6u;
@@ -380,11 +392,11 @@ __device__ __forceinline__ U256 gcd_binary_u256_oddN(U256 a, U256 b /*N*/){
 __device__ __forceinline__ void load_state(uint32_t idx, const Header& h, const uint32_t* io, /*out*/U256& X, U256& Z, U256& A24, uint32_t& sigma, uint32_t& curve_ok){
     uint32_t base = stateOffset(h) + idx * STATE_WORDS_PER_CURVE;
     #pragma unroll
-    for (int i=0;i<8;i++) X.limbs[i]    = io[base + i];
+    for (int i=0;i<8;i++) { X.limbs[i]    = io[base + i]; }
     #pragma unroll
-    for (int i=0;i<8;i++) Z.limbs[i]    = io[base + 8u + i];
+    for (int i=0;i<8;i++) { Z.limbs[i]    = io[base + 8u + i]; }
     #pragma unroll
-    for (int i=0;i<8;i++) A24.limbs[i]  = io[base + 16u + i];
+    for (int i=0;i<8;i++) { A24.limbs[i]  = io[base + 16u + i]; }
     sigma    = io[base + 24u];
     curve_ok = io[base + 25u];
 }
@@ -392,11 +404,11 @@ __device__ __forceinline__ void load_state(uint32_t idx, const Header& h, const 
 __device__ __forceinline__ void save_state(uint32_t idx, const Header& h, uint32_t* io, const U256& X, const U256& Z, const U256& A24, uint32_t sigma, uint32_t curve_ok){
     uint32_t base = stateOffset(h) + idx * STATE_WORDS_PER_CURVE;
     #pragma unroll
-    for (int i=0;i<8;i++) io[base + i]       = X.limbs[i];
+    for (int i=0;i<8;i++) { io[base + i]       = X.limbs[i]; }
     #pragma unroll
-    for (int i=0;i<8;i++) io[base + 8u + i]  = Z.limbs[i];
+    for (int i=0;i<8;i++) { io[base + 8u + i]  = Z.limbs[i]; }
     #pragma unroll
-    for (int i=0;i<8;i++) io[base + 16u + i] = A24.limbs[i];
+    for (int i=0;i<8;i++) { io[base + 16u + i] = A24.limbs[i]; }
     io[base + 24u] = sigma;
     io[base + 25u] = curve_ok;
 }
@@ -440,11 +452,14 @@ __global__ void execute_task(const uint32_t* __restrict__ in_words,
     uint32_t off = off_consts;
     U256 N, R2, mont_one;
     #pragma unroll
-    for (int i=0;i<8;i++) N.limbs[i] = in_words[off+i];     off += 8u;
+    for (int i=0;i<8;i++) { N.limbs[i] = in_words[off+i]; }
+    off += 8u;
     #pragma unroll
-    for (int i=0;i<8;i++) R2.limbs[i] = in_words[off+i];    off += 8u;
+    for (int i=0;i<8;i++) { R2.limbs[i] = in_words[off+i]; }
+    off += 8u;
     #pragma unroll
-    for (int i=0;i<8;i++) mont_one.limbs[i] = in_words[off+i]; off += 8u;
+    for (int i=0;i<8;i++) { mont_one.limbs[i] = in_words[off+i]; }
+    off += 8u;
     uint32_t n0inv32 = in_words[off]; off += 4u; // +3 pad ignored
 
     const uint32_t pp_off = off_pp;
@@ -481,7 +496,7 @@ __global__ void execute_task(const uint32_t* __restrict__ in_words,
         if (!curve_ok){
             // bad curve: write zeros + status=3
             #pragma unroll
-            for (int i=0;i<8;i++) out_words[out_base+i] = 0u;
+            for (int i=0;i<8;i++) { out_words[out_base+i] = 0u; }
             out_words[out_base+8u] = 3u;
             return;
         }
@@ -495,7 +510,7 @@ __global__ void execute_task(const uint32_t* __restrict__ in_words,
         curve_ok = (curve_ok_u32 == 1u);
         if (!curve_ok){
             #pragma unroll
-            for (int i=0;i<8;i++) out_words[out_base+i] = 0u;
+            for (int i=0;i<8;i++) { out_words[out_base+i] = 0u; }
             out_words[out_base+8u] = 3u;
             return;
         }
@@ -533,7 +548,7 @@ __global__ void execute_task(const uint32_t* __restrict__ in_words,
 
         // Write final result (8 limbs) + status
         #pragma unroll
-        for (int i=0;i<8;i++) out_words[out_base+i] = result.limbs[i];
+        for (int i=0;i<8;i++) { out_words[out_base+i] = result.limbs[i]; }
         out_words[out_base+8u] = status;
     }
 }
