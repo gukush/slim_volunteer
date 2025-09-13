@@ -3,17 +3,11 @@
 -- It selects the proper artifact directly from the incoming chunk,
 -- and falls back to the global `artifacts` table if the runtime
 -- doesn't pass artifacts into the chunk.
+-- REDESIGNED to use raw framework strings instead of normalized ones.
 
 ----------------------------------------------------------------------
 -- Utilities
 ----------------------------------------------------------------------
-
-local function norm_fw(fw)
-  if fw == "native-opencl" then return "opencl" end
-  if fw == "native-cuda"   then return "cuda"   end
-  if fw == "native-vulkan" then return "vulkan" end
-  return fw or "opencl"
-end
 
 -- Pure Lua Base64 decode (tolerates missing padding and stray chars)
 local function b64decode(data)
@@ -61,11 +55,26 @@ end
 
 local function round_up(n, m) return math.floor((n + m - 1) / m) * m end
 
+-- Check if framework is an OpenCL variant
+local function is_opencl_framework(fw)
+  return fw == "opencl" or fw == "native-opencl"
+end
+
+-- Check if framework is a CUDA variant
+local function is_cuda_framework(fw)
+  return fw == "cuda" or fw == "native-cuda"
+end
+
+-- Check if framework is a Vulkan variant
+local function is_vulkan_framework(fw)
+  return fw == "vulkan" or fw == "native-vulkan"
+end
+
 local function calculate_local_size(payload, fw, rows, cols)
   if payload and payload["local"] then return payload["local"] end
-  fw = norm_fw(fw)
-  if fw == "opencl" then
-    -- Match kernel’s TILE (16 in your .cl). If you later pass -DTILE=..., read it here.
+  
+  if is_opencl_framework(fw) then
+    -- Match kernel's TILE (16 in your .cl). If you later pass -DTILE=..., read it here.
     local tile = 16
     local lx = (cols and cols < tile) and cols or tile
     local ly = (rows and rows < tile) and rows or tile
@@ -77,8 +86,15 @@ end
 local function get_entry_point(fw, payload)
   if payload and payload.entry and #payload.entry > 0 then return payload.entry end
   if payload and payload.program and #payload.program > 0 then return payload.program end
-  local defaults = { opencl = "execute_task", cuda = "execute_task", vulkan = "main" }
-  return defaults[norm_fw(fw)] or "main"
+  
+  -- Default entry points for raw framework strings
+  if is_opencl_framework(fw) or is_cuda_framework(fw) then
+    return "execute_task"
+  elseif is_vulkan_framework(fw) then
+    return "main"
+  else
+    return "main"  -- fallback
+  end
 end
 
 -- Prefer chunk.artifacts; fall back to global `artifacts`
@@ -99,7 +115,7 @@ end
 local function list_available_backends(arts)
   local seen, out = {}, {}
   for _, a in ipairs(arts) do
-    local b = norm_fw(a.backend)
+    local b = a.backend
     if b and not seen[b] then
       seen[b] = true
       out[#out+1] = b
@@ -108,11 +124,26 @@ local function list_available_backends(arts)
   return out
 end
 
+-- Check if two framework strings are compatible (raw comparison)
+local function frameworks_match(fw1, fw2)
+  if fw1 == fw2 then return true end
+  
+  -- Check for OpenCL compatibility
+  if is_opencl_framework(fw1) and is_opencl_framework(fw2) then return true end
+  
+  -- Check for CUDA compatibility
+  if is_cuda_framework(fw1) and is_cuda_framework(fw2) then return true end
+  
+  -- Check for Vulkan compatibility
+  if is_vulkan_framework(fw1) and is_vulkan_framework(fw2) then return true end
+  
+  return false
+end
+
 -- Pull kernel source for the current framework from artifacts view
 local function find_artifact_source_for(fw, arts)
-  fw = norm_fw(fw)
   for _, a in ipairs(arts) do
-    if a.type == "text" and norm_fw(a.backend) == fw and a.bytes then
+    if a.type == "text" and frameworks_match(fw, a.backend) and a.bytes then
       local s = b64decode(a.bytes)
       if type(s) == "string" and #s > 0 then return s end
     end
@@ -123,8 +154,8 @@ end
 -- Global size: for OpenCL use 2-D NDRange {cols, rows, 1}; fallback otherwise
 local function calculate_global_size(payload, fw, rows, cols)
   if payload and payload.global then return payload.global end
-  fw = norm_fw(fw)
-  if rows and cols and fw == "opencl" then
+  
+  if rows and cols and is_opencl_framework(fw) then
     return { cols, rows, 1 }
   end
   local outSizes = (payload and payload.outputSizes) or {}
@@ -142,7 +173,8 @@ end
 function compile_and_run(chunk)
   print("[lua] compile_and_run called")
 
-  local fw = norm_fw(chunk.framework or (chunk.meta and chunk.meta.framework) or "opencl")
+  -- Use raw framework string directly, with fallback to default
+  local fw = chunk.framework or (chunk.meta and chunk.meta.framework) or "opencl"
   local payload = chunk.payload or chunk
   local cfg = chunk.config or payload.config or {}
 
@@ -177,10 +209,10 @@ function compile_and_run(chunk)
   local local_ = calculate_local_size(payload, fw, rows, cols)
   local global = calculate_global_size(payload, fw, rows, cols)
   if type(global) == "table" and local_ then
-  -- OpenCL requires global to be a multiple of local in each dim
-  global[1] = round_up(global[1], local_[1] or 1)
-  global[2] = round_up(global[2], local_[2] or 1)
-end
+    -- OpenCL requires global to be a multiple of local in each dim
+    global[1] = round_up(global[1], local_[1] or 1)
+    global[2] = round_up(global[2], local_[2] or 1)
+  end
   print("[lua] Global size: " ..
         (type(global) == "table" and ("{"..table.concat(global, ", ").."}") or tostring(global)))
 
@@ -224,4 +256,4 @@ end
   return { ok = false, error = "Executor returned unexpected type: " .. type(result) }
 end
 
-print("[lua] host.lua loaded (no Lua-side kernel caching; chunk/global artifacts supported).")
+print("[lua] host.lua loaded (using raw framework strings; chunk/global artifacts supported).")
