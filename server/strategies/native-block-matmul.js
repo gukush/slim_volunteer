@@ -241,6 +241,13 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               uniforms: [rNow, kNow, cNow],
             };
 
+            // Add CUDA-specific launch dimensions
+            if (framework === 'cuda') {
+              const TILE = config.tileSize ?? 16;  // match your CUDA kernel TILE
+              payload.block = [TILE, TILE, 1];
+              payload.grid = [Math.ceil(cNow / TILE), Math.ceil(rNow / TILE), 1];
+            }
+
             // If you later add a Vulkan path that *requires* a uniform buffer,
             // you can opt-in to append it here behind a flag:
             // if (framework === 'vulkan' && config.useUniformBuffer) {

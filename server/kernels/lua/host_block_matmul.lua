@@ -253,6 +253,23 @@ function compile_and_run(chunk)
   -- due to local being reserved keyword in lua
   task["local"] = local_
 
+  -- Forward explicit launch dims if the payload provided them
+  if payload.grid then task.grid = payload.grid end
+  if payload.block then task.block = payload.block end
+
+  -- For CUDA, derive grid/block if missing
+  if is_cuda_framework(fw) and (not task.grid or not task.block) then
+    -- Choose 2D tiled launch (matches many block-matmul kernels)
+    local TILE = (payload.tileSize or cfg.tileSize or 16)
+    local r = rows or 1
+    local c = cols or 1
+    task.block = task.block or { TILE, TILE, 1 }
+    task.grid  = task.grid  or { math.max(1, math.ceil(c / TILE)),
+                                 math.max(1, math.ceil(r / TILE)), 1 }
+
+    print("[lua] CUDA launch dims - grid: {" .. table.concat(task.grid, ", ") .. "}, block: {" .. table.concat(task.block, ", ") .. "}")
+  end
+
   if payload.buildOptions then task.buildOptions = payload.buildOptions end
   if payload.defines      then task.defines      = payload.defines      end
 
