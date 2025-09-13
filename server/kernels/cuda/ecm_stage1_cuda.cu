@@ -2,7 +2,7 @@
 
 extern "C" {
 
-#include <stdint.h>
+typedef unsigned int uint32_t;
 
 // --------------------------- Types ---------------------------
 struct U256 { uint32_t limbs[8]; };
