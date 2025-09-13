@@ -411,7 +411,7 @@ __device__ __forceinline__ Header getHeader(const uint32_t* w){
 }
 
 // --------------------------- Kernel entry ---------------------------
-__global__ void ecm_stage1_v3(const uint32_t* __restrict__ in_words,
+__global__ void execute_task(const uint32_t* __restrict__ in_words,
                               uint32_t*       __restrict__ out_words)
 {
     uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;

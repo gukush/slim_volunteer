@@ -391,7 +391,12 @@ export function createExecutor({ kernels, config }) {
       return {
         status: 'ok',
         result,
-        timings: { tClientRecv, tClientDone },
+        timings: {
+          tClientRecv,
+          tClientDone,
+          cpuTimeMs: resp.processingTimeMs || (tClientDone - tClientRecv),
+          gpuTimeMs: null // Native bridge doesn't separate GPU timing
+        },
         processingTimeMs: resp.processingTimeMs
       };
 

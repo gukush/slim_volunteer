@@ -133,7 +133,7 @@ end
 function compile_and_run(chunk)
   print("[lua/ecm1] compile_and_run")
 
-  local fw = norm_fw(chunk.framework or (chunk.meta and chunk.meta.framework) or "cuda")
+  local fw = norm_fw(workload_framework or (chunk.payload and chunk.payload.framework) or chunk.framework or (chunk.meta and chunk.meta.framework) or "cuda")
   if fw ~= "cuda" then
     print("[lua/ecm1] WARNING: requested fw="..tostring(fw)..", but this host is tuned for CUDA. Proceeding anyway.")
   end
