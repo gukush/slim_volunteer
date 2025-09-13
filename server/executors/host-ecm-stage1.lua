@@ -152,7 +152,13 @@ function compile_and_run(chunk)
 
   -- input buffer (as bytes); we will PATCH pp_start/pp_len each pass
   local in_b64 = assert(payload.data, "payload.data (base64) missing")
+  print("[lua/ecm1] DEBUG: payload.data length: " .. tostring(#in_b64))
+  print("[lua/ecm1] DEBUG: payload.dims: n=" .. tostring(dims.n) .. ", pp_count=" .. tostring(dims.pp_count) .. ", total_words=" .. tostring(dims.total_words))
+  print("[lua/ecm1] DEBUG: bufferSizeBytes: " .. tostring(bufferSizeBytes))
+
   local base_buf = b64decode(in_b64)
+  print("[lua/ecm1] DEBUG: decoded buffer length: " .. tostring(#base_buf))
+
   if #base_buf < bufferSizeBytes then
     error(string.format("ECM buffer too small: have %d need %d bytes", #base_buf, bufferSizeBytes))
   end

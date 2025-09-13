@@ -79,7 +79,163 @@ export function getClientExecutorInfo(config, inputArgs) {
   };
 }
 
-// Just reuse your proven chunker & assembler from WebGPU version.
-// The Lua host script will handle the WebGPU payload format and orchestrate CUDA execution.
-export const buildChunker = buildChunkerWeb;
+// Copy WebGPU chunker logic verbatim and modify just the payload format for native client
+export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles }) {
+  const N_hex = inputArgs.N;
+  const N0 = BigInt(N_hex);
+  const B1 = Number(inputArgs.B1);
+  const totalCurves = Number(inputArgs.total_curves);
+  const chunkSize = Number(inputArgs.chunk_size);
+  const totalChunks = Math.ceil(totalCurves / chunkSize);
+
+  // Copy the exact same logic from ecm-stage1.js
+  function computeMontgomeryConstants(N) {
+    // R = 2^256, mont_one = R mod N, R2 = R^2 mod N
+    const R = 1n << 256n;
+    const R2 = (R * R) % N;
+    const mont_one = R % N;
+
+    function modInverse(a, m) {
+      function extGcd(a, b) {
+        if (a === 0n) return [b, 0n, 1n];
+        const [gcd, x1, y1] = extGcd(b % a, a);
+        const x = y1 - (b / a) * x1;
+        const y = x1;
+        return [gcd, x, y];
+      }
+      const [gcd, x] = extGcd(a % m, m);
+      if (gcd !== 1n) throw new Error('Modular inverse does not exist');
+      return (x % m + m) % m;
+    }
+
+    const n0_low = N & 0xFFFFFFFFn;
+    const n0inv = modInverse(n0_low, 1n << 32n);
+    const n0inv32 = Number((-n0inv) & 0xFFFFFFFFn);
+
+    return {
+      N: bigIntToLimbs(N),
+      R2: bigIntToLimbs(R2),
+      mont_one: bigIntToLimbs(mont_one),
+      n0inv32: n0inv32 >>> 0
+    };
+  }
+
+  function bigIntToLimbs(n) {
+    const limbs = new Uint32Array(8);
+    for (let i = 0; i < 8; i++) {
+      limbs[i] = Number((n >> (32n * BigInt(i))) & 0xFFFFFFFFn);
+    }
+    return limbs;
+  }
+
+  function isPrime(n) {
+    if (n < 2) return false;
+    if (n === 2) return true;
+    if (n % 2 === 0) return false;
+    for (let i = 3; i * i <= n; i += 2) {
+      if (n % i === 0) return false;
+    }
+    return true;
+  }
+
+  // Generate prime powers up to B1
+  const primePowers = [];
+  for (let p = 2; p <= B1; p++) {
+    if (isPrime(p)) {
+      let power = p;
+      while (power <= B1) {
+        primePowers.push(power);
+        power *= p;
+      }
+    }
+  }
+  const pp_count = primePowers.length;
+
+  // Constants for buffer layout
+  const CURVE_OUT_WORDS_PER = 8 + 1 + 3; // result(8) + status(1) + padding(3)
+  const STATE_WORDS_PER_CURVE = 8 + 8 + 8 + 2; // X + Z + A24 + (sigma, curve_ok)
+
+  // Compute Montgomery constants
+  const constants = computeMontgomeryConstants(N0);
+
+  return {
+    async *stream() {
+      for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+        const startCurve = chunkIndex * chunkSize;
+        const endCurve = Math.min(startCurve + chunkSize, totalCurves);
+        const curvesInChunk = endCurve - startCurve;
+
+        // Generate random seed for this chunk
+        const taskSeed64 = BigInt(Date.now()) + BigInt(chunkIndex) * 1000000007n;
+        const seed_lo = Number(taskSeed64 & 0xFFFFFFFFn);
+        const seed_hi = Number((taskSeed64 >> 32n) & 0xFFFFFFFFn);
+
+        // Calculate buffer size
+        const HEADER_WORDS_V3 = 12;
+        const CONST_WORDS = 8*3 + 4;
+        const totalWords = HEADER_WORDS_V3 + CONST_WORDS + pp_count + curvesInChunk * (CURVE_OUT_WORDS_PER + STATE_WORDS_PER_CURVE);
+        const buffer = new Uint32Array(totalWords);
+
+        let offset = 0;
+        // Header
+        buffer[offset++] = 0;
+        buffer[offset++] = pp_count;
+        buffer[offset++] = curvesInChunk;
+        buffer[offset++] = seed_lo;
+        buffer[offset++] = seed_hi;
+        buffer[offset++] = startCurve;    // base_curve
+        buffer[offset++] = (config?.gcdMode ? 1 : 0);
+        buffer[offset++] = 0;             // pp_start (will be set by client)
+        buffer[offset++] = 0;             // pp_len (will be set by client)
+
+        // Constants for Nred
+        buffer.set(constants.N, offset);         offset += 8;
+        buffer.set(constants.R2, offset);        offset += 8;
+        buffer.set(constants.mont_one, offset);  offset += 8;
+        buffer[offset++] = constants.n0inv32;
+        buffer[offset++] = 0; buffer[offset++] = 0; buffer[offset++] = 0;
+
+        // Prime powers
+        buffer.set(primePowers, offset);         offset += pp_count;
+
+        // Reserve output space
+        offset += curvesInChunk * CURVE_OUT_WORDS_PER;
+
+        // Reserve state space (initialized to zeros)
+        offset += curvesInChunk * STATE_WORDS_PER_CURVE;
+
+        // Convert ArrayBuffer to base64 for native client (Lua script expects base64)
+        const dataBase64 = Buffer.from(buffer.buffer).toString('base64');
+
+        console.log(`[native-ecm-stage1] DEBUG: Generated buffer - words: ${totalWords}, bytes: ${totalWords * 4}, base64 length: ${dataBase64.length}`);
+        console.log(`[native-ecm-stage1] DEBUG: Chunk ${chunkIndex} - curves: ${curvesInChunk}, pp_count: ${pp_count}`);
+
+        // Create payload in format expected by Lua script
+        const payload = {
+          data: dataBase64,  // base64 string instead of ArrayBuffer
+          dims: { n: curvesInChunk, pp_count, total_words: totalWords }
+        };
+
+        const meta = {
+          chunkIndex, startCurve, endCurve,
+          n: curvesInChunk, pp_count, total_words: totalWords,
+          N: N_hex,
+          reducedN: '0x' + N0.toString(16),
+          B1,
+          rngSeed: '0x' + taskSeed64.toString(16),
+          version: 3  // Mark as version 3
+        };
+
+        yield {
+          id: uuidv4(),
+          payload,
+          meta,
+          tCreate: Date.now()
+        };
+      }
+    }
+  };
+}
+
+// Reuse assembler from WebGPU version
 export const buildAssembler = buildAssemblerWeb;
