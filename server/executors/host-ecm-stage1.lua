@@ -1,13 +1,14 @@
 -- host-ecm-stage1.lua  (resumable ECM Stage 1 for native CUDA)
 -- Mirrors browser executor behavior:
---   * Updates header[10]=pp_start, header[11]=pp_len per pass
---   * Runs with blockDim.x = 64, gridDim.x = ceil(n/64)
+--   * Uses v3 buffer layout (header[10]=pp_start, header[11]=pp_len)
+--   * Reuses the ENTIRE IO buffer between passes so saved state is preserved
+--   * Launches with blockDim.x = 64, gridDim.x = ceil(n/64)
 --   * Reads/writes the full IO buffer (header + consts + primes + outputs + state)
 --
 -- Expects the workload to carry artifacts:
 --   - {type:"lua", name:"host.lua"}         -> this file
 --   - {type:"text", backend:"cuda", bytes}  -> CUDA kernel source
--- Optionally OpenCL as fallback (backend:"opencl") if CUDA absent.
+-- Optionally OpenCL/Vulkan as fallback if CUDA absent.
 
 ----------------------------------------------------------------------
 -- util: normalize framework tag
@@ -42,7 +43,7 @@ local function b64decode(data)
 end
 
 local function b64encode(bytes)
-  local t, pad = {}, 0
+  local t = {}
   for i=1,#bytes,3 do
     local a = bytes:byte(i) or 0
     local b = bytes:byte(i+1) or 0
@@ -94,7 +95,7 @@ local function find_artifact_source_for(fw, arts)
 end
 
 ----------------------------------------------------------------------
--- util: endian helpers to patch header words (u32 little-endian)
+-- util: endian helpers to patch/read header words (u32 little-endian)
 ----------------------------------------------------------------------
 local function put_u32_le(v)
   local b0 = string.char(v % 256)
@@ -112,12 +113,29 @@ local function patch_word_le(buf, word_index, value)
   return left .. put_u32_le(value) .. right
 end
 
+local function get_u32_le(buf, word_index)
+  local i = word_index * 4
+  local b0 = buf:byte(i+1) or 0
+  local b1 = buf:byte(i+2) or 0
+  local b2 = buf:byte(i+3) or 0
+  local b3 = buf:byte(i+4) or 0
+  return b0 + b1*256 + b2*65536 + b3*16777216
+end
+
+local function ensure_len(buf, bytes)
+  local need = bytes - #buf
+  if need <= 0 then return buf end
+  return buf .. string.rep("\0", need)
+end
+
 ----------------------------------------------------------------------
--- defaults
+-- constants (match JS)
 ----------------------------------------------------------------------
-local WG_SIZE = 64  -- matches WGSL @workgroup_size(64)
+local WG_SIZE = 64  -- matches WGSL @workgroup_size(64) and CUDA blockDim.x
 local HEADER_WORDS_V3 = 12
--- word 10: pp_start, word 11: pp_len
+local CONST_WORDS = 8*3 + 4            -- N(8) + R2(8) + mont_one(8) + n0inv32(1) + pad(3)
+local CURVE_OUT_WORDS_PER = 8 + 1 + 3  -- result(8) + status(1) + pad(3)
+local STATE_WORDS_PER_CURVE = 8 + 8 + 8 + 2 -- X(8) + Z(8) + A24(8) + (sigma, curve_ok)
 
 -- choose a sane entry name. If your CUDA kernel uses another name, set payload.entry in strategy.
 local DEFAULT_ENTRY_BY_FW = { cuda = "execute_task", opencl = "execute_task", vulkan = "main" }
@@ -142,29 +160,44 @@ function compile_and_run(chunk)
   local dims = payload.dims or {}
   local n = assert(dims.n, "payload.dims.n missing")
   local pp_count = assert(dims.pp_count, "payload.dims.pp_count missing")
-  local total_words = assert(dims.total_words, "payload.dims.total_words missing")
-  local bufferSizeBytes = total_words * 4
 
   -- pull kernel source (CUDA preferred)
   local arts = get_artifacts_view(chunk)
   local source = find_artifact_source_for(fw, arts) or find_artifact_source_for("cuda", arts)
   if not source then error("No kernel source found for CUDA in artifacts") end
 
-  -- input buffer (as bytes); we will PATCH pp_start/pp_len each pass
+  -- input buffer (as base64); we will PATCH pp_start/pp_len each pass AND reuse between passes
   local in_b64 = assert(payload.data, "payload.data (base64) missing")
   local base_buf = b64decode(in_b64)
-  if #base_buf < bufferSizeBytes then
-    error(string.format("ECM buffer too small: have %d need %d bytes", #base_buf, bufferSizeBytes))
+
+  -- Ensure header is at least v3 and 12 words long
+  base_buf = ensure_len(base_buf, HEADER_WORDS_V3 * 4)
+  local version = get_u32_le(base_buf, 1)
+  if version < 3 then
+    print(string.format("[lua/ecm1] Upgrading buffer version %d -> 3", version))
+    base_buf = patch_word_le(base_buf, 1, 3)   -- version
+    base_buf = patch_word_le(base_buf, 10, 0)  -- pp_start
+    base_buf = patch_word_le(base_buf, 11, 0)  -- pp_len
   end
 
-  -- launch configuration (OpenCL-style fields; CudaExecutor maps them to grid/block)
-  local blocks = math.floor((n + WG_SIZE - 1) / WG_SIZE) * WG_SIZE
-  local local_size = { WG_SIZE, 1, 1 }
-  local global_size = { blocks, 1, 1 }
+  -- Compute full IO layout like the JS client, and make sure buffer is large enough
+  local outputOffset = HEADER_WORDS_V3 + CONST_WORDS + pp_count
+  local stateOffset  = outputOffset + n * CURVE_OUT_WORDS_PER
+  local totalBufferWords = stateOffset + n * STATE_WORDS_PER_CURVE
+  local bufferSizeBytes = totalBufferWords * 4
+  if #base_buf < bufferSizeBytes then
+    print(string.format("[lua/ecm1] Extending input buffer from %d to %d bytes for state region", #base_buf, bufferSizeBytes))
+    base_buf = ensure_len(base_buf, bufferSizeBytes)
+  end
+
+  -- launch configuration (explicit CUDA grid/block to match JS: @workgroup_size(64))
+  local blocks_x = math.floor((n + WG_SIZE - 1) / WG_SIZE) -- ceil(n/64)
+  local grid = { blocks_x, 1, 1 }
+  local block = { WG_SIZE, 1, 1 }
 
   local entry = get_entry_point(fw, payload)
 
-  -- resumable loop
+  -- resumable loop (match JS tuning policy)
   local TARGET_MS = 500
   local pp_len = math.min(1500, pp_count)
   local pp_start = 0
@@ -173,10 +206,12 @@ function compile_and_run(chunk)
   local total_ms = 0
   local last_result = nil
 
+  print(string.format("[lua/ecm1] Starting ECM Stage 1 v3: n=%d curves, pp_count=%d", n, pp_count))
+
   while pp_start < pp_count do
     local this_len = math.min(pp_len, pp_count - pp_start)
 
-    -- patch header[10]=pp_start, header[11]=pp_len
+    -- patch header[10]=pp_start, header[11]=pp_len on the current working buffer
     local buf = base_buf
     buf = patch_word_le(buf, 10, pp_start)
     buf = patch_word_le(buf, 11, this_len)
@@ -186,23 +221,35 @@ function compile_and_run(chunk)
       source      = source,
       entry       = entry,
       inputs      = { { b64 = b64encode(buf) } },
-      outputSizes = { bufferSizeBytes }, -- read back full IO region
-      global      = global_size,
+      outputSizes = { bufferSizeBytes }, -- read back FULL IO region (so state is preserved)
+      grid        = grid,                -- explicit grid
+      block       = block,               -- explicit block (64)
     }
-    task["local"] = local_size
 
     local result = executor.run(fw, task)
-    local dt = 100.0  -- Fixed timing for adaptive sizing (timing not available in native client)
 
     if type(result) ~= "table" or not result.ok then
       local err = (type(result) == "table" and result.error) or "unknown"
       error("[lua/ecm1] executor error: " .. tostring(err))
     end
+
     last_result = result
+
+    -- IMPORTANT: carry state forward by replacing base_buf with the WHOLE returned IO buffer
+    local outs = assert(result.outputs, "missing result.outputs from executor")
+    local out_b64 = assert(outs[1], "missing result.outputs[1]")
+    base_buf = b64decode(out_b64)
+    if #base_buf < bufferSizeBytes then
+      -- some executors may truncate; ensure we keep capacity
+      base_buf = ensure_len(base_buf, bufferSizeBytes)
+    end
+
+    -- Timing and adaptive pp_len (use GPU kernel ms if provided)
+    local dt = tonumber(result.ms) or 0
+    if dt <= 0 then dt = 100.0 end
     total_ms = total_ms + dt
     pass = pass + 1
 
-    -- Adaptive pp_len (CPU time heuristic)
     if dt < TARGET_MS/2 and pp_len < 10000 then
       pp_len = math.min(pp_len * 2, 10000)
     elseif dt > TARGET_MS * 1.5 then
@@ -210,10 +257,13 @@ function compile_and_run(chunk)
       pp_len = math.max(scaled, 100)
     end
 
+    print(string.format("[lua/ecm1] pass %d: pp[%d:%d) dt=%.1fms pp_len=%d",
+      pass, pp_start, pp_start + this_len, dt, pp_len))
+
     pp_start = pp_start + this_len
   end
 
-  -- Annotate timings for your C++ client to forward in "timings"
+  -- Annotate timings (for C++ client logs)
   if type(last_result) == "table" then
     last_result.timings = last_result.timings or {}
     last_result.timings.luaPasses = pass
@@ -221,7 +271,8 @@ function compile_and_run(chunk)
     last_result.timings.wgSize = WG_SIZE
   end
 
+  print(string.format("[lua/ecm1] complete: %d prime powers in ~%.1fms across %d passes", pp_count, total_ms, pass))
   return last_result
 end
 
-print("[lua/ecm1] host loaded (resumable CUDA)")
+print("[lua/ecm1] host loaded (resumable CUDA, JS-equivalent behavior)")
