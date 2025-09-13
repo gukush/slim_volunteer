@@ -148,16 +148,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
         const nativeMeta = {
           ...meta,
           framework: 'native-cuda',
-          schema: {
-            output: 'Uint32Array',
-            inputs: [
-              {
-                name: 'data',
-                type: 'Uint32Array',
-                inPlace: true // This input buffer is modified in-place (like WebGPU)
-              }
-            ]
-          },
           // Add any additional metadata needed for native processing
         };
 
