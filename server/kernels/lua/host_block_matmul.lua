@@ -72,7 +72,7 @@ end
 
 local function calculate_local_size(payload, fw, rows, cols)
   if payload and payload["local"] then return payload["local"] end
-  
+
   if is_opencl_framework(fw) then
     -- Match kernel's TILE (16 in your .cl). If you later pass -DTILE=..., read it here.
     local tile = 16
@@ -86,7 +86,7 @@ end
 local function get_entry_point(fw, payload)
   if payload and payload.entry and #payload.entry > 0 then return payload.entry end
   if payload and payload.program and #payload.program > 0 then return payload.program end
-  
+
   -- Default entry points for raw framework strings
   if is_opencl_framework(fw) or is_cuda_framework(fw) then
     return "execute_task"
@@ -127,16 +127,16 @@ end
 -- Check if two framework strings are compatible (raw comparison)
 local function frameworks_match(fw1, fw2)
   if fw1 == fw2 then return true end
-  
+
   -- Check for OpenCL compatibility
   if is_opencl_framework(fw1) and is_opencl_framework(fw2) then return true end
-  
+
   -- Check for CUDA compatibility
   if is_cuda_framework(fw1) and is_cuda_framework(fw2) then return true end
-  
+
   -- Check for Vulkan compatibility
   if is_vulkan_framework(fw1) and is_vulkan_framework(fw2) then return true end
-  
+
   return false
 end
 
@@ -154,7 +154,7 @@ end
 -- Global size: for OpenCL use 2-D NDRange {cols, rows, 1}; fallback otherwise
 local function calculate_global_size(payload, fw, rows, cols)
   if payload and payload.global then return payload.global end
-  
+
   if rows and cols and is_opencl_framework(fw) then
     return { cols, rows, 1 }
   end
@@ -173,12 +173,30 @@ end
 function compile_and_run(chunk)
   print("[lua] compile_and_run called")
 
-  -- Use raw framework string directly, with fallback to default
-  local fw = chunk.framework or (chunk.meta and chunk.meta.framework) or "opencl"
+  -- Use workload framework as primary source, strip "native-" prefix
+  local fw = workload_framework or (chunk.payload and chunk.payload.framework) or chunk.framework or (chunk.meta and chunk.meta.framework) or "opencl"
+  -- Strip "native-" prefix if present
+  if fw:match("^native%-") then
+    fw = fw:gsub("^native%-", "")
+  end
+
   local payload = chunk.payload or chunk
   local cfg = chunk.config or payload.config or {}
 
+  -- Get config from workload if available (K, M, N, tileSize)
+  if workload_config then
+    for k, v in pairs(workload_config) do
+      if k == "framework" and type(v) == "string" and v:match("^native%-") then
+        -- Strip "native-" prefix from framework in config
+        cfg[k] = v:gsub("^native%-", "")
+      else
+        cfg[k] = v
+      end
+    end
+  end
+
   print("[lua] Framework: " .. tostring(fw) .. ", Action: " .. tostring(payload.action or "compile_and_run"))
+  print("[lua] Config K: " .. tostring(cfg.K) .. ", M: " .. tostring(cfg.M) .. ", N: " .. tostring(cfg.N) .. ", tileSize: " .. tostring(cfg.tileSize))
 
   -- Uniforms: rows (M), K, cols (N)
   local uniforms = payload.uniforms
