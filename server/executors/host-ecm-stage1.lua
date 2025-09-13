@@ -98,9 +98,9 @@ end
 ----------------------------------------------------------------------
 local function put_u32_le(v)
   local b0 = string.char(v % 256)
-  local b1 = string.char((v // 256) % 256)
-  local b2 = string.char((v // 65536) % 256)
-  local b3 = string.char((v // 16777216) % 256)
+  local b1 = string.char(math.floor(v / 256) % 256)
+  local b2 = string.char(math.floor(v / 65536) % 256)
+  local b3 = string.char(math.floor(v / 16777216) % 256)
   return b0..b1..b2..b3
 end
 
