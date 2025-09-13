@@ -191,6 +191,24 @@ function compile_and_run(chunk)
   local padded_data = create_padded_buffer(original_data, original_size, padded_size, ascending)
   local data_size_bytes = padded_size * 4
 
+  -- Debug: Check first few bytes of original and padded data
+  print(string.format("[lua/sort] Original data length: %d bytes", #original_data))
+  print(string.format("[lua/sort] Padded data length: %d bytes", #padded_data))
+  if #original_data >= 16 then
+    local orig_hex = ""
+    for i = 1, math.min(16, #original_data) do
+      orig_hex = orig_hex .. string.format("%02x", string.byte(original_data, i))
+    end
+    print(string.format("[lua/sort] Original data first 16 bytes: %s", orig_hex))
+  end
+  if #padded_data >= 16 then
+    local pad_hex = ""
+    for i = 1, math.min(16, #padded_data) do
+      pad_hex = pad_hex .. string.format("%02x", string.byte(padded_data, i))
+    end
+    print(string.format("[lua/sort] Padded data first 16 bytes: %s", pad_hex))
+  end
+
   -- Launch configuration
   local num_groups = math.floor((padded_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE)
   local grid = { num_groups, 1, 1 }
