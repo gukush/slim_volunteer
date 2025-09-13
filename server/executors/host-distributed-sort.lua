@@ -106,11 +106,14 @@ end
 -- util: create padded buffer with sentinel values
 ----------------------------------------------------------------------
 local function create_padded_buffer(original_data, original_size, padded_size, ascending)
-  local padded_bytes = string.rep("\0", padded_size * 4)
-
   -- Copy original data (first original_size * 4 bytes)
   local copy_bytes = math.min(#original_data, original_size * 4)
-  padded_bytes = original_data:sub(1, copy_bytes) .. padded_bytes:sub(copy_bytes + 1)
+  local original_part = original_data:sub(1, copy_bytes)
+
+  -- Create the rest with zeros
+  local padding_size = (padded_size - original_size) * 4
+  local padding_bytes = string.rep("\0", padding_size)
+  local padded_bytes = original_part .. padding_bytes
 
   -- Fill padding with sentinel values
   if original_size < padded_size then
