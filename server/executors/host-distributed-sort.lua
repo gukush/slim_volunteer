@@ -228,8 +228,8 @@ function compile_and_run(chunk)
       end
 
       -- Get result data for next iteration
-      local outs = assert(result.outputs, "missing result.outputs from executor")
-      local out_b64 = assert(outs[1], "missing result.outputs[1]")
+      local outs = assert(result.results, "missing result.results from executor")
+      local out_b64 = assert(outs[1], "missing result.results[1]")
       current_data = b64decode(out_b64)
 
       -- Track timing
@@ -250,7 +250,7 @@ function compile_and_run(chunk)
   -- Create final result
   local final_result_obj = {
     ok = true,
-    outputs = { b64encode(final_result) },
+    results = { b64encode(final_result) },  -- Changed from "outputs" to "results"
     ms = total_gpu_time,
     timings = {
       stageCount = stage_count,
