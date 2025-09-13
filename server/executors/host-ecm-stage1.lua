@@ -97,10 +97,10 @@ end
 -- util: endian helpers to patch header words (u32 little-endian)
 ----------------------------------------------------------------------
 local function put_u32_le(v)
-  local b0 = string.char(v         & 0xFF)
-  local b1 = string.char((v >> 8 ) & 0xFF)
-  local b2 = string.char((v >> 16) & 0xFF)
-  local b3 = string.char((v >> 24) & 0xFF)
+  local b0 = string.char(v % 256)
+  local b1 = string.char((v // 256) % 256)
+  local b2 = string.char((v // 65536) % 256)
+  local b3 = string.char((v // 16777216) % 256)
   return b0..b1..b2..b3
 end
 
