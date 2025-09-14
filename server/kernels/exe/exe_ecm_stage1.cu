@@ -53,12 +53,20 @@ __device__ __forceinline__ uint32_t stateOffset(const Header32& h){
 // -------------------- 256-bit types (8 x u32) --------------------
 struct U256 { uint32_t w[LIMBS32]; };
 
-__device__ __forceinline__ void set_zero(U256& a){ #pragma unroll for(int i=0;i<8;i++) a.w[i]=0u; }
+__device__ __forceinline__ void set_zero(U256& a){
+    #pragma unroll
+    for(int i=0;i<8;i++) a.w[i]=0u;
+}
 __device__ __forceinline__ void set_one (U256& a){ set_zero(a); a.w[0]=1u; }
 __device__ __forceinline__ int  cmp(const U256& a, const U256& b){
     for(int i=7;i>=0;i--){ if(a.w[i]<b.w[i]) return -1; if(a.w[i]>b.w[i]) return 1; } return 0;
 }
-__device__ __forceinline__ bool is_zero(const U256& a){ uint32_t x=0u; #pragma unroll for(int i=0;i<8;i++) x|=a.w[i]; return x==0u; }
+__device__ __forceinline__ bool is_zero(const U256& a){
+    uint32_t x=0u;
+    #pragma unroll
+    for(int i=0;i<8;i++) x|=a.w[i];
+    return x==0u;
+}
 __device__ __forceinline__ bool is_even(const U256& a){ return (a.w[0] & 1u)==0u; }
 
 __device__ __forceinline__ void add_u256(U256& r, const U256& a, const U256& b){
@@ -106,7 +114,9 @@ __device__ __forceinline__ void mul32(uint32_t a, uint32_t b, uint32_t& lo, uint
 
 // Montgomery CIOS (word=32, L=8)
 __device__ void mont_mul(U256& r, const U256& a, const U256& b, const U256& N, uint32_t n0inv32){
-    uint32_t t[9]; #pragma unroll for(int i=0;i<9;i++) t[i]=0u;
+    uint32_t t[9];
+    #pragma unroll
+    for(int i=0;i<9;i++) t[i]=0u;
 
     #pragma unroll
     for(int i=0;i<8;i++){
@@ -215,7 +225,9 @@ __device__ void ladder(PointXZ& R0, const PointXZ& P, uint32_t k, const U256& A2
 // RNG + simple helpers (LCG32)
 __device__ __forceinline__ uint32_t lcg32(uint32_t& s){ s = s*1103515245u + 12345u; return s; }
 __device__ U256 next_sigma(const U256& /*N*/, uint32_t& state){
-    U256 sigma; #pragma unroll for(int i=0;i<8;i++) sigma.w[i] = lcg32(state);
+    U256 sigma;
+    #pragma unroll
+    for(int i=0;i<8;i++) sigma.w[i] = lcg32(state);
     if(is_zero(sigma)){ set_one(sigma); sigma.w[0]=6u; }
     if(sigma.w[0]==1u){ sigma.w[0]=6u; }
     return sigma;
