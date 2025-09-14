@@ -1,147 +1,88 @@
-// kernels/cuda/multi_head_attention.cu
-// Single-head scaled dot-product attention (tiled, uniform-control flow)
-// Launch: dim3 block(256, 1, 1), dim3 grid(seq_len, d_v, 1)
+// File: kernels/multi_head_attention.cu
+// Device kernel (to be compiled at runtime by your CUDA executor).
+// Signature must be: execute_task(int seq_len, int d_k, int d_v, Q, K, V, output)
 
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
-#include <cmath>
+extern "C" __global__
+void execute_task(const int seq_len,
+                  const int d_k,
+                  const int d_v,
+                  const float* __restrict__ Q,
+                  const float* __restrict__ K,
+                  const float* __restrict__ V,
+                  float* __restrict__ O)
+{
+    // One block computes a single output element O[row, col].
+    const int row = blockIdx.x;
+    const int col = blockIdx.y;
+    if (row >= seq_len || col >= d_v) return;
 
-struct Dims {
-  unsigned int seq_len;
-  unsigned int d_k;
-  unsigned int d_v;
-  unsigned int _pad;
-};
+    const float scale = rsqrtf((float)d_k);
 
-__global__ void attention(const float* Q, const float* K, const float* V, float* output, Dims dims) {
-  unsigned int out_row = blockIdx.x;
-  unsigned int out_col = blockIdx.y;
-  unsigned int lane = threadIdx.x;
+    // Fixed-size shared buffer for reductions (256 threads expected).
+    __shared__ float sdata[256];
 
-  bool is_active = (out_row < dims.seq_len) && (out_col < dims.d_v);
-
-  float scale = 1.0f / sqrtf(static_cast<float>(dims.d_k));
-
-  __shared__ float scratch[256];
-  __shared__ float wg_max;
-  __shared__ float wg_sum;
-
-  // Pass 1: global max(score)
-  if (lane == 0) { wg_max = -1e30f; }
-  __syncthreads();
-
-  unsigned int base = 0;
-  while (base < dims.seq_len) {
-    unsigned int k_idx = base + lane;
-
-    float s = -1e30f;
-
-    if (is_active && k_idx < dims.seq_len) {
-      float acc = 0.0f;
-      for (unsigned int d = 0; d < dims.d_k; ++d) {
-        float qv = Q[out_row * dims.d_k + d];
-        float kv = K[k_idx * dims.d_k + d];
-        acc += qv * kv;
-      }
-      s = acc * scale;
+    // 1) Max over scores for numerical stability
+    float local_max = -1e30f;
+    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
+        const float* q = Q + row * d_k;
+        const float* k = K + j   * d_k;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < d_k; ++d) acc += q[d] * k[d];
+        local_max = fmaxf(local_max, acc * scale);
     }
-
-    scratch[lane] = s;
+    sdata[threadIdx.x] = local_max;
     __syncthreads();
 
-    if (lane == 0) {
-      unsigned int tile_n = min(256u, dims.seq_len - base);
-      float tmax = -1e30f;
-      for (unsigned int i = 0; i < tile_n; ++i) {
-        tmax = fmaxf(tmax, scratch[i]);
-      }
-      wg_max = fmaxf(wg_max, tmax);
+    // reduce max
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + stride]);
+        __syncthreads();
     }
+    const float gmax = sdata[0];
+
+    // 2) Denominator = sum(exp(score - gmax))
+    float local_sum = 0.0f;
+    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
+        const float* q = Q + row * d_k;
+        const float* k = K + j   * d_k;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < d_k; ++d) acc += q[d] * k[d];
+        local_sum += __expf(acc * scale - gmax);
+    }
+    sdata[threadIdx.x] = local_sum;
     __syncthreads();
 
-    base += 256;
-  }
-
-  // Broadcast global max
-  if (lane == 0) { scratch[0] = wg_max; }
-  __syncthreads();
-  float gmax = scratch[0];
-
-  // Pass 2: global sum(exp(..))
-  if (lane == 0) { wg_sum = 0.0f; }
-  __syncthreads();
-
-  base = 0;
-  while (base < dims.seq_len) {
-    unsigned int k_idx = base + lane;
-
-    float ex = 0.0f;
-    if (is_active && k_idx < dims.seq_len) {
-      float acc = 0.0f;
-      for (unsigned int d = 0; d < dims.d_k; ++d) {
-        float qv = Q[out_row * dims.d_k + d];
-        float kv = K[k_idx * dims.d_k + d];
-        acc += qv * kv;
-      }
-      ex = expf(acc * scale - gmax);
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        __syncthreads();
     }
+    const float denom = fmaxf(sdata[0], 1e-20f);
 
-    scratch[lane] = ex;
+    // 3) Weighted sum with V
+    float local_out = 0.0f;
+    for (int j = threadIdx.x; j < seq_len; j += blockDim.x) {
+        const float* q = Q + row * d_k;
+        const float* k = K + j   * d_k;
+        float acc = 0.0f;
+        #pragma unroll 4
+        for (int d = 0; d < d_k; ++d) acc += q[d] * k[d];
+        const float p = __expf(acc * scale - gmax) / denom;
+        local_out += p * V[j * d_v + col];
+    }
+    sdata[threadIdx.x] = local_out;
     __syncthreads();
 
-    if (lane == 0) {
-      unsigned int tile_n = min(256u, dims.seq_len - base);
-      float tsum = 0.0f;
-      for (unsigned int i = 0; i < tile_n; ++i) {
-        tsum += scratch[i];
-      }
-      wg_sum += tsum;
-    }
-    __syncthreads();
-
-    base += 256;
-  }
-
-  // Broadcast denom with epsilon
-  if (lane == 0) { scratch[0] = fmaxf(wg_sum, 1e-20f); }
-  __syncthreads();
-  float denom = scratch[0];
-
-  // Pass 3: weighted sum with V
-  float partial = 0.0f;
-
-  base = 0;
-  while (base < dims.seq_len) {
-    unsigned int k_idx = base + lane;
-
-    if (is_active && k_idx < dims.seq_len) {
-      float acc = 0.0f;
-      for (unsigned int d = 0; d < dims.d_k; ++d) {
-        float qv = Q[out_row * dims.d_k + d];
-        float kv = K[k_idx * dims.d_k + d];
-        acc += qv * kv;
-      }
-      float prob = expf(acc * scale - gmax) / denom;
-      float vv = V[k_idx * dims.d_v + out_col];
-      partial += prob * vv;
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            sdata[threadIdx.x] += sdata[threadIdx.x + stride];
+        __syncthreads();
     }
 
-    base += 256;
-  }
-
-  // Reduce 256 lanes to one
-  scratch[lane] = partial;
-  __syncthreads();
-
-  for (unsigned int stride = 128; stride > 0; stride /= 2) {
-    if (lane < stride) {
-      scratch[lane] += scratch[lane + stride];
+    if (threadIdx.x == 0) {
+        O[row * d_v + col] = sdata[0];
     }
-    __syncthreads();
-  }
-
-  // Only active lanes write output
-  if (lane == 0 && is_active) {
-    output[out_row * dims.d_v + out_col] = scratch[0];
-  }
 }

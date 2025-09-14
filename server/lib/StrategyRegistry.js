@@ -8,6 +8,9 @@ import * as multiHeadAttention from '../strategies/multi-head-attention.js';
 import * as exeBlockMatmulFlex from '../strategies/exe-block-matmul-flex.js';
 import * as nativeEcmStage1 from '../strategies/native-ecm-stage1.js';
 import * as nativeDistributedSort from '../strategies/native-distributed-sort.js';
+import * as nativeMultiHeadAttention from '../strategies/native-multi-head-attention.js';
+import * as exeMultiHeadAttention from '../strategies/exe-multi-head-attention.js';
+
 
 const strategies = new Map();
 
@@ -24,6 +27,8 @@ register(multiHeadAttention);
 register(exeBlockMatmulFlex);
 register(nativeEcmStage1);
 register(nativeDistributedSort);
+register(nativeMultiHeadAttention);
+register(exeMultiHeadAttention);
 
 export function listStrategies() {
   return Array.from(strategies.keys());
