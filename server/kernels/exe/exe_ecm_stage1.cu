@@ -627,6 +627,6 @@ int main(){
     // Only send until end of output section (no need to stream state back)
     const uint64_t resultWords = outOffset(h) + (uint64_t)h.n_curves * OUT_WORDS_PER;
     const uint64_t resultBytes = resultWords * 4ull;
-re     write_exact(buf.data(), resultBytes);
+    write_exact(buf.data(), resultBytes);
     return 0;
 }
