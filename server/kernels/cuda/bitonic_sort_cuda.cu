@@ -16,22 +16,34 @@ struct SortParams {
 
 extern "C" __global__
 void execute_task(
-    const uint32_t array_size,    // uniforms[0]
-    const uint32_t stage,         // uniforms[1]
-    const uint32_t substage,      // uniforms[2]
-    const uint32_t ascending,     // uniforms[3]
-    uint32_t* __restrict__ data   // inputs[0] and outputs[0], size array_size
+    const uint32_t* __restrict__ uniforms,  // uniforms[0]=array_size, uniforms[1]=stage, uniforms[2]=substage, uniforms[3]=ascending
+    const uint32_t* __restrict__ inputs,    // inputs[0] = input data buffer
+    uint32_t* __restrict__ outputs          // outputs[0] = output data buffer
 ) {
+    // Extract uniform parameters (matching WebGPU uniform buffer structure)
+    const uint32_t array_size = uniforms[0];
+    const uint32_t stage = uniforms[1];
+    const uint32_t substage = uniforms[2];
+    const uint32_t ascending = uniforms[3];
+
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (i >= array_size) {
         return;
     }
 
+    // Copy input data to output buffer (only if different buffers)
+    if (inputs != outputs) {
+        outputs[i] = inputs[i];
+        // Synchronize to ensure all threads have copied their data
+        __syncthreads();
+    }
+
+    // Bitonic sort comparison and swap (matching WebGPU logic exactly)
     const uint32_t partner = i ^ substage;
     if (partner > i) {
-        const uint32_t a = data[i];
-        const uint32_t b = data[partner];
+        const uint32_t a = outputs[i];
+        const uint32_t b = outputs[partner];
 
         // Determine sort direction for this comparison
         // The bit pattern determines if we're in an ascending or descending block
@@ -40,42 +52,57 @@ void execute_task(
         // Apply global sort direction
         const bool should_ascend = ascending_block == (ascending == 1u);
 
-        // Swap if elements are out of order
+        // Swap if elements are out of order (exactly like WebGPU)
         if ((a > b) == should_ascend) {
-            data[i] = b;
-            data[partner] = a;
+            outputs[i] = b;
+            outputs[partner] = a;
         }
     }
 }
 
-// Alternative entry point that matches the WebGPU parameter structure
+// Alternative entry point that matches the WebGPU parameter structure exactly
 extern "C" __global__
 void bitonic_sort_stage(
-    uint32_t* __restrict__ data,
-    const SortParams params
+    const uint32_t* __restrict__ uniforms,  // uniforms[0]=array_size, uniforms[1]=stage, uniforms[2]=substage, uniforms[3]=ascending
+    const uint32_t* __restrict__ inputs,    // inputs[0] = input data buffer
+    uint32_t* __restrict__ outputs          // outputs[0] = output data buffer
 ) {
+    // Extract uniform parameters (matching WebGPU uniform buffer structure)
+    const uint32_t array_size = uniforms[0];
+    const uint32_t stage = uniforms[1];
+    const uint32_t substage = uniforms[2];
+    const uint32_t ascending = uniforms[3];
+
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (i >= params.array_size) {
+    if (i >= array_size) {
         return;
     }
 
-    const uint32_t partner = i ^ params.substage;
+    // Copy input data to output buffer (only if different buffers)
+    if (inputs != outputs) {
+        outputs[i] = inputs[i];
+        // Synchronize to ensure all threads have copied their data
+        __syncthreads();
+    }
+
+    // Bitonic sort comparison and swap (matching WebGPU logic exactly)
+    const uint32_t partner = i ^ substage;
     if (partner > i) {
-        const uint32_t a = data[i];
-        const uint32_t b = data[partner];
+        const uint32_t a = outputs[i];
+        const uint32_t b = outputs[partner];
 
         // Determine sort direction for this comparison
         // The bit pattern determines if we're in an ascending or descending block
-        const bool ascending_block = ((i & params.stage) == 0u);
+        const bool ascending_block = ((i & stage) == 0u);
 
         // Apply global sort direction
-        const bool should_ascend = ascending_block == (params.ascending == 1u);
+        const bool should_ascend = ascending_block == (ascending == 1u);
 
-        // Swap if elements are out of order
+        // Swap if elements are out of order (exactly like WebGPU)
         if ((a > b) == should_ascend) {
-            data[i] = b;
-            data[partner] = a;
+            outputs[i] = b;
+            outputs[partner] = a;
         }
     }
 }
