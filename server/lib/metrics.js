@@ -22,12 +22,12 @@ export class TaskTimers{
     this.start = Date.now();
     this.dir = dir;
     this.roundTrip = new CSVWriter(path.join(dir, `chunk_timing_${taskId}.csv`),
-      ['chunkId','replica','t_chunk_create','t_sent','t_client_recv','t_client_done','t_server_recv','t_assembled','duration_ms']);
+      ['chunkId','replica','t_chunk_create','t_sent','t_client_recv','t_client_done','t_server_recv','t_assembled','duration_ms','cpu_time_ms','gpu_time_ms']);
   }
   chunkRow(data){
-    const {chunkId, replica, tCreate, tSent, tClientRecv, tClientDone, tServerRecv, tAssembled} = data;
+    const {chunkId, replica, tCreate, tSent, tClientRecv, tClientDone, tServerRecv, tAssembled, cpuTimeMs, gpuTimeMs} = data;
     const duration = (tAssembled||tServerRecv||Date.now()) - (tCreate||this.start);
-    this.roundTrip.append([chunkId, replica, tCreate, tSent, tClientRecv, tClientDone, tServerRecv, tAssembled, duration]);
+    this.roundTrip.append([chunkId, replica, tCreate, tSent, tClientRecv, tClientDone, tServerRecv, tAssembled, duration, cpuTimeMs || '', gpuTimeMs || '']);
   }
   endSummary(outFile, status='completed'){
     const end = Date.now();
