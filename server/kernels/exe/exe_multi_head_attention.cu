@@ -11,7 +11,7 @@
 #include <vector>
 #include <iostream>
 #include <cuda_runtime.h>
-#include "common_protocol.h"
+#include "common_protocol_cuda.h"
 
 using i32 = int32_t;
 

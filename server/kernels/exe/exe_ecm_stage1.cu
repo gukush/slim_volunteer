@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include "common_protocol.h"
+#include "common_protocol_cuda.h"
 
 static void die(const char* msg){ std::fprintf(stderr, "%s\n", msg); std::exit(1); }
 static void read_all_stdin(std::vector<uint8_t>& out){
