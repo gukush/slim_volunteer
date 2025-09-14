@@ -12,7 +12,7 @@ export function getClientExecutorInfo(config) {
     return {
       framework: 'webgpu',
       path: 'executors/webgpu-distributed-sort.client.js',
-      kernels: ['kernels/bitonic_sort.wgsl']
+      kernels: ['kernels/webgpu/bitonic_sort.wgsl']
     };
   }
   throw new Error('Unsupported framework in config.framework: ' + fw);
@@ -108,7 +108,7 @@ if (!inputFile) {
 
   if (!inputFile) throw new Error('Need input binary file with integers');
 
-  const { chunkSize = 65536, ascending = true } = config; // Default 64K integers per chunk
+  const { chunkSize = 65536, ascending = true, maxElements } = config; // Default 64K integers per chunk
 if (!inputFile) {
   throw new Error('Need input binary file with integers (.bin). None provided and none found in task/uploads.');
 }
@@ -116,7 +116,14 @@ const fd = fs.openSync(inputFile, 'r');
 
   const fileStats = fs.fstatSync(fd);
   if (fileStats.size % 4 !== 0) throw new Error(`Input file size (${fileStats.size} bytes) is not a multiple of 4.`);
-  const totalIntegers = Math.floor(fileStats.size / 4); // 4 bytes per 32-bit integer
+  let totalIntegers = Math.floor(fileStats.size / 4); // 4 bytes per 32-bit integer
+  
+  // Apply maxElements limit if specified
+  if (maxElements && maxElements > 0 && maxElements < totalIntegers) {
+    totalIntegers = maxElements;
+    logger.info(`Limiting processing to ${maxElements} elements (file contains ${Math.floor(fileStats.size / 4)} elements)`);
+  }
+  
   const chunksCount = Math.ceil(totalIntegers / chunkSize);
 
   logger.info(`Distributed sort: ${totalIntegers} integers, ${chunksCount} chunks`);

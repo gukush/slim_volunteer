@@ -15,7 +15,18 @@ export function getClientExecutorInfo(config){
     return { framework:'cpp-wasm', path:'executors/wasm-block-matmul.client.js', kernels:['kernels/cpp/block_matmul.js'] };
   }
   if (fw === 'webgpu') {
-    return { framework:'webgpu', path:'executors/webgpu-block-matmul.client.js', kernels:['kernels/webgpu/block_matmul.wgsl'] };
+    const datatype = (config?.datatype || 'f32').toLowerCase();
+    let kernelPath = 'kernels/webgpu/block_matmul.wgsl'; // default f32
+    
+    if (datatype === 'f16') {
+      kernelPath = 'kernels/webgpu/block_matmul_fp16.wgsl';
+    } else if (datatype === 'int8') {
+      kernelPath = 'kernels/webgpu/block_matmul_int8.wgsl';
+    } else if (datatype !== 'f32') {
+      logger.warn(`Unknown datatype '${datatype}', using default f32`);
+    }
+    
+    return { framework:'webgpu', path:'executors/webgpu-block-matmul.client.js', kernels:[kernelPath] };
   }
   if (fw === 'webgl2') {
     return { framework:'webgl2', path:'executors/webgl2-block-matmul.client.js', kernels:[
@@ -79,7 +90,7 @@ function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }){
 // ---------- Chunker (depth-tiling over K, payload bounded by chunk_size) ----------
 export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
     function pickInputs(files, N, K, M){
-    if (!files || files.length < 2) throw new Error('No input files uploaded');
+    if (!files || files.length < 2) throw new Error('No input files provided (either upload files or use cachedFilePaths)');
 
     const nameOf = f => f.originalName || (f.path ? path.basename(f.path) : '');
     const endsWithA = f => /(^|[_\-])A\.bin$/i.test(nameOf(f));
