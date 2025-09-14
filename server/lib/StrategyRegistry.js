@@ -10,6 +10,9 @@ import * as nativeEcmStage1 from '../strategies/native-ecm-stage1.js';
 import * as nativeDistributedSort from '../strategies/native-distributed-sort.js';
 import * as nativeMultiHeadAttention from '../strategies/native-multi-head-attention.js';
 import * as exeMultiHeadAttention from '../strategies/exe-multi-head-attention.js';
+import * as exeCpuQuicksort from '../strategies/exe-cpu-quicksort.js';
+import * as exeEcmStage1 from '../strategies/exe-ecm-stage1.js';
+import * as exeDistributedSort from '../strategies/exe-distributed-sort.js';
 
 
 const strategies = new Map();
@@ -29,6 +32,9 @@ register(nativeEcmStage1);
 register(nativeDistributedSort);
 register(nativeMultiHeadAttention);
 register(exeMultiHeadAttention);
+register(exeCpuQuicksort);
+register(exeEcmStage1);
+register(exeDistributedSort);
 
 export function listStrategies() {
   return Array.from(strategies.keys());
