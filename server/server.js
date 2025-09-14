@@ -27,6 +27,32 @@ app.get('/', (req,res)=>res.sendFile(path.join(process.cwd(),'public','index.htm
 app.get('/health', (req,res)=>res.json({ ok: true }));
 app.get('/strategies', (req,res)=>res.json({ strategies: listStrategies() }));
 
+// Endpoint to list cached files in uploads directory
+app.get('/uploads', (req, res) => {
+  try {
+    const uploadsDir = path.join(process.cwd(), STORAGE_DIR, 'uploads');
+    if (!fs.existsSync(uploadsDir)) {
+      return res.json({ files: [] });
+    }
+    
+    const files = fs.readdirSync(uploadsDir).map(filename => {
+      const fullPath = path.join(uploadsDir, filename);
+      const stats = fs.statSync(fullPath);
+      return {
+        filename,
+        size: stats.size,
+        created: stats.birthtime,
+        modified: stats.mtime
+      };
+    }).sort((a, b) => b.modified - a.modified); // Sort by most recent first
+    
+    res.json({ files });
+  } catch (e) {
+    logger.error('Error listing uploads:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const server = (()=>{
   try{
     if(ALLOW_INSECURE) throw new Error('insecure forced');
@@ -105,29 +131,30 @@ io.on('connection', (socket)=>{
   socket.on('chunk:result', (data)=>tm.receiveResult(socket.id, data));
 });
 
-// Raw WebSocket handlers (native clients only)
+// Raw WebSocket handlers (native clients and listeners)
 wss.on('connection', (ws, req) => {
-  logger.info('Native client connected via WebSocket');
+  logger.info('WebSocket connection established');
   logger.info('WebSocket connection details:', { url: req.url, headers: req.headers });
 
-  // Unique ID + mark as native
-  ws.id = `native_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  ws.kind = 'native';
+  // Determine connection type based on User-Agent header
+  const userAgent = req.headers['user-agent'] || '';
+  const isListener = userAgent.includes('Metrics-Listener');
+  
+  if (isListener) {
+    // Listener connection
+    ws.id = `listener_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    ws.kind = 'listener';
+    logger.info('Listener connected via WebSocket');
+  } else {
+    // Native client connection
+    ws.id = `native_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    ws.kind = 'native';
+    logger.info('Native client connected via WebSocket');
+  }
 
-  // Clean up ALL old native connections (only allow one at a time)
-  const existingConnections = Array.from(wss.clients).filter(client =>
-    client.kind === 'native' && client !== ws
-  );
-
-  // Close all old native connections
-  existingConnections.forEach(oldWs => {
-    if (oldWs.readyState === oldWs.OPEN) {
-      logger.info(`Closing old native connection ${oldWs.id} for new connection ${ws.id}`);
-      // Remove client from task manager before closing
-      tm.removeClient(oldWs.id);
-      oldWs.close();
-    }
-  });
+  // Allow multiple connections of both types simultaneously
+  // No need to close existing connections - the TaskManager can handle multiple clients
+  logger.info(`New ${ws.kind} connection established: ${ws.id}`);
 
   // Compact send helper (keeps your {type,data} envelope)
   const send = (type, data) => {
@@ -195,13 +222,21 @@ wss.on('connection', (ws, req) => {
         messageStr = data.toString();
       }
 
-      logger.info(`📨 Native client ${ws.id} message:`, messageStr.substring(0, 100) + '...');
+      logger.info(`📨 ${ws.kind} ${ws.id} message:`, messageStr.substring(0, 100) + '...');
 
       const message = JSON.parse(messageStr);
       const { type, data: eventData } = message;
 
       logger.info(`🔍 Parsed message - type: ${type}, data keys:`, Object.keys(eventData || {}));
       logger.debug(`Processing message type: ${type}`);
+
+      // Handle listener connections differently
+      if (ws.kind === 'listener') {
+        // Listeners don't need to process complex messages, just acknowledge
+        logger.info(`Listener ${ws.id} sent message: ${type}`);
+        send('message:ack', { received: type });
+        return;
+      }
 
       switch (type) {
         case 'client:join': {
@@ -294,8 +329,11 @@ wss.on('connection', (ws, req) => {
   });
 
   ws.on('close', (code, reason) => {
-    logger.info(`Native client ${ws.id} disconnected:`, code, reason?.toString());
-    tm.removeClient(ws.id);
+    logger.info(`${ws.kind} ${ws.id} disconnected:`, code, reason?.toString());
+    if (ws.kind === 'native') {
+      tm.removeClient(ws.id);
+    }
+    // Listeners don't need to be removed from task manager
   });
 
   ws.on('error', (error) => {
@@ -359,7 +397,7 @@ app.post('/tasks', (req, res)=>{
   // Handle JSON requests
   if (contentType.includes('application/json')) {
     try {
-      const { strategyId, input, label, K = 1, config = {} } = req.body || {};
+      const { strategyId, input, label, K = 1, config = {}, cachedFilePaths = [] } = req.body || {};
 
       if (!strategyId) {
         return res.status(400).json({ error: 'strategyId is required' });
@@ -367,13 +405,34 @@ app.post('/tasks', (req, res)=>{
 
       getStrategy(strategyId);
 
+      // Handle cached file paths
+      let inputFiles = [];
+      if (cachedFilePaths && cachedFilePaths.length > 0) {
+        const uploadsDir = path.join(process.cwd(), STORAGE_DIR, 'uploads');
+        
+        for (const cachedPath of cachedFilePaths) {
+          const fullPath = path.join(uploadsDir, cachedPath);
+          if (fs.existsSync(fullPath)) {
+            const stats = fs.statSync(fullPath);
+            inputFiles.push({
+              path: fullPath,
+              originalName: path.basename(cachedPath),
+              size: stats.size
+            });
+            logger.info(`Using cached file: ${cachedPath} (${stats.size} bytes)`);
+          } else {
+            logger.warn(`Cached file not found: ${cachedPath}`);
+          }
+        }
+      }
+
       const desc = tm.createTask({
         strategyId,
         K,
         label: label || 'task',
         config,
         inputArgs: input || {},
-        inputFiles: []
+        inputFiles
       });
 
       res.json(desc);
