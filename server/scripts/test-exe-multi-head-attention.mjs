@@ -97,7 +97,8 @@ async function main() {
   form.append('label', `EXE-MHA-${seq_len}x${d_model}x${num_heads}`);
   form.append('config', JSON.stringify({
     seq_len, d_model, num_heads,
-    backend, binary, program
+    backend, binary, program,
+    framework: 'exe' // Updated to match exe framework
   }));
   form.append('Q.bin', new Blob([fs.readFileSync(qPath)]), 'Q.bin');
   form.append('K.bin', new Blob([fs.readFileSync(kPath)]), 'K.bin');

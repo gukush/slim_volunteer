@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Verification test for native-block-matmul-flex (native binary execution) strategy.
+// Verification test for exe-cpu-quicksort (native binary execution) strategy.
 // This tests the native binary upload and execution path via WebSocket connection.
 
 import fs from 'fs';
@@ -16,29 +16,16 @@ const args = Object.fromEntries(process.argv.slice(2).map(s=>{
 
 // Configuration
 const host = args.host || 'https://localhost:3000';
-const backend = args.backend || 'opencl'; // 'opencl' | 'cuda' | 'vulkan'
 const binary = args.binary; // Path to native binary executable
-const program = args.program || 'block_matmul_native'; // Program name hint for native client
-const N = parseInt(args.N||'64',10), K = parseInt(args.K||'64',10), M = parseInt(args.M||'64',10);
-const TS = parseInt(args.tileSize||'32',10);
-const KTS = parseInt(args.kTileSize||'256',10);
-const Krep = parseInt(args.Krep||'1',10);
-const chunkSize = parseInt(args.chunkSize || args.C || '8388608', 10); // 8MB default
+const program = args.program || 'cpu-quicksort'; // Program name hint for native client
+const N = parseInt(args.N||'1000000',10); // Number of integers to sort
+const chunkSize = parseInt(args.chunkSize || args.C || '65536', 10); // 64K integers per chunk
+const ascending = args.ascending !== 'false'; // Sort direction
+const maxElements = parseInt(args.maxElements || '0', 10); // Limit elements (0 = no limit)
 
-// Validate backend
-if (!['opencl', 'cuda', 'vulkan'].includes(backend)) {
-  console.error(`Invalid backend: ${backend}. Must be one of: opencl, cuda, vulkan`);
-  process.exit(1);
-}
-
-// Default binary paths if not specified
-const defaultBinaries = {
-  opencl: 'server/scripts/native/ocl_block_matmul_chunked',
-  cuda: 'server/scripts/native/cuda_block_matmul',
-  vulkan: 'server/scripts/native/vk_block_matmul'
-};
-
-const binaryPath = binary || defaultBinaries[backend];
+// Default binary path if not specified
+const defaultBinary = 'server/executors/binary/cpu-quicksort';
+const binaryPath = binary || defaultBinary;
 
 // Check if binary exists (optional - server will check too)
 if (binaryPath && !binaryPath.startsWith('server/')) {
@@ -49,70 +36,60 @@ if (binaryPath && !binaryPath.startsWith('server/')) {
   }
 }
 
-console.log('=== Native Binary Execution Test ===');
+console.log('=== Native CPU Quicksort Binary Execution Test ===');
 console.log('Configuration:');
-console.log(`  Backend: ${backend}`);
 console.log(`  Binary: ${binaryPath}`);
 console.log(`  Program: ${program}`);
-console.log(`  Matrix dimensions: ${N}x${K} * ${K}x${M} = ${N}x${M}`);
-console.log(`  Tile size: ${TS}x${TS}, K-tile: ${KTS}`);
+console.log(`  Number of integers: ${N}`);
 console.log(`  Chunk size: ${chunkSize} elements (${(chunkSize*4/1024/1024).toFixed(2)} MB)`);
-console.log(`  K-replication: ${Krep}`);
+console.log(`  Ascending: ${ascending}`);
+console.log(`  Max elements: ${maxElements || 'unlimited'}`);
 console.log(`  Host: ${host}`);
 console.log('');
 
-// Matrix generation and multiplication functions
-function randMat(r,c){
-  const a = new Float32Array(r*c);
-  for(let i=0;i<a.length;i++) a[i] = (Math.random()*2-1);
-  return a;
+// Integer generation and sorting functions
+function generateRandomIntegers(count) {
+  const data = new Uint32Array(count);
+  for (let i = 0; i < count; i++) {
+    data[i] = Math.floor(Math.random() * 0xFFFFFFFF);
+  }
+  return data;
 }
 
-function matmulCPUf32(A,B,rows,kk,cols){
-  const C = new Float32Array(rows*cols);
-  const f = Math.fround;
-  for (let r=0;r<rows;r++){
-    for (let c=0;c<cols;c++){
-      let acc = f(0);
-      for (let k=0;k<kk;k++){
-        acc = f( acc + f( f(A[r*kk+k]) * f(B[k*cols+c]) ) );
-      }
-      C[r*cols+c] = acc;
-    }
+function sortIntegersCPU(data, ascending = true) {
+  const sorted = new Uint32Array(data);
+  if (ascending) {
+    sorted.sort((a, b) => a - b);
+  } else {
+    sorted.sort((a, b) => b - a);
   }
-  return C;
+  return sorted;
 }
 
 // Helper to ignore self-signed certificates for localhost
 const httpsAgent = new Agent({ rejectUnauthorized: false });
 
 async function main(){
-  console.log('Step 1: Generating test matrices...');
-  const A = randMat(N,K);
-  const B = randMat(K,M);
+  console.log('Step 1: Generating test data...');
+  const testData = generateRandomIntegers(N);
   const tmpDir = '/tmp';
-  const tmpA = path.join(tmpDir, `A_${Date.now()}.bin`);
-  const tmpB = path.join(tmpDir, `B_${Date.now()}.bin`);
-  fs.writeFileSync(tmpA, Buffer.from(A.buffer));
-  fs.writeFileSync(tmpB, Buffer.from(B.buffer));
-  console.log(`  Created A.bin: ${N}x${K} (${(N*K*4/1024/1024).toFixed(2)} MB)`);
-  console.log(`  Created B.bin: ${K}x${M} (${(K*M*4/1024/1024).toFixed(2)} MB)`);
+  const tmpInput = path.join(tmpDir, `input_${Date.now()}.bin`);
+  fs.writeFileSync(tmpInput, Buffer.from(testData.buffer));
+  console.log(`  Created input.bin: ${N} integers (${(N*4/1024/1024).toFixed(2)} MB)`);
 
   console.log('\nStep 2: Computing CPU reference result...');
   const startCPU = Date.now();
-  const Cref = matmulCPUf32(A,B,N,K,M);
+  const refResult = sortIntegersCPU(testData, ascending);
   const cpuTime = Date.now() - startCPU;
-  console.log(`  CPU computation took ${cpuTime}ms`);
+  console.log(`  CPU reference sort took ${cpuTime}ms`);
 
   console.log('\nStep 3: Creating task with native binary strategy...');
 
   // Build configuration for native execution
   const config = {
-    N, K, M,
-    backend,        // opencl, cuda, or vulkan
-    tileSize: TS,
-    kTileSize: KTS,
     chunk_size: chunkSize,
+    ascending: ascending,
+    maxElements: maxElements || undefined,
     framework: 'exe', // Updated to match exe framework
   };
 
@@ -128,16 +105,14 @@ async function main(){
 
   // Create FormData for multipart upload
   const fd = new FormData();
-  fd.append('strategyId', 'exe-block-matmul-flex'); // Strategy ID from exe-block-matmul-flex.js
-  fd.append('K', String(Krep));
-  fd.append('label', `native-binary-test`);
+  fd.append('strategyId', 'exe-cpu-quicksort'); // Strategy ID from exe-cpu-quicksort.js
+  fd.append('K', '1'); // Single replication for CPU sort
+  fd.append('label', `cpu-quicksort-test`);
   fd.append('config', JSON.stringify(config));
 
-  // Add matrix files
-  const fileA = new Blob([fs.readFileSync(tmpA)], { type: 'application/octet-stream' });
-  const fileB = new Blob([fs.readFileSync(tmpB)], { type: 'application/octet-stream' });
-  fd.append('A.bin', fileA, 'A.bin');
-  fd.append('B.bin', fileB, 'B.bin');
+  // Add input file
+  const fileInput = new Blob([fs.readFileSync(tmpInput)], { type: 'application/octet-stream' });
+  fd.append('input.bin', fileInput, 'input.bin');
 
   const fetchOptions = host.startsWith('https://localhost')
     ? { agent: httpsAgent }
@@ -157,7 +132,7 @@ async function main(){
   const desc = await resp.json();
   const taskId = desc.id;
   console.log(`  Task created: ${taskId}`);
-  console.log(`  Strategy: exe-block-matmul-flex`);
+  console.log(`  Strategy: exe-cpu-quicksort`);
   console.log(`  Framework: binary`);
 
   console.log('\nStep 4: Starting task (will send binary to native client)...');
@@ -215,19 +190,42 @@ async function main(){
   }
 
   const buf = new Uint8Array(await out.arrayBuffer());
-  const Cgpu = new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength/4);
-  console.log(`  Downloaded result: ${N}x${M} (${(N*M*4/1024/1024).toFixed(2)} MB)`);
+  const resultData = new Uint32Array(buf.buffer, buf.byteOffset, buf.byteLength/4);
+  console.log(`  Downloaded result: ${resultData.length} integers (${(resultData.length*4/1024/1024).toFixed(2)} MB)`);
 
-  console.log('\nStep 7: Validating numerical accuracy...');
-  const absTol = parseFloat(args.absTol || '1e-5');
-  const relTol = parseFloat(args.relTol || '1e-3');
+  console.log('\nStep 7: Validating sort correctness...');
+  let isSorted = true;
+  let errors = 0;
+  const maxErrors = 10;
+
+  for (let i = 1; i < resultData.length; i++) {
+    const valid = ascending ? (resultData[i-1] <= resultData[i]) : (resultData[i-1] >= resultData[i]);
+    if (!valid) {
+      isSorted = false;
+      if (errors < maxErrors) {
+        console.log(`  Sort error at position ${i}: ${resultData[i-1]} ${ascending ? '>' : '<'} ${resultData[i]}`);
+        errors++;
+      }
+    }
+  }
+
+  if (!isSorted) {
+    console.log(`\n❌ SORT VALIDATION FAILED`);
+    console.log(`  Found ${errors} errors (showing first ${maxErrors})`);
+    process.exit(4);
+  }
+
+  console.log('\nStep 8: Validating numerical accuracy against reference...');
+  const absTol = parseFloat(args.absTol || '0');
+  const relTol = parseFloat(args.relTol || '0');
   let worst = { i:-1, a:0, b:0, abs:0, rel:0 };
   let ok = true;
   let maxAbs = 0, maxRel = 0;
   let numErrors = 0;
 
-  for (let i=0;i<Cgpu.length;i++){
-    const a = Cgpu[i], b = Cref[i];
+  const compareLength = Math.min(resultData.length, refResult.length);
+  for (let i=0; i<compareLength; i++){
+    const a = resultData[i], b = refResult[i];
     const abs = Math.abs(a-b);
     const rel = abs / Math.max(Math.abs(b), 1e-6);  // stabilized rel
     if (abs > maxAbs) maxAbs = abs;
@@ -245,30 +243,29 @@ async function main(){
   console.log(`  Tolerance: abs=${absTol}, rel=${relTol}`);
 
   if (!ok) {
-    const row = Math.floor(worst.i / M);
-    const col = worst.i % M;
-    console.log(`\n  Worst error at [${row},${col}]:`);
-    console.log(`    GPU result: ${worst.a}`);
-    console.log(`    CPU result: ${worst.b}`);
+    const row = Math.floor(worst.i / 1000); // Assuming some row width for display
+    const col = worst.i % 1000;
+    console.log(`\n  Worst error at position ${worst.i}:`);
+    console.log(`    Result: ${worst.a}`);
+    console.log(`    Reference: ${worst.b}`);
     console.log(`    Absolute error: ${worst.abs.toExponential(3)}`);
     console.log(`    Relative error: ${worst.rel.toExponential(3)}`);
-    console.log(`  Total errors: ${numErrors}/${Cgpu.length} elements`);
+    console.log(`  Total errors: ${numErrors}/${compareLength} elements`);
     console.log('\n❌ VALIDATION FAILED');
     process.exit(4);
   } else {
     console.log('\n✅ VALIDATION PASSED');
-    console.log(`All ${Cgpu.length} elements within tolerance!`);
+    console.log(`All ${compareLength} elements match reference!`);
 
-    // Performance estimate (rough)
-    const flops = 2.0 * N * M * K; // 2 ops per multiply-add
-    const gflops = flops / 1e9;
+    // Performance estimate
+    const elementsPerSecond = (resultData.length / (cpuTime / 1000)).toFixed(0);
     console.log(`\nPerformance estimate:`);
-    console.log(`  Total FLOPs: ${gflops.toFixed(2)} GFLOPs`);
-    console.log(`  CPU time: ${cpuTime}ms (${(gflops/(cpuTime/1000)).toFixed(2)} GFLOPS)`);
+    console.log(`  Elements sorted: ${resultData.length.toLocaleString()}`);
+    console.log(`  CPU time: ${cpuTime}ms`);
+    console.log(`  Rate: ${elementsPerSecond.toLocaleString()} elements/second`);
 
     // Clean up temp files
-    fs.unlinkSync(tmpA);
-    fs.unlinkSync(tmpB);
+    fs.unlinkSync(tmpInput);
 
     process.exit(0);
   }

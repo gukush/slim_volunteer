@@ -38,8 +38,8 @@ export function getArtifacts(config){
 
 	// Framework-specific binary paths
 	const frameworkBinaries = {
-		opencl: config.openclBinary || config.binary || 'scripts/native/ocl_block_matmul_chunked',
-		cuda: config.cudaBinary || 'scripts/native/cuda_block_matmul',
+		opencl: config.openclBinary || config.binary || 'binaries/ocl_block_matmul_chunked',
+		cuda: config.cudaBinary || 'binaries/cuda_block_matmul_chunked',
 		vulkan: config.vulkanBinary || 'scripts/native/vk_block_matmul'
 	};
 
@@ -203,21 +203,44 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               readWindowAsync(fdB, kb, kNow, jb*baseCols, cNow, M)
             ]);
 
-            // Binary mode: prepare raw binary data for stdin
-            const uniforms = new Int32Array([rNow, kNow, cNow]);
-            const uniformsBytes = new Uint8Array(uniforms.buffer);
-
-            // Payload prepared in strict order: UNIFORMS, then INPUTS, then OUTPUTS (placeholder)
-            // Send as raw binary data, not base64 encoded
-            const payload = {
-              action: 'exec',
-              framework: 'exe',
-              buffers: [
-                Array.from(uniformsBytes),  // Raw bytes for uniforms
-                Array.from(new Uint8Array(Ablock)),  // Raw bytes for A
-                Array.from(new Uint8Array(Bblock))   // Raw bytes for B
+            // Create protocol-compliant payload
+            const protocolPayload = createProtocolPayload({
+              framework: config.backend?.toUpperCase() || 'CUDA',
+              dataType: 'FLOAT32',
+              inputs: [
+                {
+                  data: Ablock,
+                  dataType: 'FLOAT32',
+                  dimensions: [rNow, kNow, 1, 1] // 2D matrix
+                },
+                {
+                  data: Bblock,
+                  dataType: 'FLOAT32',
+                  dimensions: [kNow, cNow, 1, 1] // 2D matrix
+                }
               ],
-              outputs: [ { byteLength: outputBytes } ]
+              outputs: [
+                {
+                  dataType: 'FLOAT32',
+                  dimensions: [rNow, cNow, 1, 1] // 2D matrix
+                }
+              ],
+              metadata: JSON.stringify({
+                rows: rNow,
+                K: kNow,
+                cols: cNow,
+                backend: config.backend || 'cuda',
+                program: binaryName
+              })
+            });
+
+            // Payload for binary execution
+            const payload = {
+              action: 'execute_binary_stream',
+              binary: binaryName,
+              args: ['--stdin'], // Use stdin/stdout mode
+              stdin: b64(protocolPayload), // Protocol-compliant data
+              stdoutSize: outputBytes
             };
 
             // Metadata for the native runtime
@@ -258,6 +281,52 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
       logger.info(`${id} chunker done - generated ${chunkCount} chunks`);
     }
   };
+}
+
+// Helper function to create protocol-compliant payload
+function createProtocolPayload({ framework, dataType, inputs, outputs, metadata = '' }) {
+  const buffer = Buffer.alloc(0);
+
+  // Protocol header
+  const header = Buffer.alloc(32); // ProtocolHeader size
+  header.writeUInt32LE(0x4558454D, 0); // magic "EXEM"
+  header.writeUInt32LE(1, 4); // version
+  header.writeUInt32LE(getFrameworkCode(framework), 8); // framework
+  header.writeUInt32LE(getDataTypeCode(dataType), 12); // dataType
+  header.writeUInt32LE(inputs.length, 16); // num_inputs
+  header.writeUInt32LE(outputs.length, 20); // num_outputs
+  header.writeUInt32LE(Buffer.byteLength(metadata, 'utf8'), 24); // metadata_size
+  header.writeUInt32LE(0, 28); // reserved
+
+  let result = Buffer.concat([Buffer.from(header), Buffer.from(metadata, 'utf8')]);
+
+  // Add input buffers
+  for (const input of inputs) {
+    const desc = Buffer.alloc(32); // BufferDescriptor size
+    desc.writeUInt32LE(input.data.byteLength, 0); // size
+    desc.writeUInt32LE(getDataTypeCode(input.dataType), 4); // dataType
+    desc.writeUInt32LE(input.dimensions[0] || 0, 8);
+    desc.writeUInt32LE(input.dimensions[1] || 0, 12);
+    desc.writeUInt32LE(input.dimensions[2] || 0, 16);
+    desc.writeUInt32LE(input.dimensions[3] || 0, 20);
+    desc.writeUInt32LE(0, 24); // reserved
+    desc.writeUInt32LE(0, 28); // reserved
+    desc.writeUInt32LE(0, 32); // reserved
+
+    result = Buffer.concat([result, desc, Buffer.from(input.data)]);
+  }
+
+  return result;
+}
+
+function getFrameworkCode(framework) {
+  const codes = { 'CPU': 0, 'CUDA': 1, 'OPENCL': 2, 'VULKAN': 3, 'WEBGPU': 4 };
+  return codes[framework] || 0;
+}
+
+function getDataTypeCode(dataType) {
+  const codes = { 'FLOAT32': 0, 'FLOAT16': 1, 'INT32': 2, 'INT16': 3, 'INT8': 4, 'UINT32': 5, 'UINT16': 6, 'UINT8': 7 };
+  return codes[dataType] || 0;
 }
 
 // Assembler: accumulate partial tiles per (ib,jb) and stream to C.bin
