@@ -37,8 +37,8 @@ if (!['cuda', 'opencl'].includes(backend)) {
 
 // Default binary paths if not specified
 const defaultBinaries = {
-  cuda: '/binaries/exe_distributed_sort',
-  opencl: '/binaries/exe_distributed_sort_opencl'
+  cuda: '/app/binaries/exe_distributed_sort',
+  opencl: '/app/binaries/exe_distributed_sort_opencl'
 };
 
 const binaryPath = binary || defaultBinaries[backend];
