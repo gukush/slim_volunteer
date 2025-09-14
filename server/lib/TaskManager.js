@@ -89,54 +89,63 @@ export class TaskManager{
     }
   }
 
-  createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[], cachedFilePaths=[]}){
-    const strategy = getStrategy(strategyId);
-    const id = uuidv4();
-    const taskDir = path.join(this.storageDir, 'tasks', id);
-    ensureDir(taskDir);
-    const descriptor = { id, label, strategyId, status: 'created', createdAt: now(), K, config, inputArgs, inputFiles: [], cachedFilePaths };
-    /*
-    for(const f of inputFiles){
-      const dest = path.join(taskDir, f.originalName);
+
+createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[], cachedFilePaths=[]}){
+  const strategy = getStrategy(strategyId);
+  const id = uuidv4();
+  const taskDir = path.join(this.storageDir, 'tasks', id);
+  ensureDir(taskDir);
+  const descriptor = { id, label, strategyId, status: 'created', createdAt: now(), K, config, inputArgs, inputFiles: [], cachedFilePaths };
+
+  for (const f of inputFiles){
+    const dest = path.join(taskDir, f.originalName || path.basename(f.path));
+
+    // Check if this is a cached file (already in storage/uploads)
+    const uploadsDir = path.join(this.storageDir, 'uploads');
+    const isCachedFile = f.path && f.path.startsWith(uploadsDir);
+
+    if (isCachedFile) {
+      // For cached files, just reference them directly - NO COPYING
+      console.log(`[DEBUG] Using cached file directly: ${f.path} (${f.size} bytes)`);
+      descriptor.inputFiles.push({
+        path: f.path,  // Use original path directly
+        originalName: path.basename(f.path),
+        size: f.size
+      });
+    } else if (f.path) {
+      // For uploaded files, copy them (but use async for large files)
+      console.log(`[DEBUG] Copying uploaded file: ${f.path} -> ${dest}`);
+      fs.copyFileSync(f.path, dest);
+      const size = f.size ?? fs.statSync(dest).size;
+      descriptor.inputFiles.push({ path: dest, originalName: path.basename(dest), size });
+    } else if (f.buffer) {
+      // For small buffer files
       fs.writeFileSync(dest, f.buffer);
-      descriptor.inputFiles.push({ path: dest, originalName: f.originalName, size: f.buffer.length });
+      descriptor.inputFiles.push({ path: dest, originalName: path.basename(dest), size: f.buffer.length });
+    } else {
+      throw new Error('input file missing buffer/path');
     }
-    */
-    for (const f of inputFiles){
-      const dest = path.join(taskDir, f.originalName || path.basename(f.path));
-      if (f.path) {
-        fs.copyFileSync(f.path, dest);              // streamless copy on same disk; or use streams if cross-device
-        const size = f.size ?? fs.statSync(dest).size;
-        descriptor.inputFiles.push({ path: dest, originalName: path.basename(dest), size });
-      } else if (f.buffer) {
-        fs.writeFileSync(dest, f.buffer);           // fallback for small files only
-        descriptor.inputFiles.push({ path: dest, originalName: path.basename(dest), size: f.buffer.length });
-      } else {
-        throw new Error('input file missing buffer/path');
-      }
-      // NOTE: your original snippet appended a second time here; left as-is if intentional.
-      //const size = f.size ?? fs.statSync(dest).size;
-      //descriptor.inputFiles.push({ path: dest, originalName: f.originalName, size });
-    }
-    writeJSON(path.join(taskDir, `task_descriptor_${id}.json`), descriptor);
-
-    const chunker = strategy.buildChunker({ taskId: id, taskDir, K, config, inputArgs, inputFiles: descriptor.inputFiles });
-    const assembler = strategy.buildAssembler({ taskId: id, taskDir, K, config, inputArgs });
-    const timers = new TaskTimers(id, path.join(this.storageDir, 'timing'));
-
-    const task = {
-      id, descriptor, strategy, chunker, assembler, timers,
-      status: 'created', startTime: null, endTime: null, K,
-      queue: [], assignments: new Map(),
-      totalChunks: null, completedChunks: 0,
-      cancelRequested: false, chunkerFinished: false,
-      framework: null,
-      osTracker: null,
-    };
-    this.tasks.set(id, task);
-    logger.info('Task created', id, strategyId, 'K=', K);
-    return descriptor;
   }
+
+  writeJSON(path.join(taskDir, `task_descriptor_${id}.json`), descriptor);
+
+  const chunker = strategy.buildChunker({ taskId: id, taskDir, K, config, inputArgs, inputFiles: descriptor.inputFiles });
+  const assembler = strategy.buildAssembler({ taskId: id, taskDir, K, config, inputArgs });
+  const timers = new TaskTimers(id, path.join(this.storageDir, 'timing'));
+
+  const task = {
+    id, descriptor, strategy, chunker, assembler, timers,
+    status: 'created', startTime: null, endTime: null, K,
+    queue: [], assignments: new Map(),
+    totalChunks: null, completedChunks: 0,
+    cancelRequested: false, chunkerFinished: false,
+    framework: null,
+    osTracker: null,
+  };
+  this.tasks.set(id, task);
+  logger.info('Task created', id, strategyId, 'K=', K);
+  return descriptor;
+}
 
   getTask(id){ return this.tasks.get(id); }
 
