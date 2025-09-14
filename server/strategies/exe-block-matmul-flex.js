@@ -38,9 +38,9 @@ export function getArtifacts(config){
 
 	// Framework-specific binary paths
 	const frameworkBinaries = {
-		opencl: config.openclBinary || config.binary || 'binaries/ocl_block_matmul_chunked',
-		cuda: config.cudaBinary || 'binaries/exe_block_matmul',
-		vulkan: config.vulkanBinary || 'scripts/native/vk_block_matmul'
+		opencl: config.openclBinary || config.binary || '/app/binaries/ocl_block_matmul_chunked',
+		cuda: config.cudaBinary || '/app/binaries/exe_block_matmul',
+		vulkan: config.vulkanBinary || '/app/scripts/native/vk_block_matmul'
 	};
 
 	const binaryPath = frameworkBinaries[backend];
@@ -50,7 +50,7 @@ export function getArtifacts(config){
 	}
 
 	try {
-		const abs = path.isAbsolute(binaryPath) ? binaryPath : path.join(process.cwd(), 'server', binaryPath);
+		const abs = path.isAbsolute(binaryPath) ? binaryPath : binaryPath;
 		const bytes = fs.readFileSync(abs).toString('base64');
 		const artifactName = config.program || path.basename(binaryPath);
 

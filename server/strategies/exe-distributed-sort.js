@@ -39,8 +39,8 @@ export function getArtifacts(config) {
 
   // Framework-specific binary paths
   const frameworkBinaries = {
-    cuda: config.cudaBinary || config.binary || 'binaries/exe_distributed_sort',
-    opencl: config.openclBinary || config.binary || 'binaries/exe_distributed_sort_opencl'
+    cuda: config.cudaBinary || config.binary || '/app/binaries/exe_distributed_sort',
+    opencl: config.openclBinary || config.binary || '/app/binaries/exe_distributed_sort_opencl'
   };
 
   const binaryPath = frameworkBinaries[backend];
@@ -50,7 +50,7 @@ export function getArtifacts(config) {
   }
 
   try {
-    const abs = path.isAbsolute(binaryPath) ? binaryPath : path.join(process.cwd(), 'server', binaryPath);
+    const abs = path.isAbsolute(binaryPath) ? binaryPath : binaryPath;
     const bytes = fs.readFileSync(abs).toString('base64');
     const artifactName = config.program || path.basename(binaryPath);
 
@@ -148,7 +148,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
   const listed = Array.isArray(inputFiles) ? inputFiles : [];
   const byName = listed.find(f => f && f.originalName && /\.bin$/i.test(f.originalName) && !/_[AB]\.bin$/i.test(f.originalName));
   let inputFile = (byName && byName.path) || (listed[0] && listed[0].path) || null;
-  
+
   if (!inputFile) {
     inputFile = findNewestBin({ preferredName: 'large_sort_input.bin', taskDir, uploadsDir }) ||
                findNewestBin({ preferredName: 'input.bin', taskDir, uploadsDir });
@@ -165,21 +165,21 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
   if (fileStats.size % 4 !== 0) {
     throw new Error(`Input file size (${fileStats.size} bytes) is not a multiple of 4.`);
   }
-  
+
   let totalIntegers = Math.floor(fileStats.size / 4);
-  
+
   if (maxElements && maxElements > 0 && maxElements < totalIntegers) {
     totalIntegers = maxElements;
     logger.info(`Limiting processing to ${maxElements} elements (file contains ${Math.floor(fileStats.size / 4)} elements)`);
   }
-  
+
   const chunksCount = Math.ceil(totalIntegers / chunkSize);
-  
+
   // Get the binary name for program reference
   const backend = (config?.backend || 'cuda').toLowerCase();
   const defaultBins = {
-    cuda: 'binaries/exe_distributed_sort',
-    opencl: 'binaries/exe_distributed_sort_opencl'
+    cuda: '/app/binaries/exe_distributed_sort',
+    opencl: '/app/binaries/exe_distributed_sort_opencl'
   };
   const rel = config.binary || defaultBins[backend];
   const binaryName = config.program || path.basename(rel);

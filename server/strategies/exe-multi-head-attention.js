@@ -30,9 +30,9 @@ function getArtifacts(config = {}) {
   }
 
   // Default location similar to exe-block-matmul-flex
-  const defaultBinary = 'binaries/native_cuda_multi_head_attention';
+  const defaultBinary = '/app/binaries/exe_cuda_multi_head_attention';
   const rel = config.binary || defaultBinary;
-  const abs = path.isAbsolute(rel) ? rel : path.join(process.cwd(), rel);
+  const abs = path.isAbsolute(rel) ? rel : rel;
 
   const bytes = fs.readFileSync(abs).toString('base64');
   const artifactName = config.program || path.basename(rel);
