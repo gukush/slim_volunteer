@@ -43,10 +43,10 @@ struct Header32 {
     uint32_t base_curve, flags, pp_start, pp_len;
 };
 
-__device__ __forceinline__ uint32_t constOffset(){ return 12u; }
-__device__ __forceinline__ uint32_t ppOffset(){ return constOffset() + (8u*3u + 4u); }
-__device__ __forceinline__ uint32_t outOffset(const Header32& h){ return ppOffset() + h.pp_count; }
-__device__ __forceinline__ uint32_t stateOffset(const Header32& h){
+__host__ __device__ __forceinline__ uint32_t constOffset(){ return 12u; }
+__host__ __device__ __forceinline__ uint32_t ppOffset(){ return constOffset() + (8u*3u + 4u); }
+__host__ __device__ __forceinline__ uint32_t outOffset(const Header32& h){ return ppOffset() + h.pp_count; }
+__host__ __device__ __forceinline__ uint32_t stateOffset(const Header32& h){
     return outOffset(h) + h.n_curves * OUT_WORDS_PER;
 }
 
@@ -627,6 +627,6 @@ int main(){
     // Only send until end of output section (no need to stream state back)
     const uint64_t resultWords = outOffset(h) + (uint64_t)h.n_curves * OUT_WORDS_PER;
     const uint64_t resultBytes = resultWords * 4ull;
-    write_exact(buf.data(), resultBytes);
+re     write_exact(buf.data(), resultBytes);
     return 0;
 }
