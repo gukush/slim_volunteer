@@ -81,48 +81,22 @@ export function buildChunker(args) {
         const { payload, meta } = ch;
         const { seq_len, d_k, d_v } = payload.dims || meta || {};
 
-        // Create protocol-compliant payload
-        const protocolPayload = createProtocolPayload({
-          framework: 'CUDA',
-          dataType: 'FLOAT32',
-          inputs: [
-            {
-              data: payload.q,
-              dataType: 'FLOAT32',
-              dimensions: [seq_len, d_k, 1, 1] // Q matrix
-            },
-            {
-              data: payload.k,
-              dataType: 'FLOAT32',
-              dimensions: [seq_len, d_k, 1, 1] // K matrix
-            },
-            {
-              data: payload.v,
-              dataType: 'FLOAT32',
-              dimensions: [seq_len, d_v, 1, 1] // V matrix
-            }
-          ],
-          outputs: [
-            {
-              dataType: 'FLOAT32',
-              dimensions: [seq_len, d_v, 1, 1] // Output matrix
-            }
-          ],
-          metadata: JSON.stringify({
-            seq_len,
-            d_k,
-            d_v,
-            backend: 'cuda',
-            program: 'native_cuda_multi_head_attention'
-          })
-        });
+        // uniforms -> Int32Array -> Uint8Array -> JSON array
+        const u8U = new Uint8Array(new Int32Array([seq_len, d_k, d_v]).buffer);
+        const u8Q = new Uint8Array(payload.q);
+        const u8K = new Uint8Array(payload.k);
+        const u8V = new Uint8Array(payload.v);
 
         const exePayload = {
-          action: 'execute_binary_stream',
-          binary: 'native_cuda_multi_head_attention',
-          args: ['--stdin'], // Use stdin/stdout mode
-          stdin: b64(protocolPayload), // Protocol-compliant data
-          stdoutSize: seq_len * d_v * 4 // Expected output size in bytes
+          action: 'exec',
+          framework: 'exe',
+          buffers: [
+            Array.from(u8U),
+            Array.from(u8Q),
+            Array.from(u8K),
+            Array.from(u8V),
+          ],
+          outputs: [ { byteLength: seq_len * d_v * 4 } ]
         };
 
         yield {
@@ -136,55 +110,6 @@ export function buildChunker(args) {
   };
 }
 
-// Helper function to create protocol-compliant payload
-function createProtocolPayload({ framework, dataType, inputs, outputs, metadata = '' }) {
-  const buffer = Buffer.alloc(0);
-
-  // Protocol header
-  const header = Buffer.alloc(32); // ProtocolHeader size
-  header.writeUInt32LE(0x4558454D, 0); // magic "EXEM"
-  header.writeUInt32LE(1, 4); // version
-  header.writeUInt32LE(getFrameworkCode(framework), 8); // framework
-  header.writeUInt32LE(getDataTypeCode(dataType), 12); // dataType
-  header.writeUInt32LE(inputs.length, 16); // num_inputs
-  header.writeUInt32LE(outputs.length, 20); // num_outputs
-  header.writeUInt32LE(Buffer.byteLength(metadata, 'utf8'), 24); // metadata_size
-  header.writeUInt32LE(0, 28); // reserved
-
-  let result = Buffer.concat([Buffer.from(header), Buffer.from(metadata, 'utf8')]);
-
-  // Add input buffers
-  for (const input of inputs) {
-    const desc = Buffer.alloc(32); // BufferDescriptor size
-    desc.writeUInt32LE(input.data.byteLength, 0); // size
-    desc.writeUInt32LE(getDataTypeCode(input.dataType), 4); // dataType
-    desc.writeUInt32LE(input.dimensions[0] || 0, 8);
-    desc.writeUInt32LE(input.dimensions[1] || 0, 12);
-    desc.writeUInt32LE(input.dimensions[2] || 0, 16);
-    desc.writeUInt32LE(input.dimensions[3] || 0, 20);
-    desc.writeUInt32LE(0, 24); // reserved
-    desc.writeUInt32LE(0, 28); // reserved
-    desc.writeUInt32LE(0, 32); // reserved
-
-    result = Buffer.concat([result, desc, Buffer.from(input.data)]);
-  }
-
-  return result;
-}
-
-function getFrameworkCode(framework) {
-  const codes = { 'CPU': 0, 'CUDA': 1, 'OPENCL': 2, 'VULKAN': 3, 'WEBGPU': 4 };
-  return codes[framework] || 0;
-}
-
-function getDataTypeCode(dataType) {
-  const codes = { 'FLOAT32': 0, 'FLOAT16': 1, 'INT32': 2, 'INT16': 3, 'INT8': 4, 'UINT32': 5, 'UINT16': 6, 'UINT8': 7 };
-  return codes[dataType] || 0;
-}
-
-function b64(buffer) {
-  return Buffer.from(buffer).toString('base64');
-}
 
 // Reuse base assembler; coerce result like native-block-matmul.
 export function buildAssembler(args) {

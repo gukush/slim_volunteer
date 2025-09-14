@@ -4,7 +4,7 @@
 //
 // Usage examples:
 //   node scripts/test-exe-ecm-stage1.mjs
-//   node scripts/test-exe-ecm-stage1.mjs --server http://localhost:3000 --binary ./bin/ecm_stage1_cuda
+//   node scripts/test-exe-ecm-stage1.mjs --server https://localhost:3000 --binary ./bin/ecm_stage1_cuda
 //   node scripts/test-exe-ecm-stage1.mjs --N 0x00d6... --curves 2000 --B1 50000 --threads 1 --seed 42
 //
 // Notes:
@@ -24,10 +24,10 @@ const argv = Object.fromEntries(
   })
 );
 
-const baseURL = argv.server || process.env.SERVER_URL || 'http://localhost:3000';
+const baseURL = argv.server || process.env.SERVER_URL || 'https://localhost:3000';
 const backend = (argv.backend || 'cuda').toLowerCase();
 const program = argv.program || 'ecm_stage1_cuda';
-const binaryPath = argv.binary || null;
+const binaryPath = argv.binary || 'binaries/exec_cuda_ecm_stage1';
 
 // Target number N (hex string or decimal). Provide your own or use a small demo semiprime.
 let N = argv.N;

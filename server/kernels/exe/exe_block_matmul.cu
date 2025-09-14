@@ -15,20 +15,15 @@ static void die(const char* msg){
     std::exit(1);
 }
 
-static void read_all_stdin(std::vector<uint8_t>& buffer) {
-    const size_t CHUNK_SIZE = 1 << 20; // 1MB chunks
-    uint8_t chunk[CHUNK_SIZE];
-    size_t bytes_read;
-
-    while ((bytes_read = std::fread(chunk, 1, CHUNK_SIZE, stdin)) > 0) {
-        buffer.insert(buffer.end(), chunk, chunk + bytes_read);
-    }
-
-    if (std::ferror(stdin)) {
-        die("Error reading from stdin");
+static void read_exact(void* dst, size_t n){
+    uint8_t* p = static_cast<uint8_t*>(dst);
+    size_t got = 0;
+    while(got < n){
+        size_t r = std::fread(p + got, 1, n - got, stdin);
+        if(r == 0) die("EOF while reading stdin");
+        got += r;
     }
 }
-
 static void write_exact(const void* src, size_t n){
     const uint8_t* p = static_cast<const uint8_t*>(src);
     size_t put = 0;

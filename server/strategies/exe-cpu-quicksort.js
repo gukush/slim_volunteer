@@ -31,7 +31,7 @@ export function getClientExecutorInfo(config = {}) {
   const framework = 'binary'; // Native binary execution
 
   // Prepare the CPU quicksort binary
-  const binaryPath = 'executors/binary/cpu-quicksort';
+  const binaryPath = 'binaries/cpu-quicksort';
   let binaryBytes;
 
   try {

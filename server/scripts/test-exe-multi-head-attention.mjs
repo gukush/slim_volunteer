@@ -20,12 +20,12 @@ function args() {
 }
 
 const a = args();
-const host      = a.host || 'http://localhost:3000';
+const host      = a.host || 'https://localhost:3000';
 const seq_len   = Number(a.seq_len || 512);
 const d_model   = Number(a.d_model || 768);
 const num_heads = Number(a.num_heads || 12);
 const backend   = (a.backend || 'cuda').toLowerCase();
-const binary    = a.binary || 'binaries/native_cuda_multi_head_attentio' + 'n'; // avoid auto lint split
+const binary    = a.binary || 'binaries/exe_cuda_multi_head_attention'; // avoid auto lint split
 const program   = a.program || 'native_cuda_multi_head_attention';
 const Krep      = Number(a.K || 2);
 

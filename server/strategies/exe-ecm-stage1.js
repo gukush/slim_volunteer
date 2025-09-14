@@ -73,39 +73,23 @@ export function buildChunker(args) {
         throw new Error(`[${id}] Expected web ECM chunk to have payload.data as ArrayBuffer`);
       }
 
-      // Create protocol-compliant payload
-      const protocolPayload = createProtocolPayload({
-        framework: 'CUDA',
-        dataType: 'UINT32',
-        inputs: [
-          {
-            data: ioBuffer,
-            dataType: 'UINT32',
-            dimensions: [ioBuffer.byteLength / 4, 1, 1, 1] // 1D array of uint32s
-          }
-        ],
-        outputs: [
-          {
-            dataType: 'UINT32',
-            dimensions: [ioBuffer.byteLength / 4, 1, 1, 1] // Same size output
-          }
-        ],
-        metadata: JSON.stringify({
-          program: (args?.config?.program) || defaultPrograms[(args?.config?.backend || 'cuda').toLowerCase()] || 'ecm_stage1_cuda',
-          backend: (args?.config?.backend || 'cuda').toLowerCase(),
-          framework: 'exe',
-          ...chunk.meta
-        })
-      });
+      // For exe: write entire IO buffer to stdin, expect same-sized stdout.
+      const outSize = ioBuffer.byteLength;
 
       yield {
         id: chunk.id,
         payload: {
-          action: 'execute_binary_stream',
-          binary: (args?.config?.program) || defaultPrograms[(args?.config?.backend || 'cuda').toLowerCase()] || 'ecm_stage1_cuda',
-          args: ['--stdin'], // Use stdin/stdout mode
-          stdin: b64(protocolPayload), // Protocol-compliant data
-          stdoutSize: ioBuffer.byteLength // Expected output size in bytes
+          action: 'exec',
+          // TaskManager will base64-encode ArrayBuffers for native clients automatically.
+          buffers: [ioBuffer],          // stdin
+          outputs: [outSize],           // expected stdout size
+          meta: {
+            program: (args?.config?.program) || defaultPrograms[(args?.config?.backend || 'cuda').toLowerCase()] || 'ecm_stage1_cuda',
+            backend: (args?.config?.backend || 'cuda').toLowerCase(),
+            framework: 'exe',
+            // Carry through any useful metadata for logging/diagnostics
+            ...chunk.meta,
+          },
         },
         meta: chunk.meta,              // keep the original meta (useful in assembler)
       };
@@ -115,55 +99,6 @@ export function buildChunker(args) {
   return generator();
 }
 
-// Helper function to create protocol-compliant payload
-function createProtocolPayload({ framework, dataType, inputs, outputs, metadata = '' }) {
-  const buffer = Buffer.alloc(0);
-
-  // Protocol header
-  const header = Buffer.alloc(32); // ProtocolHeader size
-  header.writeUInt32LE(0x4558454D, 0); // magic "EXEM"
-  header.writeUInt32LE(1, 4); // version
-  header.writeUInt32LE(getFrameworkCode(framework), 8); // framework
-  header.writeUInt32LE(getDataTypeCode(dataType), 12); // dataType
-  header.writeUInt32LE(inputs.length, 16); // num_inputs
-  header.writeUInt32LE(outputs.length, 20); // num_outputs
-  header.writeUInt32LE(Buffer.byteLength(metadata, 'utf8'), 24); // metadata_size
-  header.writeUInt32LE(0, 28); // reserved
-
-  let result = Buffer.concat([Buffer.from(header), Buffer.from(metadata, 'utf8')]);
-
-  // Add input buffers
-  for (const input of inputs) {
-    const desc = Buffer.alloc(32); // BufferDescriptor size
-    desc.writeUInt32LE(input.data.byteLength, 0); // size
-    desc.writeUInt32LE(getDataTypeCode(input.dataType), 4); // dataType
-    desc.writeUInt32LE(input.dimensions[0] || 0, 8);
-    desc.writeUInt32LE(input.dimensions[1] || 0, 12);
-    desc.writeUInt32LE(input.dimensions[2] || 0, 16);
-    desc.writeUInt32LE(input.dimensions[3] || 0, 20);
-    desc.writeUInt32LE(0, 24); // reserved
-    desc.writeUInt32LE(0, 28); // reserved
-    desc.writeUInt32LE(0, 32); // reserved
-
-    result = Buffer.concat([result, desc, Buffer.from(input.data)]);
-  }
-
-  return result;
-}
-
-function getFrameworkCode(framework) {
-  const codes = { 'CPU': 0, 'CUDA': 1, 'OPENCL': 2, 'VULKAN': 3, 'WEBGPU': 4 };
-  return codes[framework] || 0;
-}
-
-function getDataTypeCode(dataType) {
-  const codes = { 'FLOAT32': 0, 'FLOAT16': 1, 'INT32': 2, 'INT16': 3, 'INT8': 4, 'UINT32': 5, 'UINT16': 6, 'UINT8': 7 };
-  return codes[dataType] || 0;
-}
-
-function b64(buffer) {
-  return Buffer.from(buffer).toString('base64');
-}
 
 // Reuse the exact same assembler the web strategy uses;
 // it already knows how to parse the returned IO buffer and produce summary + artifacts.
