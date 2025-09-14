@@ -465,6 +465,8 @@ export function createExecutor({ kernels, config }){
       timings: {
         tClientRecv,
         tClientDone,
+        cpuTimeMs: (tClientDone - tClientRecv) - totalGpuTime, // CPU time is total minus GPU time
+        gpuTimeMs: totalGpuTime,
         totalGpuTimeMs: totalGpuTime,
         avgGpuTimeMs: passCount > 0 ? totalGpuTime / passCount : 0,
         passCount

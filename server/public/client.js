@@ -93,28 +93,12 @@ function notifyListenerChunkComplete(chunkId, status) {
   }, 0);
 }
 
-function notifyListenerMetrics(messageType, data) {
-  if (!enableListener || !listenerWs || listenerWs.readyState !== WebSocket.OPEN) return;
-
-  // Make this asynchronous and non-blocking
-  setTimeout(() => {
-    try {
-      const message = {
-        type: messageType,
-        data: data || {}
-      };
-      listenerWs.send(JSON.stringify(message));
-      log('debug', 'Notified listener of metrics message:', messageType);
-    } catch (error) {
-      log('error', 'Failed to notify listener of metrics message:', error);
-    }
-  }, 0);
-}
+// notifyListenerMetrics function removed - metrics are now sent directly from server to listener
 
 socket.on('connect', async ()=>{
   statusEl.textContent = 'connected';
   log('info', 'Connected', socket.id);
-  const frameworks = ['cuda','vulkan','opencl','cpp-wasm','webgpu'];
+  const frameworks = ['cpp-wasm','webgl2'];
   let gpuInfo = null;
 
   if('gpu' in navigator) {
@@ -256,13 +240,5 @@ socket.on('chunk:assign', async (job)=>{
   }
 });
 
-// Listen for metrics messages from server and forward to listener
-socket.on('metrics:prepare', (data) => {
-  log('info', 'Received metrics:prepare from server');
-  notifyListenerMetrics('metrics:prepare', data);
-});
-
-socket.on('metrics:stop', (data) => {
-  log('info', 'Received metrics:stop from server');
-  notifyListenerMetrics('metrics:stop', data);
-});
+// Note: Metrics events are now sent directly from server to listener via WebSocket
+// No need to forward them through the browser client anymore

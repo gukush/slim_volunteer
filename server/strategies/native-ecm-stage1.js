@@ -184,10 +184,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
 
   // Pre-pass: strip tiny primes (especially factor 2)
   const { reducedN: Nred, smallFactors } = trialDivideSmallPrimes(N0);
-  console.log(`[native-ecm-stage1] Trial division: N reduced from 0x${N0.toString(16)} to 0x${Nred.toString(16)}`);
-  if (smallFactors.size > 0) {
-    console.log(`[native-ecm-stage1] Small factors found:`, Array.from(smallFactors.entries()));
-  }
   if (Nred === 1n) {
     console.log('[native-ecm-stage1] All factors were tiny; skipping GPU stage.');
     return { async *stream() {} };
@@ -244,9 +240,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs, inputFiles
 
         // Convert ArrayBuffer to base64 for native client (Lua script expects base64)
         const dataBase64 = Buffer.from(buffer.buffer).toString('base64');
-
-        console.log(`[native-ecm-stage1] DEBUG: Generated buffer - words: ${totalWords}, bytes: ${totalWords * 4}, base64 length: ${dataBase64.length}`);
-        console.log(`[native-ecm-stage1] DEBUG: Chunk ${chunkIndex} - curves: ${curvesInChunk}, pp_count: ${pp_count}`);
 
         // Create payload in format expected by Lua script
         const payload = {

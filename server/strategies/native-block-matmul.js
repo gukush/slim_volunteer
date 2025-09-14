@@ -54,7 +54,7 @@ export function getClientExecutorInfo(config){
   const framework = String(config?.framework || 'native-opencl').toLowerCase();
 
   // Always try to include host.lua so native client can route + compile at runtime.
-  const hostCandidates = resolveCandidates('lua/host_block_matmul.lua');
+  const hostCandidates = resolveCandidates('executors/host_block_matmul.lua');
   const host = findFirstExisting(hostCandidates);
 
   // Optional kernels (these are just hints; Lua host can also generate or use its own)

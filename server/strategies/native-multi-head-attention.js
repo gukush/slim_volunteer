@@ -57,7 +57,7 @@ export function getClientExecutorInfo(config = {}) {
   });
 
   // CUDA kernel
-  const cuPath = 'kernels/multi_head_attention.cu';
+  const cuPath = 'kernels/cuda/multi_head_attention.cu';
   const cuBytes = readProjectFile(cuPath);
   artifacts.push({
     type: 'text',
