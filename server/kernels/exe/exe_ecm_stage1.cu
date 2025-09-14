@@ -8,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include "common_protocol_cuda.h"
 
 static void die(const char* msg){ std::fprintf(stderr, "%s\n", msg); std::exit(1); }
 static void read_all_stdin(std::vector<uint8_t>& out){
@@ -540,70 +539,10 @@ __global__ void ecm_stage1_v3(uint32_t* io){
 
 // -------------------- Host: resumable loop, full-buffer IO --------------------
 int main(){
-    EXE_LOG_INFO("Starting CUDA ECM Stage 1");
-
-    // Read all data from stdin
-    std::vector<uint8_t> input_buffer;
-    read_all_stdin(input_buffer);
-
-    if (input_buffer.empty()) {
-        EXE_LOG_ERROR("No data received from stdin");
-        return 1;
-    }
-
-    EXE_LOG_INFO("Received " << input_buffer.size() << " bytes from stdin");
-
-    // Parse protocol header
-    ProtocolHeader header;
-    const uint8_t* data = input_buffer.data();
-    size_t remaining = input_buffer.size();
-
-    EXE_VALIDATE(ExeProtocol::readHeader(data, remaining, header),
-                 "Failed to read protocol header");
-
-    EXE_LOG_INFO("Protocol version: " << header.version);
-    EXE_LOG_INFO("Framework: " << ExeProtocol::getFrameworkName(static_cast<FrameworkType>(header.framework)));
-    EXE_LOG_INFO("Data type: " << ExeProtocol::getDataTypeName(static_cast<DataType>(header.data_type)));
-    EXE_LOG_INFO("Inputs: " << header.num_inputs << ", Outputs: " << header.num_outputs);
-
-    // Skip metadata if present
-    if (header.metadata_size > 0) {
-        EXE_VALIDATE(remaining >= header.metadata_size, "Insufficient data for metadata");
-        data += header.metadata_size;
-        remaining -= header.metadata_size;
-    }
-
-    // Parse input buffers
-    EXE_VALIDATE(header.num_inputs >= 1, "Expected at least 1 input buffer");
-
-    std::vector<std::vector<uint8_t>> input_buffers;
-    std::vector<BufferDescriptor> input_descriptors;
-
-    for (uint32_t i = 0; i < header.num_inputs; ++i) {
-        BufferDescriptor desc;
-        std::vector<uint8_t> buffer;
-
-        EXE_VALIDATE(ExeProtocol::readBuffer(data, remaining, desc, buffer),
-                     "Failed to read input buffer " << i);
-
-        input_descriptors.push_back(desc);
-        input_buffers.push_back(std::move(buffer));
-
-        EXE_LOG_DEBUG("Input " << i << ": " << desc.size << " bytes, dims=["
-                     << desc.dimensions[0] << "," << desc.dimensions[1]
-                     << "," << desc.dimensions[2] << "," << desc.dimensions[3] << "]");
-    }
-
-    // Extract IO buffer from first input
-    EXE_VALIDATE(input_descriptors[0].data_type == static_cast<uint32_t>(DataType::UINT32),
-                 "Input data must be uint32");
-
-    std::vector<uint8_t> buf = std::move(input_buffers[0]);
-
-    if(buf.size() < HEADER_WORDS_V3*4) {
-        EXE_LOG_ERROR("Buffer too small for header");
-        return 1;
-    }
+    // Read entire IO buffer (header + consts + pp + outputs + state)
+    std::vector<uint8_t> buf;
+    read_all_stdin(buf);
+    if(buf.size() < HEADER_WORDS_V3*4) die("buffer too small for header");
 
     // Compute geometry from header
     const uint32_t* u32 = reinterpret_cast<const uint32_t*>(buf.data());
@@ -616,8 +555,6 @@ int main(){
         ((uint32_t*)buf.data())[11] = 0u; // pp_len
         std::memcpy(&h, buf.data(), sizeof(Header32));
     }
-
-    EXE_LOG_INFO("ECM parameters: n_curves=" << h.n_curves << ", pp_count=" << h.pp_count);
 
     const uint32_t outputOffset = outOffset(h);
     const uint32_t stateOff     = stateOffset(h);
@@ -678,10 +615,6 @@ int main(){
     // Only send until end of output section (no need to stream state back)
     const uint64_t resultWords = outOffset(h) + (uint64_t)h.n_curves * OUT_WORDS_PER;
     const uint64_t resultBytes = resultWords * 4ull;
-
-    EXE_LOG_INFO("ECM Stage 1 completed successfully");
-    EXE_LOG_INFO("Writing " << resultBytes << " bytes to stdout");
-
     write_exact(buf.data(), resultBytes);
     return 0;
 }

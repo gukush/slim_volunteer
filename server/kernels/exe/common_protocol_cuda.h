@@ -61,43 +61,43 @@ public:
         if (remaining < sizeof(ProtocolHeader)) {
             return false;
         }
-        
+
         memcpy(&header, data, sizeof(ProtocolHeader));
         data += sizeof(ProtocolHeader);
         remaining -= sizeof(ProtocolHeader);
-        
+
         if (header.magic != EXE_PROTOCOL_MAGIC) {
             return false;
         }
-        
+
         if (header.version != EXE_PROTOCOL_VERSION) {
             return false;
         }
-        
+
         return true;
     }
-    
+
     static bool readBuffer(const uint8_t*& data, size_t& remaining, BufferDescriptor& desc, std::vector<uint8_t>& buffer) {
         if (remaining < sizeof(BufferDescriptor)) {
             return false;
         }
-        
+
         memcpy(&desc, data, sizeof(BufferDescriptor));
         data += sizeof(BufferDescriptor);
         remaining -= sizeof(BufferDescriptor);
-        
+
         if (remaining < desc.size) {
             return false;
         }
-        
+
         buffer.resize(desc.size);
         memcpy(buffer.data(), data, desc.size);
         data += desc.size;
         remaining -= desc.size;
-        
+
         return true;
     }
-    
+
     static const char* getFrameworkName(FrameworkType framework) {
         switch (framework) {
             case FrameworkType::CPU: return "CPU";
@@ -108,7 +108,7 @@ public:
             default: return "Unknown";
         }
     }
-    
+
     static const char* getDataTypeName(DataType dataType) {
         switch (dataType) {
             case DataType::FLOAT32: return "Float32";
