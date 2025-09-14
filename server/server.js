@@ -34,7 +34,7 @@ app.get('/uploads', (req, res) => {
     if (!fs.existsSync(uploadsDir)) {
       return res.json({ files: [] });
     }
-    
+
     const files = fs.readdirSync(uploadsDir).map(filename => {
       const fullPath = path.join(uploadsDir, filename);
       const stats = fs.statSync(fullPath);
@@ -45,7 +45,7 @@ app.get('/uploads', (req, res) => {
         modified: stats.mtime
       };
     }).sort((a, b) => b.modified - a.modified); // Sort by most recent first
-    
+
     res.json({ files });
   } catch (e) {
     logger.error('Error listing uploads:', e);
@@ -139,7 +139,7 @@ wss.on('connection', (ws, req) => {
   // Determine connection type based on User-Agent header
   const userAgent = req.headers['user-agent'] || '';
   const isListener = userAgent.includes('Metrics-Listener');
-  
+
   if (isListener) {
     // Listener connection
     ws.id = `listener_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -312,7 +312,6 @@ wss.on('connection', (ws, req) => {
             const task = tm.getTask(taskId);
             if (task && task.status === 'running') {
               logger.info(`Draining task queue for ${taskId} after client ${ws.id} reported ready`);
-              console.log(`[DEBUG] About to call tm._drainTaskQueue for task ${taskId}`);
               tm._drainTaskQueue(task);
             }
           }
@@ -409,7 +408,7 @@ app.post('/tasks', (req, res)=>{
       let inputFiles = [];
       if (cachedFilePaths && cachedFilePaths.length > 0) {
         const uploadsDir = path.join(process.cwd(), STORAGE_DIR, 'uploads');
-        
+
         for (const cachedPath of cachedFilePaths) {
           const fullPath = path.join(uploadsDir, cachedPath);
           if (fs.existsSync(fullPath)) {

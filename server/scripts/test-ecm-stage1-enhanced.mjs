@@ -30,6 +30,7 @@ const targetWindowBits = parseInt(args.targetWindowBits || '256', 10);
 const Krep = parseInt(args.Krep || '1', 10);
 const validate = args.validate === true || args.validate === 'true' || args.validate === '1';
 const binaryPath = args.binary; // Optional binary path for exe strategy
+const cleanupOutput = args.cleanupOutput === true || args.cleanupOutput === 'true' || args.cleanupOutput === '1'; // Remove output files after task completion
 
 // Helper to ignore self-signed certificates
 import { Agent } from 'https';
@@ -195,8 +196,16 @@ async function runECMStage1() {
     framework, backend, N, B1, B2, curves, chunkSize, threads, seed, gcdMode, targetWindowBits, binaryPath
   );
 
+  // Add cleanup flag to config if requested
+  if (cleanupOutput) {
+    config.cleanupOutputFiles = true;
+  }
+
   console.log(`🎯 Using strategy: ${strategyId}`);
   console.log(`⚙️  Config:`, JSON.stringify(config, null, 2));
+  if (cleanupOutput) {
+    console.log(`🧹 Output files will be cleaned up after task completion`);
+  }
   console.log(`📊 Input args:`, JSON.stringify(inputArgs, null, 2));
 
   // Create task
@@ -397,6 +406,7 @@ Execution Options:
   --host=URL             Server URL (default: https://localhost:3000)
   --Krep=N               Replication factor (default: 1)
   --validate             Validate binary output results
+  --cleanupOutput        Remove output files after task completion
   --binary=PATH          Path to binary for exe strategy
   --help, -h             Show this help
 
@@ -412,6 +422,9 @@ Examples:
 
   # Large test with validation
   ./test-ecm-stage1-enhanced.mjs --framework=webgpu --N=0x1234567890abcdef --curves=1024 --validate
+
+  # With output cleanup to save disk space
+  ./test-ecm-stage1-enhanced.mjs --framework=webgpu --curves=512 --cleanupOutput
 `);
   process.exit(0);
 }

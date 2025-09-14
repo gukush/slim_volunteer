@@ -24,6 +24,7 @@ const datatype = args.datatype || 'f32'; // 'f32', 'f16', 'int8'
 const chunkSize = parseInt(args.chunkSize||'8388608',10); // For exe strategies
 const fileA = args.fileA || 'A.bin';
 const fileB = args.fileB || 'B.bin';
+const cleanupOutput = args.cleanupOutput === true || args.cleanupOutput === 'true' || args.cleanupOutput === '1'; // Remove output files after task completion
 
 // CPU reference implementation for validation
 function randMat(r,c){ const a = new Float32Array(r*c); for(let i=0;i<a.length;i++) a[i] = (Math.random()*2-1); return a; }
@@ -190,8 +191,16 @@ async function runBlockMatmul() {
   // Get strategy and config based on framework
   const { strategyId, config } = getStrategyAndConfig(framework, backend, N, K, M, TS, datatype, chunkSize);
 
+  // Add cleanup flag to config if requested
+  if (cleanupOutput) {
+    config.cleanupOutputFiles = true;
+  }
+
   console.log(`🎯 Using strategy: ${strategyId}`);
   console.log(`⚙️  Config:`, JSON.stringify(config, null, 2));
+  if (cleanupOutput) {
+    console.log(`🧹 Output files will be cleaned up after task completion`);
+  }
 
   // Create task using cached file paths
   const taskPayload = {

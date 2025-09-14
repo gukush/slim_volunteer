@@ -45,7 +45,6 @@ export function getArtifacts(config) {
 
   const binaryPath = frameworkBinaries[backend];
   if (!binaryPath) {
-    console.log(`[DEBUG] getArtifacts - Unknown backend ${backend}`);
     return [];
   }
 
@@ -54,7 +53,6 @@ export function getArtifacts(config) {
     const bytes = fs.readFileSync(abs).toString('base64');
     const artifactName = config.program || path.basename(binaryPath);
 
-    console.log(`[DEBUG] getArtifacts - Adding binary: ${artifactName} for ${backend}`);
 
     artifacts.push({
       type: 'binary',

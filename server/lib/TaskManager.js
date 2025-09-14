@@ -106,7 +106,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
     if (isCachedFile) {
       // For cached files, just reference them directly - NO COPYING
-      console.log(`[DEBUG] Using cached file directly: ${f.path} (${f.size} bytes)`);
       descriptor.inputFiles.push({
         path: f.path,  // Use original path directly
         originalName: path.basename(f.path),
@@ -114,7 +113,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       });
     } else if (f.path) {
       // For uploaded files, copy them (but use async for large files)
-      console.log(`[DEBUG] Copying uploaded file: ${f.path} -> ${dest}`);
       fs.copyFileSync(f.path, dest);
       const size = f.size ?? fs.statSync(dest).size;
       descriptor.inputFiles.push({ path: dest, originalName: path.basename(dest), size });
@@ -295,13 +293,10 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   }
 
   getWorkloadHeader(taskId, { includeArtifacts = false } = {}) {
-    console.log(`[DEBUG] getWorkloadHeader called with taskId: '${taskId}'`);
     const task = this.tasks.get(taskId);
     if (!task) {
-      console.log(`[DEBUG] Task ${taskId} not found in tasks map`);
       throw new Error(`Unknown task: ${taskId}`);
     }
-    console.log(`[DEBUG] Found task ${taskId}, task.id: '${task.id}'`);
     const header = {
       taskId: task.id,
       framework: task.clientInfo?.framework || null,
@@ -311,7 +306,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     if (includeArtifacts && Array.isArray(task.artifacts) && task.artifacts.length) {
       header.artifacts = task.artifacts;
     }
-    console.log(`[DEBUG] Returning header:`, header);
     return header;
   }
 
@@ -328,7 +322,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     // Send metrics:start message to listener (1 second advance)
     this.sendMetricsToListeners('metrics:start', { taskId: task.id });
     logger.info(`Task ${task.id}: Sent metrics:start to listener`);
-    sleep(500); // allow listener to start collecting metrics
+    sleep(1000); // allow listener to start collecting metrics
     try {
       for await (const chunk of task.chunker.stream()) {
         if (task.cancelRequested) {
@@ -411,19 +405,14 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   }
 
   _eligibleClients(task){
-    console.log(`[DEBUG] _eligibleClients called for task ${task.id}`);
-    console.log(`[DEBUG] Task framework: ${task.framework}`);
-    console.log(`[DEBUG] All clients:`, Array.from(this.clients.values()).map(c => ({ id: c.socket.id, frameworks: c.frameworks })));
     // Only clients that support the framework
     const list = Array.from(this.clients.values()).filter(c=>{
       if(task.framework && c.frameworks){
         const supports = c.frameworks.includes(task.framework);
-        logger.info(`[DEBUG] Client ${c.socket.id} supports ${task.framework}: ${supports} (frameworks: ${JSON.stringify(c.frameworks)})`);
         return supports;
       }
       return true;
     });
-    logger.info(`[DEBUG] Eligible clients after filtering: ${list.length}`);
     // Prefer clients with available capacity and lower load
     return list.sort((a,b)=>{
       const la = a.inFlight / (a.capacity||1);
@@ -433,7 +422,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   }
 
   _assignChunkReplica(task, chunkId){
-    console.log(`[DEBUG] _assignChunkReplica called for task ${task.id}, chunk ${chunkId}`);
     let assigned = false;
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) return;
@@ -444,7 +432,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     if(entry.replicas >= task.K && !entry.completed) {
       const timeSinceAssignment = now - (entry.tCreate || now);
       if(timeSinceAssignment > stuckTimeout) {
-        console.log(`[DEBUG] Chunk ${chunkId} is stuck, reassigning...`);
         // Reset client inFlight counts first
         for(const clientId of entry.assignedTo) {
           const client = this.clients.get(clientId);
@@ -465,11 +452,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     // Check if we allow same client multiple replicas (for research/testing)
     const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
 
-    console.log(`[DEBUG] About to call _eligibleClients for task ${task.id}`);
     const eligibleClients = this._eligibleClients(task);
-    console.log(`[DEBUG] Eligible clients for task ${task.id}: ${eligibleClients.length}`);
     for(const c of eligibleClients){
-      console.log(`[DEBUG] Checking client ${c.socket.id}, inFlight: ${c.inFlight||0}, capacity: ${c.capacity||1}, frameworks: ${JSON.stringify(c.frameworks)}`);
       // Skip if client already assigned to this chunk AND we don't allow same client replicas
       if(!allowSameClient && entry.assignedTo.has(c.socket.id)) continue;
 
@@ -482,26 +466,20 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       c.tasks.add(task.id);
       assigned = true;
 
-      console.log(`[DEBUG] Assigning chunk ${chunkId} to client ${c.socket.id}, replica ${replica}`);
-      console.log(`[DEBUG] Client type: ${c.clientType}, has payload: ${!!entry.payload}, has buffers: ${!!(entry.payload && entry.payload.buffers)}`);
 
       // Convert ArrayBuffers to base64 for native clients (unless already in raw format)
       let serializedPayload = entry.payload;
       if (c.clientType === 'native' && entry.payload && entry.payload.buffers) {
-        console.log(`[DEBUG] Converting ${entry.payload.buffers.length} buffers to base64 for native client`);
         serializedPayload = {
           ...entry.payload,
           buffers: entry.payload.buffers.map((buf, i) => {
             if (buf instanceof ArrayBuffer) {
               const base64 = Buffer.from(buf).toString('base64');
-              console.log(`[DEBUG] Buffer ${i}: ArrayBuffer(${buf.byteLength}) -> base64(${base64.length})`);
               return base64;
             } else if (Array.isArray(buf)) {
               // Already in raw byte array format, keep as is
-              console.log(`[DEBUG] Buffer ${i}: already raw byte array, length: ${buf.length}`);
               return buf;
             }
-            console.log(`[DEBUG] Buffer ${i}: not ArrayBuffer or array, type: ${typeof buf}, value:`, buf);
             return buf;
           })
         };
@@ -573,21 +551,15 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     for (const [cs, rec2] of entry.results){
       // For native-block-matmul-flex, process each chunk result immediately
       // The assembler handles K accumulation internally
-      console.log(`[TASKMANAGER] Processing chunk ${chunkId}, count: ${rec2.count}, K: ${task.K}`);
       if (rec2.count >= task.K){
         try{
-          console.log(`[TASKMANAGER] Calling assembler.integrate for chunk ${chunkId}`);
           // Decode base64 data for native clients
           let resultData = rec2.buf;
-          console.log(`[TASKMANAGER] Result data type: ${typeof resultData}, isArray: ${Array.isArray(resultData)}, length: ${resultData?.length || 'N/A'}`);
           if (Array.isArray(resultData) && resultData.length > 0) {
             // Result is an array of base64 strings, take the first one
-            console.log(`[TASKMANAGER] First element type: ${typeof resultData[0]}, length: ${resultData[0]?.length || 'N/A'}`);
             resultData = Buffer.from(resultData[0], 'base64');
-            console.log(`[TASKMANAGER] Decoded buffer length: ${resultData.length}`);
           } else if (typeof resultData === 'string') {
             resultData = Buffer.from(resultData, 'base64');
-            console.log(`[TASKMANAGER] Decoded string buffer length: ${resultData.length}`);
           }
           task.assembler.integrate({ chunkId, result: resultData, meta: entry.meta });
           const tAssembled = now();
@@ -623,6 +595,11 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         // Send metrics:stop message to listener
         this.sendMetricsToListeners('metrics:stop', { taskId, outInfo });
         logger.info(`Task ${taskId}: Sent metrics:stop to listener`);
+
+        // Clean up output files if requested
+        if (task.descriptor.config?.cleanupOutputFiles === true) {
+          this._cleanupOutputFiles(task, outInfo);
+        }
 
         this.io.emit('task:done', { taskId, outInfo });
         logger.info('Task completed', taskId, outInfo);
@@ -676,11 +653,51 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     }
   }
 
+  _cleanupOutputFiles(task, outInfo) {
+    try {
+      const taskDir = path.join(this.storageDir, 'tasks', task.id);
+
+      // Clean up output files but preserve task descriptor and timings
+      const filesToCleanup = [];
+
+      // Get output file path from outInfo if available
+      if (outInfo?.outPath) {
+        filesToCleanup.push(outInfo.outPath);
+      }
+
+      // Also check for common output file patterns in task directory
+      const taskDirContents = fs.readdirSync(taskDir);
+      for (const file of taskDirContents) {
+        const filePath = path.join(taskDir, file);
+        const stat = fs.statSync(filePath);
+
+        // Only remove files (not directories) and skip task descriptor
+        if (stat.isFile() && !file.startsWith('task_descriptor_')) {
+          // Check if it's likely an output file
+          if (file.includes('output') || file.endsWith('.bin') || file.endsWith('.json')) {
+            filesToCleanup.push(filePath);
+          }
+        }
+      }
+
+      // Remove the files
+      for (const filePath of filesToCleanup) {
+        try {
+          fs.unlinkSync(filePath);
+          logger.info(`Task ${task.id}: Cleaned up output file: ${path.basename(filePath)}`);
+        } catch (err) {
+          logger.warn(`Task ${task.id}: Failed to cleanup file ${filePath}:`, err.message);
+        }
+      }
+
+      logger.info(`Task ${task.id}: Output files cleanup completed (${filesToCleanup.length} files removed)`);
+    } catch (error) {
+      logger.error(`Task ${task.id}: Error during output files cleanup:`, error);
+    }
+  }
+
   _drainTaskQueue(task){
     if(!task || task.status!=='running') return;
-    console.log(`[DEBUG] Draining task queue for ${task.id}, ${task.queue.length} chunks in queue`);
-    console.log(`[DEBUG] Task framework: ${task.framework}`);
-    console.log(`[DEBUG] About to process chunks in queue`);
 
     // Check for stuck chunks first
     const now = Date.now();
@@ -693,7 +710,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       if(entry.replicas >= task.K && !entry.completed) {
         const timeSinceAssignment = now - (entry.tCreate || now);
         if(timeSinceAssignment > stuckTimeout) {
-          console.log(`[DEBUG] Chunk ${chunkId} is stuck (${timeSinceAssignment}ms), reassigning...`);
           // Reset client inFlight counts first
           for(const clientId of entry.assignedTo) {
             const client = this.clients.get(clientId);
@@ -712,11 +728,9 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     for(const chunkId of task.queue){
       const entry = task.assignments.get(chunkId);
       if(!entry || entry.completed) continue;
-      console.log(`[DEBUG] Processing chunk ${chunkId}, replicas: ${entry.replicas}/${task.K}`);
       // Try to assign as many replicas as needed (up to K)
       while(entry.replicas < task.K){
         const assigned = this._assignChunkReplica(task, chunkId);
-        console.log(`[DEBUG] Chunk ${chunkId} assignment attempt: ${assigned}`);
         if(!assigned) break; // No capacity right now
       }
     }

@@ -45,7 +45,6 @@ export function getArtifacts(config){
 
 	const binaryPath = frameworkBinaries[backend];
 	if (!binaryPath) {
-		console.log(`[DEBUG] getArtifacts - Unknown backend ${backend}`);
 		return [];
 	}
 
@@ -54,7 +53,6 @@ export function getArtifacts(config){
 		const bytes = fs.readFileSync(abs).toString('base64');
 		const artifactName = config.program || path.basename(binaryPath);
 
-		console.log(`[DEBUG] getArtifacts - Adding binary: ${artifactName} for ${backend}`);
 
 		artifacts.push({
 			type: 'binary',
@@ -160,10 +158,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const binaryName = config.program || path.basename(rel);
 
   // Debug output
-  console.log(`[DEBUG] buildChunker - config.program: ${config.program}`);
-  console.log(`[DEBUG] buildChunker - rel: ${rel}`);
-  console.log(`[DEBUG] buildChunker - path.basename(rel): ${path.basename(rel)}`);
-  console.log(`[DEBUG] buildChunker - binaryName: ${binaryName}`);
 
   const C = Number(config.chunk_size ?? config.C);
   let baseRows, baseCols, kSpan;

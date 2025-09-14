@@ -25,6 +25,7 @@ const validate = args.validate === true || args.validate === 'true' || args.vali
 const fileQ = args.fileQ || 'Q.bin';
 const fileK = args.fileK || 'K.bin';
 const fileV = args.fileV || 'V.bin';
+const cleanupOutput = args.cleanupOutput === true || args.cleanupOutput === 'true' || args.cleanupOutput === '1'; // Remove output files after task completion
 
 // Helper to ignore self-signed certificates
 import { Agent } from 'https';
@@ -224,8 +225,16 @@ async function runMultiHeadAttention() {
   // Get strategy and config based on framework
   const { strategyId, config } = getStrategyAndConfig(framework, backend, seqLen, dModel, numHeads);
 
+  // Add cleanup flag to config if requested
+  if (cleanupOutput) {
+    config.cleanupOutputFiles = true;
+  }
+
   console.log(`🎯 Using strategy: ${strategyId}`);
   console.log(`⚙️  Config:`, JSON.stringify(config, null, 2));
+  if (cleanupOutput) {
+    console.log(`🧹 Output files will be cleaned up after task completion`);
+  }
 
   // Create task using cached file paths
   const taskPayload = {

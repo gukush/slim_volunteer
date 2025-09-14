@@ -25,6 +25,7 @@ const maxElements = args.maxElements ? parseInt(args.maxElements, 10) : undefine
 const cachedFile = args.file || 'large_sort_input.bin'; // Default cached file
 const validate = args.validate === true || args.validate === 'true' || args.validate === '1';
 const useMatrixData = args.useMatrixData === true || args.useMatrixData === 'true' || args.useMatrixData === '1';
+const cleanupOutput = args.cleanupOutput === true || args.cleanupOutput === 'true' || args.cleanupOutput === '1'; // Remove output files after task completion
 
 // Helper to ignore self-signed certificates
 import { Agent } from 'https';
@@ -88,9 +89,9 @@ function getStrategyAndConfig(framework, backend, chunkSize, ascending, maxEleme
     case 'webgpu':
       return {
         strategyId: 'distributed-sort',
-        config: { 
-          chunkSize, 
-          ascending, 
+        config: {
+          chunkSize,
+          ascending,
           framework: 'webgpu',
           maxElements
         }
@@ -99,9 +100,9 @@ function getStrategyAndConfig(framework, backend, chunkSize, ascending, maxEleme
     case 'cuda':
       return {
         strategyId: 'exe-distributed-sort',
-        config: { 
-          chunkSize, 
-          ascending, 
+        config: {
+          chunkSize,
+          ascending,
           backend: 'cuda',
           maxElements
         }
@@ -117,14 +118,14 @@ function findSortInputFile(uploadsDir, preferredFile, useMatrixData) {
   console.log(`🔍 Looking for sort input file...`);
   console.log(`   Preferred: ${preferredFile}`);
   console.log(`   Use matrix data: ${useMatrixData}`);
-  
+
   if (!fs.existsSync(uploadsDir)) {
     throw new Error(`Uploads directory not found: ${uploadsDir}`);
   }
 
   const files = fs.readdirSync(uploadsDir);
   console.log(`📁 Available files in uploads: ${files.length} files`);
-  
+
   // List all .bin files with sizes
   const binFiles = files.filter(f => f.endsWith('.bin')).map(f => {
     const fullPath = path.join(uploadsDir, f);
@@ -150,8 +151,8 @@ function findSortInputFile(uploadsDir, preferredFile, useMatrixData) {
   }
 
   // 2. Look for dedicated sort files (exclude A.bin, B.bin)
-  const sortFiles = binFiles.filter(f => 
-    !/_[AB]\.bin$/i.test(f.name) && 
+  const sortFiles = binFiles.filter(f =>
+    !/_[AB]\.bin$/i.test(f.name) &&
     !/^[AB]\.bin$/i.test(f.name) &&
     (f.name.includes('sort') || f.name.includes('input'))
   );
@@ -194,13 +195,13 @@ async function runDistributedSort() {
   let reference, originalData;
   if (validate) {
     const filePath = path.join(uploadsDir, inputFile);
-    
+
     console.log('🔍 Loading input file for validation...');
     const fileBuffer = fs.readFileSync(filePath);
     originalData = new Uint32Array(fileBuffer.buffer, fileBuffer.byteOffset, fileBuffer.byteLength / 4);
-    
+
     console.log(`📊 Loaded ${originalData.length} integers (${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
-    
+
     // Generate reference sorted array
     console.log('🧮 Computing reference sorted array...');
     reference = new Uint32Array(originalData);
@@ -210,10 +211,18 @@ async function runDistributedSort() {
 
   // Get strategy and config based on framework
   const { strategyId, config } = getStrategyAndConfig(framework, backend, chunkSize, ascending, maxElements);
-  
+
+  // Add cleanup flag to config if requested
+  if (cleanupOutput) {
+    config.cleanupOutputFiles = true;
+  }
+
   console.log(`🎯 Using strategy: ${strategyId}`);
   console.log(`📁 Input file: ${inputFile}`);
   console.log(`⚙️  Config:`, JSON.stringify(config, null, 2));
+  if (cleanupOutput) {
+    console.log(`🧹 Output files will be cleaned up after task completion`);
+  }
 
   // Create task using cached file paths
   const taskPayload = {
@@ -255,13 +264,13 @@ async function runDistributedSort() {
     const s = await fetchWithAgent(`${host}/tasks/${taskId}`);
     const j = await s.json();
     status = j.status;
-    
+
     const chunks = j.completedChunks || 0;
     const total = j.totalChunks || '?';
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    
+
     process.stdout.write(`\r📊 [${elapsed}s] status=${status} ${chunks}/${total} chunks   `);
-    
+
     if (status === 'completed' || status === 'error' || status === 'canceled') break;
   }
   console.log();
@@ -283,7 +292,7 @@ async function runDistributedSort() {
   const resultData = new Uint32Array(resultBuffer.buffer, resultBuffer.byteOffset, resultBuffer.byteLength / 4);
 
   console.log(`✅ Successfully sorted ${resultData.length} integers`);
-  
+
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
   const throughput = Math.round(resultData.length / parseFloat(totalTime));
   console.log(`⏱️  Time: ${totalTime}s, Throughput: ${throughput} int/s`);
@@ -291,17 +300,17 @@ async function runDistributedSort() {
   // Validate results if requested
   if (validate && reference && originalData) {
     console.log('🔍 Validating results...');
-    
+
     if (resultData.length !== originalData.length) {
       console.error(`❌ Length mismatch: expected ${originalData.length}, got ${resultData.length}`);
       process.exit(4);
     }
-    
+
     if (!isSorted(resultData, ascending)) {
       console.error('❌ Output is not properly sorted!');
       process.exit(5);
     }
-    
+
     // Verify we have the same elements (sorted reference vs our result)
     let elementsMismatch = false;
     for (let i = 0; i < originalData.length; i++) {
@@ -311,7 +320,7 @@ async function runDistributedSort() {
         break;
       }
     }
-    
+
     if (elementsMismatch) {
       console.error('❌ FAIL - Elements do not match reference');
       process.exit(6);
