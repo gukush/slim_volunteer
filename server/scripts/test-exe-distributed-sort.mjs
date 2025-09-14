@@ -37,8 +37,8 @@ if (!['cuda', 'opencl'].includes(backend)) {
 
 // Default binary paths if not specified
 const defaultBinaries = {
-  cuda: 'server/binaries/exe_distributed_sort',
-  opencl: 'server/binaries/exe_distributed_sort_opencl'
+  cuda: '/binaries/exe_distributed_sort',
+  opencl: '/binaries/exe_distributed_sort_opencl'
 };
 
 const binaryPath = binary || defaultBinaries[backend];
@@ -140,7 +140,7 @@ async function robustFetch(url, opts = {}, retryCfg = {}) {
       const fetchOptions = host.startsWith('https://localhost')
         ? { agent: httpsAgent, ...opts }
         : opts;
-      
+
       const response = await fetch(url, fetchOptions);
       return response;
     } catch (error) {
@@ -297,7 +297,7 @@ async function main() {
   console.log(`  Downloaded result: ${resultData.length} integers`);
 
   console.log('\nStep 7: Validating results...');
-  
+
   // Check length
   if (resultData.length !== inputData.length) {
     console.error(`⚠️ Length mismatch: expected ${inputData.length}, got ${resultData.length}`);
