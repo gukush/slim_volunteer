@@ -60,7 +60,7 @@ function verifyRecords(u32, N){
 
 async function main(){
   const args = parseArgs(process.argv);
-  const baseURL = args.baseURL || process.env.BASE_URL || 'http://localhost:3000';
+  const baseURL = args.baseURL || process.env.BASE_URL || 'https://localhost:3000';
   const outDir = args.outDir || path.join(__dirname, `task-native-ecm-${Date.now()}`);
   fs.mkdirSync(outDir, { recursive: true });
 

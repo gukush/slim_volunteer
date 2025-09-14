@@ -78,7 +78,7 @@ async function main(){
   console.log(`  CPU computation took ${cpuTime}ms`);
 
   console.log('\nStep 3: Loading Lua host script...');
-  const luaScriptPath = path.join(__dirname, 'host_block_matmul.lua');
+  const luaScriptPath = path.join(__dirname, '../../executors/host_block_matmul.lua');
   if (!fs.existsSync(luaScriptPath)) {
     console.error(`Lua script not found: ${luaScriptPath}`);
     process.exit(1);

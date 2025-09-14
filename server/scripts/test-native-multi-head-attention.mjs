@@ -19,7 +19,7 @@ function args() {
 }
 
 const a = args();
-const host      = a.host || 'http://localhost:3000';
+const host      = a.host || 'https://localhost:3000';
 const seq_len   = Number(a.seq_len || 512);
 const d_model   = Number(a.d_model || 768);
 const num_heads = Number(a.num_heads || 12);

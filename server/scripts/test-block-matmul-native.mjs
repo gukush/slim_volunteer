@@ -21,7 +21,7 @@ const framework = String(args.framework || 'native-opencl');
 const N = parseInt(args.N||'64',10), K = parseInt(args.K||'64',10), M = parseInt(args.M||'64',10);
 const TS = parseInt(args.tileSize||'32',10);
 const Krep = parseInt(args.Krep||'1',10);
-const luaPathArg = args.lua || path.join(__dirname, 'host_block_matmul.lua'); // default next to script
+const luaPathArg = args.lua || path.join(__dirname, '../executors/host_block_matmul.lua'); // default in executors directory
 
 function randMat(r,c){ const a=new Float32Array(r*c); for(let i=0;i<a.length;i++) a[i]=(Math.random()*2-1); return a; }
 function matmulCPUf32(A,B,rows,kk,cols){

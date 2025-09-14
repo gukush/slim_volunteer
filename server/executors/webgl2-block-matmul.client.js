@@ -75,9 +75,10 @@ export function createExecutor({ kernels, config }) {
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
       throw new Error('Program link error: ' + gl.getProgramInfoLog(prog));
     }
-    loc.uA = gl.getUniformLocation(prog, 'uA');
-    loc.uB = gl.getUniformLocation(prog, 'uB');
-    loc.uRows = gl.getUniformLocation(prog, 'uRows');
+    // Try both naming conventions for compatibility
+    loc.uA = gl.getUniformLocation(prog, 'uA') || gl.getUniformLocation(prog, 'Atex');
+    loc.uB = gl.getUniformLocation(prog, 'uB') || gl.getUniformLocation(prog, 'Btex');
+    loc.uRows = gl.getUniformLocation(prog, 'uRows') || gl.getUniformLocation(prog, 'dims');
     loc.uK = gl.getUniformLocation(prog, 'uK');
     loc.uCols = gl.getUniformLocation(prog, 'uCols');
   }
@@ -143,7 +144,16 @@ export function createExecutor({ kernels, config }) {
     for (let i = 0, j = 0; i < compact.length; ++i, j += 4) compact[i] = out[j];
 
     const tClientDone = Date.now();
-    return { status: 'ok', result: compact.buffer, timings: { tClientRecv, tClientDone } };
+    return {
+      status: 'ok',
+      result: compact.buffer,
+      timings: {
+        tClientRecv,
+        tClientDone,
+        cpuTimeMs: tClientDone - tClientRecv, // No GPU timing in WebGL2
+        gpuTimeMs: null
+      }
+    };
   }
 
   return { runChunk };

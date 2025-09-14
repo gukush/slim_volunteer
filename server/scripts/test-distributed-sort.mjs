@@ -19,6 +19,7 @@ const count = parseInt(args.count || '100000', 10); // Number of integers to sor
 const chunkSize = parseInt(args.chunkSize || '65536', 10); // Integers per chunk
 const ascending = args.descending ? false : true; // Sort direction
 const Krep = parseInt(args.Krep || '1', 10); // Replication factor
+const maxElements = args.maxElements ? parseInt(args.maxElements, 10) : undefined; // Optional limit on elements to process
 
 function generateRandomIntegers(count) {
   const data = new Uint32Array(count);
@@ -40,7 +41,7 @@ function isSorted(data, ascending = true) {
 }
 
 async function main() {
-  console.log(`Testing distributed sort with ${count} integers, chunkSize=${chunkSize}, ascending=${ascending}`);
+  console.log(`Testing distributed sort with ${count} integers, chunkSize=${chunkSize}, ascending=${ascending}${maxElements ? `, maxElements=${maxElements}` : ''}`);
 
   // 1) Generate test data
   const inputData = generateRandomIntegers(count);
@@ -58,11 +59,17 @@ async function main() {
   fd.append('strategyId', 'distributed-sort');
   fd.append('K', String(Krep));
   fd.append('label', 'distributed-sort-test');
-  fd.append('config', JSON.stringify({
+  const config = {
     chunkSize,
     ascending,
     framework
-  }));
+  };
+  
+  if (maxElements) {
+    config.maxElements = maxElements;
+  }
+  
+  fd.append('config', JSON.stringify(config));
   fd.append('sort_input.bin', new Blob([fs.readFileSync(inputFile)]), 'sort_input.bin');
 
   let resp = await fetch(`${host}/tasks`, { method: 'POST', body: fd });

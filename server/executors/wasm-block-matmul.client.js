@@ -161,7 +161,16 @@ export function createExecutor({ kernels, config }) {
         d('runChunk timings(ms): ensure+copy+mul+read total=', (t1 - t0).toFixed(2),
           'mulOnly=', (tMul1 - tMul0).toFixed(2));
 
-        return { status: 'ok', result: out, timings: { tClientRecv, tClientDone } };
+        return {
+          status: 'ok',
+          result: out,
+          timings: {
+            tClientRecv,
+            tClientDone,
+            cpuTimeMs: tClientDone - tClientRecv, // No GPU timing in WASM
+            gpuTimeMs: null
+          }
+        };
       } finally {
         // Always free
         try { Module._free(ptrA); } catch {}
@@ -172,7 +181,17 @@ export function createExecutor({ kernels, config }) {
       const tClientDone = Date.now();
       const msg = (err && err.stack) ? err.stack : String(err && err.message || err);
       e('runChunk error:', msg);
-      return { status: 'error', error: msg, result: new ArrayBuffer(0), timings: { tClientRecv, tClientDone } };
+      return {
+        status: 'error',
+        error: msg,
+        result: new ArrayBuffer(0),
+        timings: {
+          tClientRecv,
+          tClientDone,
+          cpuTimeMs: tClientDone - tClientRecv,
+          gpuTimeMs: null
+        }
+      };
     }
   }
 

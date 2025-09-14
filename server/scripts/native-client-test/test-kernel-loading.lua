@@ -24,7 +24,7 @@ local mock_executor = {
 }
 
 -- Load the host script
-dofile("scripts/native/host_block_matmul.lua")
+dofile("executors/host_block_matmul.lua")
 
 -- Test kernel loading for each framework
 local frameworks = {"cuda", "opencl", "vulkan"}
