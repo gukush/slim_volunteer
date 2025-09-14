@@ -50,12 +50,51 @@ export class TaskManager{
     this.clients.delete(socketId);
   }
 
-  createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[]}){
+  // Send metrics events to listener WebSocket connections
+  sendMetricsToListeners(eventType, data) {
+    if (!this.wss) {
+      logger.warn('WebSocket server not available for sending metrics');
+      return;
+    }
+
+    const message = JSON.stringify({ type: eventType, data });
+    let listenerCount = 0;
+    let totalClients = 0;
+    let listenerClients = 0;
+
+    for (const client of this.wss.clients) {
+      totalClients++;
+      if (client.kind === 'listener') {
+        listenerClients++;
+        logger.debug(`Found listener client ${client.id}, readyState: ${client.readyState}`);
+        if (client.readyState === 1) { // 1 = WebSocket.OPEN
+          try {
+            client.send(message);
+            listenerCount++;
+            logger.debug(`Sent ${eventType} to listener ${client.id}`);
+          } catch (error) {
+            logger.error(`Failed to send metrics to listener ${client.id}:`, error);
+          }
+        } else {
+          logger.warn(`Listener ${client.id} is not open (readyState: ${client.readyState})`);
+        }
+      }
+    }
+
+    logger.info(`Metrics send attempt: ${totalClients} total clients, ${listenerClients} listeners, ${listenerCount} sent`);
+    if (listenerCount > 0) {
+      logger.info(`Sent ${eventType} to ${listenerCount} listener(s)`);
+    } else {
+      logger.warn(`No listeners received ${eventType} message`);
+    }
+  }
+
+  createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[], cachedFilePaths=[]}){
     const strategy = getStrategy(strategyId);
     const id = uuidv4();
     const taskDir = path.join(this.storageDir, 'tasks', id);
     ensureDir(taskDir);
-    const descriptor = { id, label, strategyId, status: 'created', createdAt: now(), K, config, inputArgs, inputFiles: [] };
+    const descriptor = { id, label, strategyId, status: 'created', createdAt: now(), K, config, inputArgs, inputFiles: [], cachedFilePaths };
     /*
     for(const f of inputFiles){
       const dest = path.join(taskDir, f.originalName);
@@ -111,6 +150,10 @@ export class TaskManager{
     try {
       task.status = 'running';
       task.startTime = now();
+
+      // Send metrics:start message to listeners immediately when task starts
+      this.sendMetricsToListeners('metrics:start', { taskId: task.id });
+      logger.info(`Task ${task.id}: Sent metrics:start to listener (task start)`);
 
       // OSUsageTracker: start per-task sampling
       const osOutDir = path.join(this.storageDir, 'timing', task.id);
@@ -273,8 +316,8 @@ export class TaskManager{
     const startTime = Date.now();
     let lastLogTime = startTime;
 
-    // Send metrics:prepare message to listener (1 second advance)
-    this.io.emit('metrics:start', { taskId: task.id });
+    // Send metrics:start message to listener (1 second advance)
+    this.sendMetricsToListeners('metrics:start', { taskId: task.id });
     logger.info(`Task ${task.id}: Sent metrics:start to listener`);
     sleep(500); // allow listener to start collecting metrics
     try {
@@ -484,12 +527,18 @@ export class TaskManager{
     const client = this.clients.get(socketId);
     if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
 
+    // Extract GPU timing data from response
+    const cpuTimeMs = timings?.cpuTimeMs || null;
+    const gpuTimeMs = timings?.gpuTimeMs || null;
+
     task.timers.chunkRow({
       chunkId, replica,
       tCreate: entry.tCreate,
       tServerRecv,
       tClientRecv: timings?.tClientRecv,
       tClientDone: timings?.tClientDone,
+      cpuTimeMs,
+      gpuTimeMs,
     });
 
     if(status!=='ok'){
@@ -533,7 +582,7 @@ export class TaskManager{
           }
           task.assembler.integrate({ chunkId, result: resultData, meta: entry.meta });
           const tAssembled = now();
-          task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled });
+          task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled, cpuTimeMs, gpuTimeMs });
           entry.completed = true;
           task.completedChunks += 1;
           logger.debug('Chunk accepted', task.id, chunkId, 'checksum', cs);
@@ -563,7 +612,7 @@ export class TaskManager{
         try { task.osTracker?.stop('completed'); } catch {}
 
         // Send metrics:stop message to listener
-        this.io.emit('metrics:stop', { taskId, outInfo });
+        this.sendMetricsToListeners('metrics:stop', { taskId, outInfo });
         logger.info(`Task ${taskId}: Sent metrics:stop to listener`);
 
         this.io.emit('task:done', { taskId, outInfo });
