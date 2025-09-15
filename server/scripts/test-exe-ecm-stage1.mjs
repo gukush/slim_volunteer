@@ -39,7 +39,8 @@ if (!N) {
   N = '0x' + (p * q).toString(16);
 }
 
-const curves  = parseInt(argv.curves  || '256', 10);
+const total_curves = parseInt(argv.total_curves || argv.curves || '256', 10);
+const chunk_size = parseInt(argv.chunk_size || '256', 10);
 const B1      = parseInt(argv.B1      || '50000', 10);
 const B2      = parseInt(argv.B2      || String(B1 * 20), 10);
 const threads = parseInt(argv.threads || '1', 10);
@@ -119,7 +120,7 @@ async function main() {
   console.log(`Backend:  ${backend}`);
   console.log(`Program:  ${program}${binaryPath ? ` (artifact from ${binaryPath})` : ''}`);
   console.log(`N:        ${N}`);
-  console.log(`curves:   ${curves}, B1: ${B1}, B2: ${B2}, threads: ${threads}, seed: ${seed}\n`);
+  console.log(`curves:   ${total_curves}, B1: ${B1}, B2: ${B2}, threads: ${threads}, seed: ${seed}\n`);
 
   const outDir = path.join(process.cwd(), `out-${label}`);
   fs.mkdirSync(outDir, { recursive: true });
@@ -130,7 +131,8 @@ async function main() {
     label,
     inputArgs: {
       N,
-      curves,
+      total_curves,
+      chunk_size,
       threads,
       B1,
       B2,
