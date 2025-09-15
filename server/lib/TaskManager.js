@@ -335,7 +335,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     let count = 0;
     const BATCH_SIZE = 50;  // Smaller batches for better responsiveness
     const YIELD_INTERVAL = 25; // Yield more frequently
-    const MAX_PENDING = 1000; // Limit pending chunks to prevent memory issues
+    const MAX_PENDING = 5000; // Limit pending chunks
 
     let batch = 0;
     const startTime = Date.now();
@@ -390,21 +390,19 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
         // Throttle if too many chunks are pending
         const pending = task.assignments.size - task.completedChunks;
-        while (pending > MAX_PENDING && !task.cancelRequested) {
-          logger.debug(`Task ${task.id}: Throttling chunk generation (${task.queue.length} pending)`);
-          await new Promise(resolve => setTimeout(resolve, 500));
+        if (pending > MAX_PENDING && !task.cancelRequested) {
+          logger.debug(`Task ${task.id}: Throttling chunk generation (${pending} pending, ${task.queue.length} in queue)`);
+          // Use setImmediate to yield control to other operations (like result processing)
+          await new Promise(resolve => setImmediate(resolve));
+          continue; // Skip this iteration and recheck conditions
         }
 
         // Memory pressure check
-        if (count % 500 === 0) {
+        if (count % 1000 === 0) {
           const memUsage = process.memoryUsage();
           const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-          if (heapUsedMB > 1024) { // Over 1GB heap usage
+          if (heapUsedMB > 2048) { // Over 2GB heap usage
             logger.warn(`Task ${task.id}: High memory usage: ${heapUsedMB}MB heap`);
-            // Force garbage collection if available
-            if (global.gc) {
-              global.gc();
-            }
           }
         }
       }
