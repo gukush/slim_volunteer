@@ -99,21 +99,15 @@ function createTimingContext(device, capacity = 64) {
       count: capacity,
     });
 
-    // Ensure buffer size is large enough for 256-byte aligned offsets
-    // We need space for the maximum possible aligned offset plus data
-    const maxDataSize = capacity * 8;
-    const maxAlignedOffset = Math.ceil(maxDataSize / 256) * 256;
-    const alignedSize = maxAlignedOffset + maxDataSize;
-
     const resolveBuffer = device.createBuffer({
       label: 'sort-timing-resolve',
-      size: alignedSize,
+      size: capacity * 8, // 8 bytes per timestamp
       usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
     });
 
     const resultBuffer = device.createBuffer({
       label: 'sort-timing-result',
-      size: alignedSize,
+      size: capacity * 8,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
 
@@ -151,11 +145,6 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
   if (!timingCtx.supportsTimestamps) return null;
 
   try {
-    // Calculate aligned offsets for WebGPU requirements (256-byte alignment)
-    const dataOffset = queryStart * 8;
-    const alignedOffset = Math.ceil(dataOffset / 256) * 256;
-    const dataSize = (queryEnd - queryStart + 1) * 8;
-
     // Resolve timestamps to buffer
     const encoder = device.createCommandEncoder({ label: 'sort-timing-resolve' });
     encoder.resolveQuerySet(
@@ -163,27 +152,27 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
       queryStart,
       queryEnd - queryStart + 1,
       timingCtx.resolveBuffer,
-      alignedOffset
+      queryStart * 8
     );
     encoder.copyBufferToBuffer(
       timingCtx.resolveBuffer,
-      alignedOffset,
+      queryStart * 8,
       timingCtx.resultBuffer,
-      alignedOffset,
-      dataSize
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
     );
     device.queue.submit([encoder.finish()]);
 
     // Read back results
     await timingCtx.resultBuffer.mapAsync(
       GPUMapMode.READ,
-      alignedOffset,
-      dataSize
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
     );
 
     const arrayBuffer = timingCtx.resultBuffer.getMappedRange(
-      alignedOffset,
-      dataSize
+      queryStart * 8,
+      (queryEnd - queryStart + 1) * 8
     );
     const timestamps = new BigUint64Array(arrayBuffer);
     const startTime = timestamps[0];
@@ -220,6 +209,9 @@ async function getDevice() {
 
   const device = await adapter.requestDevice({
     requiredFeatures,
+    requiredLimits: {
+      maxBufferSize: 1073741824  // 1GB
+    }
   });
 
   __WGPU_SORT_CACHE__.device = device;
