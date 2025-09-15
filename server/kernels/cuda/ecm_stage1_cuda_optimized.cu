@@ -547,7 +547,13 @@ __global__ void ecm_stage1_v3_optimized(uint32_t* io) {
     h.pp_start = io[10];
     h.pp_len = io[11];
 
-    if (idx >= h.n_curves) return;
+    if (idx >= h.n_curves) {
+        // Debug: This thread is out of bounds
+        return;
+    }
+
+    // Debug: This thread is processing curve idx
+    // (We can't use printf in device code easily, so we'll use a different approach)
 
     // Load constants
     uint32_t off = constOffset();
@@ -597,6 +603,8 @@ __global__ void ecm_stage1_v3_optimized(uint32_t* io) {
             io[out_base + 8] = 3u; // bad curve status
             return;
         }
+
+        // Debug: Curve generation succeeded for this thread
     } else {
         // Resume - load saved state
         CurveState state = load_state(idx, h, io);
@@ -613,6 +621,7 @@ __global__ void ecm_stage1_v3_optimized(uint32_t* io) {
     }
 
     // Process prime powers in current window
+    uint32_t processed_pps = 0;
     for (uint32_t i = h.pp_start; i < h.pp_start + h.pp_len; i++) {
         if (i >= h.pp_count) break;
         uint32_t pp = io[pp_off + i];
@@ -620,7 +629,11 @@ __global__ void ecm_stage1_v3_optimized(uint32_t* io) {
 
         // Use the CORRECT Montgomery ladder instead of point_mul_small
         R = ladder(R, pp, A24m, N, n0inv32, mont_one);
+        processed_pps++;
     }
+
+    // Debug: Write number of processed prime powers to output (in status field)
+    // This will help us see if work is actually being done
 
     // Save state for next pass
     CurveState state;
@@ -643,11 +656,13 @@ __global__ void ecm_stage1_v3_optimized(uint32_t* io) {
         for (uint32_t i = 0; i < 8; i++) {
             io[out_base + i] = Z_std.limbs[i];
         }
-        io[out_base + 8] = 1u; // no factor status
+        // Debug: Store processed_pps in status field to see if work was done
+        io[out_base + 8] = processed_pps; // Store number of processed prime powers
     } else {
         // Not done - write "needs more" status
         for (uint32_t i = 0; i < 8; i++) { io[out_base + i] = 0u; }
-        io[out_base + 8] = 0u; // needs more status
+        // Debug: Store processed_pps in status field
+        io[out_base + 8] = processed_pps; // Store number of processed prime powers
     }
 }
 
