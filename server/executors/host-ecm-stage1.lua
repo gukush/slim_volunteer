@@ -1,14 +1,10 @@
--- host-ecm-stage1.lua  (resumable ECM Stage 1 for native CUDA)
+-- host-ecm-stage1.lua  (resumable ECM Stage 1 for native CUDA) - FIXED
 -- Mirrors browser executor behavior:
 --   * Uses v3 buffer layout (header[10]=pp_start, header[11]=pp_len)
 --   * Reuses the ENTIRE IO buffer between passes so saved state is preserved
 --   * Launches with blockDim.x = 64, gridDim.x = ceil(n/64)
 --   * Reads/writes the full IO buffer (header + consts + primes + outputs + state)
---
--- Expects the workload to carry artifacts:
---   - {type:"lua", name:"host.lua"}         -> this file
---   - {type:"text", backend:"cuda", bytes}  -> CUDA kernel source
--- Optionally OpenCL/Vulkan as fallback if CUDA absent.
+--   * FIXED: Properly interprets status codes from kernel
 
 ----------------------------------------------------------------------
 -- util: normalize framework tag
@@ -129,13 +125,26 @@ local function ensure_len(buf, bytes)
 end
 
 ----------------------------------------------------------------------
--- constants (match JS)
+-- constants (match JS and CUDA)
 ----------------------------------------------------------------------
 local WG_SIZE = 64  -- matches WGSL @workgroup_size(64) and CUDA blockDim.x
 local HEADER_WORDS_V3 = 12
 local CONST_WORDS = 8*3 + 4            -- N(8) + R2(8) + mont_one(8) + n0inv32(1) + pad(3)
 local CURVE_OUT_WORDS_PER = 8 + 1 + 3  -- result(8) + status(1) + pad(3)
 local STATE_WORDS_PER_CURVE = 8 + 8 + 8 + 2 -- X(8) + Z(8) + A24(8) + (sigma, curve_ok)
+
+-- Status codes (match CUDA/WGSL)
+local STATUS_NEEDS_MORE = 0
+local STATUS_NO_FACTOR = 1
+local STATUS_FACTOR_FOUND = 2
+local STATUS_BAD_CURVE = 3
+
+local STATUS_NAMES = {
+  [STATUS_NEEDS_MORE] = "needs_more",
+  [STATUS_NO_FACTOR] = "no_factor",
+  [STATUS_FACTOR_FOUND] = "FACTOR_FOUND",
+  [STATUS_BAD_CURVE] = "bad_curve"
+}
 
 -- choose a sane entry name. If your CUDA kernel uses another name, set payload.entry in strategy.
 local DEFAULT_ENTRY_BY_FW = { cuda = "ecm_stage1_v3_optimized", opencl = "execute_task", vulkan = "main" }
@@ -146,10 +155,53 @@ local function get_entry_point(fw, payload)
 end
 
 ----------------------------------------------------------------------
+-- Helper to check results after each pass
+----------------------------------------------------------------------
+local function check_results(buf, n, outputOffset)
+  local factors_found = 0
+  local bad_curves = 0
+  local needs_more = 0
+  local no_factors = 0
+
+  for i = 0, n - 1 do
+    local curve_offset = outputOffset + i * CURVE_OUT_WORDS_PER
+    local status = get_u32_le(buf, curve_offset + 8)
+
+    if status == STATUS_FACTOR_FOUND then
+      factors_found = factors_found + 1
+      -- Extract the factor for logging
+      local factor_words = {}
+      for j = 0, 7 do
+        factor_words[j+1] = get_u32_le(buf, curve_offset + j)
+      end
+      -- Convert to hex string (big-endian display)
+      local hex = "0x"
+      for j = 8, 1, -1 do
+        hex = hex .. string.format("%08x", factor_words[j])
+      end
+      print(string.format("[lua/ecm1] FACTOR FOUND (curve %d): %s", i, hex:sub(1, 20) .. "..."))
+    elseif status == STATUS_BAD_CURVE then
+      bad_curves = bad_curves + 1
+    elseif status == STATUS_NEEDS_MORE then
+      needs_more = needs_more + 1
+    elseif status == STATUS_NO_FACTOR then
+      no_factors = no_factors + 1
+    end
+  end
+
+  return {
+    factors_found = factors_found,
+    bad_curves = bad_curves,
+    needs_more = needs_more,
+    no_factors = no_factors
+  }
+end
+
+----------------------------------------------------------------------
 -- main entry required by your C++ LuaHost wrapper
 ----------------------------------------------------------------------
 function compile_and_run(chunk)
-  print("[lua/ecm1] compile_and_run")
+  print("[lua/ecm1] compile_and_run (FIXED)")
 
   local fw = norm_fw(workload_framework or (chunk.payload and chunk.payload.framework) or chunk.framework or (chunk.meta and chunk.meta.framework) or "cuda")
   if fw ~= "cuda" then
@@ -205,6 +257,7 @@ function compile_and_run(chunk)
   local pass = 0
   local total_ms = 0
   local last_result = nil
+  local total_factors_found = 0
 
   print(string.format("[lua/ecm1] Starting ECM Stage 1 v3: n=%d curves, pp_count=%d", n, pp_count))
 
@@ -244,12 +297,22 @@ function compile_and_run(chunk)
       base_buf = ensure_len(base_buf, bufferSizeBytes)
     end
 
+    -- Check if this is the final pass and analyze results
+    local is_final = (pp_start + this_len >= pp_count)
+    if is_final then
+      local stats = check_results(base_buf, n, outputOffset)
+      print(string.format("[lua/ecm1] Final results: %d factors found, %d no factors, %d bad curves",
+        stats.factors_found, stats.no_factors, stats.bad_curves))
+      total_factors_found = stats.factors_found
+    end
+
     -- Timing and adaptive pp_len (use GPU kernel ms if provided)
     local dt = tonumber(result.ms) or 0
     if dt <= 0 then dt = 100.0 end
     total_ms = total_ms + dt
     pass = pass + 1
 
+    -- Adaptive tuning
     if dt < TARGET_MS/2 and pp_len < 10000 then
       pp_len = math.min(pp_len * 2, 10000)
     elseif dt > TARGET_MS * 1.5 then
@@ -257,22 +320,29 @@ function compile_and_run(chunk)
       pp_len = math.max(scaled, 100)
     end
 
-    print(string.format("[lua/ecm1] pass %d: pp[%d:%d) dt=%.1fms pp_len=%d",
-      pass, pp_start, pp_start + this_len, dt, pp_len))
+    -- Progress reporting
+    local pct = math.floor(100 * (pp_start + this_len) / pp_count)
+    print(string.format("[lua/ecm1] pass %d: pp[%d:%d) dt=%.1fms pp_len=%d (%d%% complete)",
+      pass, pp_start, pp_start + this_len, dt, pp_len, pct))
 
     pp_start = pp_start + this_len
   end
 
-  -- Annotate timings (for C++ client logs)
+  -- Annotate timings and results (for C++ client logs)
   if type(last_result) == "table" then
     last_result.timings = last_result.timings or {}
     last_result.timings.luaPasses = pass
     last_result.timings.luaTotalMs = total_ms
     last_result.timings.wgSize = WG_SIZE
+    last_result.factorsFound = total_factors_found
   end
 
   print(string.format("[lua/ecm1] complete: %d prime powers in ~%.1fms across %d passes", pp_count, total_ms, pass))
+  if total_factors_found > 0 then
+    print(string.format("[lua/ecm1] *** SUCCESS: Found %d factor(s)! ***", total_factors_found))
+  end
+
   return last_result
 end
 
-print("[lua/ecm1] host loaded (resumable CUDA, JS-equivalent behavior)")
+print("[lua/ecm1] host loaded (resumable CUDA, JS-equivalent behavior, FIXED)")
