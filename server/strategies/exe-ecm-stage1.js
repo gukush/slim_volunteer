@@ -64,6 +64,8 @@ export function getClientExecutorInfo({ config = {}, inputArgs = {} } = {}) {
 // but convert each chunk to the exe transport using common protocol.
 export function buildChunker(args) {
   const { taskId, taskDir, K, config, inputArgs, inputFiles } = args;
+  console.log('DEBUG exe-ecm-stage1 buildChunker args:', JSON.stringify(args, null, 2));
+  console.log('DEBUG exe-ecm-stage1 inputArgs:', JSON.stringify(inputArgs, null, 2));
   const webChunker = buildChunkerWeb({ taskId, taskDir, K, config, inputArgs, inputFiles });
 
   function* generator() {
