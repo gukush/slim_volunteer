@@ -352,6 +352,15 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           break;
         }
 
+        // Throttle check BEFORE processing the chunk
+        const pending = task.assignments.size - task.completedChunks;
+        if (pending > MAX_PENDING && !task.cancelRequested) {
+          logger.debug(`Task ${task.id}: Throttling chunk generation (${pending} pending, ${task.queue.length} in queue)`);
+          // Use setImmediate to yield control to other operations (like result processing)
+          await new Promise(resolve => setImmediate(resolve));
+          continue; // Skip this iteration and recheck conditions
+        }
+
         const entry = {
           results: new Map(),
           assignedTo: new Set(),
@@ -369,6 +378,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
             tCreate: entry.tCreate
         });
 
+        logger.debug(`🔧 Created chunk ${chunk.id} - queue size: ${task.queue.length}, assignments: ${task.assignments.size}`);
         // Try to assign immediately
         this._assignChunkReplica(task, chunk.id);
         count++;
@@ -386,15 +396,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         if (batch >= YIELD_INTERVAL) {
           batch = 0;
           await new Promise(resolve => setImmediate(resolve));
-        }
-
-        // Throttle if too many chunks are pending
-        const pending = task.assignments.size - task.completedChunks;
-        if (pending > MAX_PENDING && !task.cancelRequested) {
-          logger.debug(`Task ${task.id}: Throttling chunk generation (${pending} pending, ${task.queue.length} in queue)`);
-          // Use setImmediate to yield control to other operations (like result processing)
-          await new Promise(resolve => setImmediate(resolve));
-          continue; // Skip this iteration and recheck conditions
         }
 
         // Memory pressure check
@@ -473,6 +474,13 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
     if(entry.replicas >= task.K) return;
 
+    // Prevent reassignment of chunks that are already assigned and in progress
+    // This fixes the race condition where chunks get reassigned while being processed
+    if(entry.assignedTo.size > 0 && !entry.completed) {
+      logger.debug(`🚫 Skipping reassignment of chunk ${chunkId} - already assigned to [${Array.from(entry.assignedTo).join(',')}]`);
+      return; // Chunk is already assigned to someone, don't reassign
+    }
+
     // Check if we allow same client multiple replicas (for research/testing)
     const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
 
@@ -550,7 +558,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       }
 
       // Emit chunk assignment with replica ID
-      logger.debug(`📤 Sending chunk ${chunkId} replica ${replica} to client ${c.socket.id} (payload size: ${payloadSize} bytes)`);
+      logger.debug(`📤 Sending chunk ${chunkId} replica ${replica} to client ${c.socket.id} (payload size: ${payloadSize} bytes) - assignedTo: [${Array.from(entry.assignedTo).join(',')}], replicas: ${entry.replicas}/${task.K}`);
       c.socket.emit('chunk:assign', {
         taskId: task.id,
         chunkId,
@@ -631,7 +639,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled, cpuTimeMs, gpuTimeMs });
           entry.completed = true;
           task.completedChunks += 1;
-          logger.debug('Chunk accepted', task.id, chunkId, 'checksum', cs);
+          logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, assignedTo: [${Array.from(entry.assignedTo).join(',')}], replicas: ${entry.replicas}`);
           this._maybeFinish(task.id);
           this._drainTaskQueue(task);
         }catch(e){
@@ -686,7 +694,17 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     task.status = 'canceled';
     task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'canceled');
 
-    // SUsageTracker
+    // Assembler cleanup - close file descriptors and clean up resources
+    try {
+      if(task.assembler && typeof task.assembler.cleanup === 'function') {
+        task.assembler.cleanup();
+        logger.info(`Task ${id}: Assembler cleanup completed`);
+      }
+    } catch(e) {
+      logger.warn(`Task ${id}: Assembler cleanup failed:`, e.message);
+    }
+
+    // OSUsageTracker
     try { task.osTracker?.stop('canceled'); } catch {}
 
     this.tasks.delete(id);
