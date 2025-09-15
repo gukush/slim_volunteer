@@ -188,10 +188,55 @@ function pickInputs(files, N, K, M){
   throw new Error('Need two input files (A.bin and B.bin)');
 }
 
+// Data type helpers for native strategy
+function getDataTypeInfo(datatype) {
+  const type = (datatype || 'f32').toLowerCase();
+  switch (type) {
+    case 'f32':
+    case 'int32':
+      return { elementSize: 4, isPacked: false, packFactor: 1 };
+    case 'f16':
+      return { elementSize: 2, isPacked: false, packFactor: 1 }; // Native fp16, no packing
+    case 'int8':
+      return { elementSize: 1, isPacked: true, packFactor: 4 };
+    default:
+      logger.warn(`Unknown datatype '${type}', using default f32`);
+      return { elementSize: 4, isPacked: false, packFactor: 1 };
+  }
+}
+
+function packData(buffer, datatype) {
+  const typeInfo = getDataTypeInfo(datatype);
+  if (!typeInfo.isPacked) return buffer;
+
+  const view = new Uint8Array(buffer);
+
+  if (typeInfo.elementSize === 1) { // int8 -> pack 4 values per 32-bit word
+    const packedSize = Math.ceil(view.length / 4) * 4;
+    const packed = new Uint8Array(packedSize);
+    const output = new Uint32Array(packed.buffer, packed.byteOffset, packedSize / 4);
+
+    for (let i = 0; i < view.length; i += 4) {
+      const val1 = view[i] || 0;
+      const val2 = view[i + 1] || 0;
+      const val3 = view[i + 2] || 0;
+      const val4 = view[i + 3] || 0;
+      output[i / 4] = val1 | (val2 << 8) | (val3 << 16) | (val4 << 24);
+    }
+
+    return packed.buffer;
+  }
+
+  return buffer;
+}
+
 // ----------------- chunker -----------------
 export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
-  const [Afile, Bfile] = pickInputs(inputFiles, config.N, config.K, config.M);
   const { N, K: KK, M } = config;
+  const datatype = config.datatype || 'f32';
+  const typeInfo = getDataTypeInfo(datatype);
+
+  const [Afile, Bfile] = pickInputs(inputFiles, N, KK, M);
 
   const C = Number(config.chunk_size ?? config.C ?? 16*1024*1024); // ~16MB default
   let baseRows, baseCols, kSpan;
@@ -207,7 +252,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const nIB = Math.ceil(N / baseRows);
   const nJB = Math.ceil(M / baseCols);
   const totalChunks = nIB * nJB * Math.ceil(KK / kSpan);
-  logger.info(`Native chunker: ${nIB}×${nJB}×${Math.ceil(KK/kSpan)} = ${totalChunks.toLocaleString()} chunks`);
+  logger.info(`Native chunker: datatype=${datatype}, elementSize=${typeInfo.elementSize}, isPacked=${typeInfo.isPacked}, ${nIB}×${nJB}×${Math.ceil(KK/kSpan)} = ${totalChunks.toLocaleString()} chunks`);
 
   return {
     async *stream(){
@@ -219,15 +264,27 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
           for(let kb=0; kb<KK; kb += kSpan){
             const kNow = Math.min(kSpan, KK - kb);
 
-            // read tiles
+            // read tiles with correct element size
             const [Ablock, Bblock] = await Promise.all([
-              readWindowAsync(Afile, ib*baseRows, rNow, kb,   kNow, KK, 4),
-              readWindowAsync(Bfile, kb,          kNow, jb*baseCols, cNow, M, 4),
+              readWindowAsync(Afile, ib*baseRows, rNow, kb,   kNow, KK, typeInfo.elementSize),
+              readWindowAsync(Bfile, kb,          kNow, jb*baseCols, cNow, M, typeInfo.elementSize),
             ]);
 
-            const dims = new Int32Array([rNow, kNow, cNow]);
-            const aBase64 = Ablock.toString('base64');
-            const bBase64 = Bblock.toString('base64');
+            // Pack data if needed for non-32bit types
+            const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
+            const bData = packData(Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength), datatype);
+
+            // For int8, we need to adjust dimensions to account for packing
+            let dims;
+            if (datatype === 'int8') {
+              const groupsK = Math.ceil(kNow / 4); // 4 int8 values per 32-bit word
+              dims = new Int32Array([rNow, kNow, cNow, groupsK]);
+            } else {
+              dims = new Int32Array([rNow, kNow, cNow, 0]); // pad to 16B
+            }
+
+            const aBase64 = Buffer.from(aData).toString('base64');
+            const bBase64 = Buffer.from(bData).toString('base64');
             const dBase64 = Buffer.from(dims.buffer).toString('base64');
             const framework = String(config.framework || 'native-opencl').toLowerCase().replace(/^native-/, '');
 
@@ -244,8 +301,26 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             // Add CUDA-specific launch dimensions
             if (framework === 'cuda') {
               const TILE = config.tileSize ?? 16;  // match your CUDA kernel TILE
-              payload.block = [TILE, TILE, 1];
-              payload.grid = [Math.ceil(cNow / TILE), Math.ceil(rNow / TILE), 1];
+
+              // CUDA has a maximum of 1024 threads per block
+              // If TILE^2 > 1024, we need to adjust the block dimensions
+              const maxThreadsPerBlock = 1024;
+              let blockX, blockY;
+
+              if (TILE * TILE <= maxThreadsPerBlock) {
+                // Use square blocks if possible
+                blockX = TILE;
+                blockY = TILE;
+              } else {
+                // Adjust to fit within thread limit
+                // Try to keep blocks as square as possible
+                const maxDim = Math.floor(Math.sqrt(maxThreadsPerBlock));
+                blockX = Math.min(TILE, maxDim);
+                blockY = Math.min(TILE, Math.floor(maxThreadsPerBlock / blockX));
+              }
+
+              payload.block = [blockX, blockY, 1];
+              payload.grid = [Math.ceil(cNow / blockX), Math.ceil(rNow / blockY), 1];
             }
 
             // If you later add a Vulkan path that *requires* a uniform buffer,
