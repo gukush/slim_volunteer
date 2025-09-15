@@ -142,8 +142,53 @@ function pickInputs(files, N, K, M){
   return [Af.path, Bf.path];
 }
 
+// Data type helpers for exe strategy
+function getDataTypeInfo(datatype) {
+  const type = (datatype || 'f32').toLowerCase();
+  switch (type) {
+    case 'f32':
+    case 'int32':
+      return { elementSize: 4, isPacked: false, packFactor: 1 };
+    case 'f16':
+      return { elementSize: 2, isPacked: false, packFactor: 1 }; // Native fp16, no packing
+    case 'int8':
+      return { elementSize: 1, isPacked: true, packFactor: 4 };
+    default:
+      logger.warn(`Unknown datatype '${type}', using default f32`);
+      return { elementSize: 4, isPacked: false, packFactor: 1 };
+  }
+}
+
+function packData(buffer, datatype) {
+  const typeInfo = getDataTypeInfo(datatype);
+  if (!typeInfo.isPacked) return buffer;
+
+  const view = new Uint8Array(buffer);
+
+  if (typeInfo.elementSize === 1) { // int8 -> pack 4 values per 32-bit word
+    const packedSize = Math.ceil(view.length / 4) * 4;
+    const packed = new Uint8Array(packedSize);
+    const output = new Uint32Array(packed.buffer, packed.byteOffset, packedSize / 4);
+
+    for (let i = 0; i < view.length; i += 4) {
+      const val1 = view[i] || 0;
+      const val2 = view[i + 1] || 0;
+      const val3 = view[i + 2] || 0;
+      const val4 = view[i + 3] || 0;
+      output[i / 4] = val1 | (val2 << 8) | (val3 << 16) | (val4 << 24);
+    }
+
+    return packed.buffer;
+  }
+
+  return buffer;
+}
+
 export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const { N, K: KK, M } = config;
+  const datatype = config.datatype || 'f32';
+  const typeInfo = getDataTypeInfo(datatype);
+
   const [Afile, Bfile] = pickInputs(inputFiles, N, KK, M);
   if (!Afile || !Bfile) throw new Error('Need A.bin and B.bin');
 
@@ -151,7 +196,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const backend = (config?.backend || 'opencl').toLowerCase();
   const defaultBins = {
     opencl: 'scripts/native/ocl_block_matmul_chunked',
-    cuda: 'scripts/native/cuda_block_matmul',
+    cuda: 'exe_block_matmul',
     vulkan: 'scripts/native/vk_block_matmul'
   };
   const rel = config.binary || defaultBins[backend];
@@ -186,19 +231,29 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
           const cNow = Math.min(baseCols, M - jb*baseCols);
 
           // C tile accumulator hint for native side (optional)
-          const outputBytes = rNow * cNow * 4;
+          const outputBytes = rNow * cNow * 4; // Always 4 bytes per element for output (int32)
 
           for (let kb = 0; kb < KK; kb += kSpan){
             const kNow = Math.min(kSpan, KK - kb);
 
-            // Use async file reading to prevent event loop blocking
+            // Use async file reading to prevent event loop blocking with correct element size
             const [Ablock, Bblock] = await Promise.all([
-              readWindowAsync(fdA, ib*baseRows, rNow, kb, kNow, KK),
-              readWindowAsync(fdB, kb, kNow, jb*baseCols, cNow, M)
+              readWindowAsync(fdA, ib*baseRows, rNow, kb, kNow, KK, typeInfo.elementSize),
+              readWindowAsync(fdB, kb, kNow, jb*baseCols, cNow, M, typeInfo.elementSize)
             ]);
 
-            // Binary mode: prepare raw binary data for stdin
-            const uniforms = new Int32Array([rNow, kNow, cNow]);
+            // Pack data if needed for non-32bit types
+            const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
+            const bData = packData(Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength), datatype);
+
+            // For int8, we need to adjust dimensions to account for packing
+            let uniforms;
+            if (datatype === 'int8') {
+              const groupsK = Math.ceil(kNow / 4); // 4 int8 values per 32-bit word
+              uniforms = new Int32Array([rNow, kNow, cNow, groupsK]);
+            } else {
+              uniforms = new Int32Array([rNow, kNow, cNow, 0]); // pad to 16B
+            }
             const uniformsBytes = new Uint8Array(uniforms.buffer);
 
             // Payload prepared in strict order: UNIFORMS, then INPUTS, then OUTPUTS (placeholder)
@@ -208,10 +263,13 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               framework: 'exe',
               buffers: [
                 uniformsBytes.buffer.slice(uniformsBytes.byteOffset, uniformsBytes.byteOffset + uniformsBytes.byteLength),  // ArrayBuffer for uniforms
-                Ablock,  // ArrayBuffer for A
-                Bblock   // ArrayBuffer for B
+                aData,  // ArrayBuffer for A (packed if needed)
+                bData   // ArrayBuffer for B (packed if needed)
               ],
-              outputs: [ { byteLength: outputBytes } ]
+              outputs: [ { byteLength: outputBytes } ],
+              datatype: datatype,
+              isPacked: typeInfo.isPacked,
+              packFactor: typeInfo.packFactor,
             };
 
             // Metadata for the native runtime
