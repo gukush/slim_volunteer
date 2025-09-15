@@ -161,6 +161,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     cancelRequested: false, chunkerFinished: false,
     framework: null,
     osTracker: null,
+    queueLock: false, // Simple mutex to prevent concurrent queue modifications
   };
   this.tasks.set(id, task);
   logger.info('Task created', id, strategyId, 'K=', K);
@@ -372,13 +373,25 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         };
 
         task.assignments.set(chunk.id, entry);
-        task.queue.push(chunk.id);
+        
+        // Acquire queue lock to safely add to queue
+        while (task.queueLock) {
+          await new Promise(resolve => setImmediate(resolve)); // Yield to event loop
+        }
+        task.queueLock = true;
+        
+        try {
+          task.queue.push(chunk.id);
+          logger.debug(`🔧 Created chunk ${chunk.id} - queue size: ${task.queue.length}, assignments: ${task.assignments.size}`);
+        } finally {
+          task.queueLock = false;
+        }
+        
         task.timers.chunkRow({
             chunkId: chunk.id, replica: -1,
             tCreate: entry.tCreate
         });
 
-        logger.debug(`🔧 Created chunk ${chunk.id} - queue size: ${task.queue.length}, assignments: ${task.assignments.size}`);
         // Try to assign immediately
         this._assignChunkReplica(task, chunk.id);
         count++;
@@ -449,7 +462,12 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   _assignChunkReplica(task, chunkId){
     let assigned = false;
     const entry = task.assignments.get(chunkId);
-    if(!entry || entry.completed) return;
+    if(!entry || entry.completed) {
+      if(entry && entry.completed) {
+        logger.debug(`🚫 Skipping assignment of completed chunk ${chunkId}`);
+      }
+      return;
+    }
 
     // Check if chunk is stuck (assigned but not completed for too long)
     const now = Date.now();
@@ -576,7 +594,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     return assigned;
   }
 
-  receiveResult(socketId, data){
+  async receiveResult(socketId, data){
     const { taskId, chunkId, replica, status, checksum, result, timings } = data;
     const task = this.tasks.get(taskId);
     if(!task){ logger.warn('Result for unknown task', taskId); return; }
@@ -637,9 +655,33 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           task.assembler.integrate({ chunkId, result: resultData, meta: entry.meta });
           const tAssembled = now();
           task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled, cpuTimeMs, gpuTimeMs });
-          entry.completed = true;
-          task.completedChunks += 1;
-          logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, assignedTo: [${Array.from(entry.assignedTo).join(',')}], replicas: ${entry.replicas}`);
+          // Atomically mark as completed and remove from queue to prevent race conditions
+          // Use simple mutex to prevent concurrent queue modifications
+          while (task.queueLock) {
+            await new Promise(resolve => setImmediate(resolve)); // Yield to event loop
+          }
+          task.queueLock = true;
+          
+          try {
+            entry.completed = true;
+            task.completedChunks += 1;
+            
+            // Immediately remove from queue to prevent any further assignment attempts
+            const queueIndex = task.queue.indexOf(chunkId);
+            if (queueIndex !== -1) {
+              task.queue.splice(queueIndex, 1);
+              logger.debug(`🗑️ Atomically removed completed chunk ${chunkId} from queue (index ${queueIndex})`);
+            }
+            
+            // Clear assignment tracking to ensure no further assignments
+            entry.assignedTo.clear();
+            entry.replicas = 0;
+          } finally {
+            task.queueLock = false;
+          }
+          
+          logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, queue removed, assignments cleared`);
+          
           this._maybeFinish(task.id);
           this._drainTaskQueue(task);
         }catch(e){
@@ -782,10 +824,18 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   _drainTaskQueue(task){
     if(!task || task.status!=='running') return;
 
-    // Check for stuck chunks first
-    const now = Date.now();
-    const stuckTimeout = 10000; // 10 seconds
-    for(const chunkId of task.queue){
+    // Acquire queue lock to prevent concurrent modifications
+    if (task.queueLock) {
+      // If queue is locked, skip this iteration to avoid race conditions
+      return;
+    }
+    task.queueLock = true;
+    
+    try {
+      // Check for stuck chunks first
+      const now = Date.now();
+      const stuckTimeout = 10000; // 10 seconds
+      for(const chunkId of task.queue){
       const entry = task.assignments.get(chunkId);
       if(!entry || entry.completed) continue;
 
@@ -808,14 +858,25 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     }
 
     // Iterate over queued chunks and try to assign replicas
-    for(const chunkId of task.queue){
+    // Make a copy of the queue to avoid issues if queue is modified during iteration
+    const queueCopy = [...task.queue];
+    for(const chunkId of queueCopy){
       const entry = task.assignments.get(chunkId);
-      if(!entry || entry.completed) continue;
+      if(!entry || entry.completed) {
+        // If chunk is no longer in queue or completed, skip it
+        if(!task.queue.includes(chunkId)) {
+          logger.debug(`🚫 Skipping chunk ${chunkId} - no longer in queue`);
+        }
+        continue;
+      }
       // Try to assign as many replicas as needed (up to K)
       while(entry.replicas < task.K){
         const assigned = this._assignChunkReplica(task, chunkId);
         if(!assigned) break; // No capacity right now
       }
+    }
+    } finally {
+      task.queueLock = false;
     }
   }
 }
