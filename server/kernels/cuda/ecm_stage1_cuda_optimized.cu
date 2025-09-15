@@ -430,6 +430,103 @@ __device__ __forceinline__ void save_state(uint32_t curve_idx, const Header& h, 
     io[state_base + 25] = state.curve_ok;
 }
 
+// --------------------------- Montgomery Ladder Functions ---------------------------
+
+// Conditional swap for Montgomery ladder
+__device__ __forceinline__ void cswap(PointXZ& a, PointXZ& b, uint32_t bit) {
+    uint32_t mask = (0u - (bit & 1u));
+    for (uint32_t i = 0; i < 8; i++) {
+        uint32_t tx = ((a.X.limbs[i]) ^ (b.X.limbs[i])) & mask;
+        a.X.limbs[i] ^= tx; b.X.limbs[i] ^= tx;
+        uint32_t tz = ((a.Z.limbs[i]) ^ (b.Z.limbs[i])) & mask;
+        a.Z.limbs[i] ^= tz; b.Z.limbs[i] ^= tz;
+    }
+}
+
+// xDBL: Point doubling for Montgomery curves
+__device__ __forceinline__ PointXZ xDBL(const PointXZ& P, const U256& A24, const U256& N, uint32_t n0inv) {
+    U256 t1, t2, t3, t4, t5, t6, Z_mult, X2, Z2;
+
+    // t1 = P.X + P.Z
+    add(t1, P.X, P.Z);
+    // t2 = P.X - P.Z
+    sub(t2, P.X, P.Z);
+    // t3 = t1^2
+    montgomery_mul(t3, t1, t1, N, n0inv);
+    // t4 = t2^2
+    montgomery_mul(t4, t2, t2, N, n0inv);
+    // t5 = t3 - t4
+    sub(t5, t3, t4);
+    // t6 = A24 * t5
+    montgomery_mul(t6, A24, t5, N, n0inv);
+    // Z_mult = t3 + t6
+    add(Z_mult, t3, t6);
+    // X2 = t3 * t4
+    montgomery_mul(X2, t3, t4, N, n0inv);
+    // Z2 = t5 * Z_mult
+    montgomery_mul(Z2, t5, Z_mult, N, n0inv);
+
+    PointXZ result;
+    result.X = X2;
+    result.Z = Z2;
+    return result;
+}
+
+// xADD: Point addition for Montgomery curves
+__device__ __forceinline__ PointXZ xADD(const PointXZ& P, const PointXZ& Q, const PointXZ& Diff, const U256& N, uint32_t n0inv) {
+    U256 t1, t2, t3, t4, t5, t6, t1n, t2n, X3, Z3;
+
+    // t1 = P.X + P.Z
+    add(t1, P.X, P.Z);
+    // t2 = P.X - P.Z
+    sub(t2, P.X, P.Z);
+    // t3 = Q.X + Q.Z
+    add(t3, Q.X, Q.Z);
+    // t4 = Q.X - Q.Z
+    sub(t4, Q.X, Q.Z);
+    // t5 = t1 * t4
+    montgomery_mul(t5, t1, t4, N, n0inv);
+    // t6 = t2 * t3
+    montgomery_mul(t6, t2, t3, N, n0inv);
+    // t1n = t5 + t6
+    add(t1n, t5, t6);
+    // t2n = t5 - t6
+    sub(t2n, t5, t6);
+    // X3 = t1n^2 * Diff.Z
+    montgomery_mul(X3, t1n, t1n, N, n0inv);
+    montgomery_mul(X3, X3, Diff.Z, N, n0inv);
+    // Z3 = t2n^2 * Diff.X
+    montgomery_mul(Z3, t2n, t2n, N, n0inv);
+    montgomery_mul(Z3, Z3, Diff.X, N, n0inv);
+
+    PointXZ result;
+    result.X = X3;
+    result.Z = Z3;
+    return result;
+}
+
+// Montgomery ladder - the CORRECT function for ECM Stage 1
+__device__ __forceinline__ PointXZ ladder(const PointXZ& P, uint32_t k, const U256& A24, const U256& N, uint32_t n0inv, const U256& mont_one) {
+    PointXZ R0, R1;
+    R0.X = mont_one;
+    set_zero(R0.Z);
+    R1 = P;
+    bool started = false;
+
+    for (int i = 31; i >= 0; i--) {
+        uint32_t bit = (k >> i) & 1u;
+        if (!started && bit == 0u) continue;
+        started = true;
+
+        cswap(R0, R1, 1u - bit);
+        PointXZ T0 = xADD(R0, R1, P, N, n0inv);
+        PointXZ T1 = xDBL(R1, A24, N, n0inv);
+        R0 = T0;
+        R1 = T1;
+    }
+    return R0;
+}
+
 // --------------------------- Main Kernel ---------------------------
 
 __global__ void ecm_stage1_v3_optimized(uint32_t* io) {
@@ -521,7 +618,8 @@ __global__ void ecm_stage1_v3_optimized(uint32_t* io) {
         uint32_t pp = io[pp_off + i];
         if (pp <= 1u) continue;
 
-        point_mul_small(R, R, pp, A24m, N, n0inv32);
+        // Use the CORRECT Montgomery ladder instead of point_mul_small
+        R = ladder(R, pp, A24m, N, n0inv32, mont_one);
     }
 
     // Save state for next pass
