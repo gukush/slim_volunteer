@@ -1,8 +1,8 @@
--- host-distributed-sort-optimized.lua (CUDA-based distributed sorting with GPU buffer optimization)
--- Eliminates CPU-GPU round trips by keeping data on GPU between stages
--- Uses new CUDA executor methods for efficient processing
+-- host-distributed-sort-optimized.lua (CUDA-based distributed sorting with batch optimization)
+-- Reduces CPU-GPU round trips by processing multiple stages per kernel launch
+-- Uses batch processing for significant performance improvement
 
-print("[lua/sort-opt] *** GPU BUFFER OPTIMIZED VERSION LOADED ***")
+print("[lua/sort-opt] *** BATCH OPTIMIZED VERSION LOADED ***")
 
 ----------------------------------------------------------------------
 -- util: normalize framework tag
@@ -159,48 +159,16 @@ local function generate_sort_stages(padded_size)
 end
 
 ----------------------------------------------------------------------
--- Optimized bitonic sort using GPU buffers
+-- Optimized bitonic sort using batch processing
 ----------------------------------------------------------------------
 local function run_optimized_bitonic_sort(stages, initial_data, padded_size, ascending, source, fw)
   local total_gpu_time = 0
   local stage_count = 0
-  local buffer_id = "bitonic_sort_buffer_" .. tostring(os.time())
+  local current_data = initial_data
 
-  print(string.format("[lua/sort-opt] Using GPU buffer: %s", buffer_id))
+  print("[lua/sort-opt] Using batch processing approach for optimal performance")
 
-  -- Step 1: Create GPU buffer and upload initial data
-  local create_task = {
-    action = "create_gpu_buffer",
-    bufferId = buffer_id,
-    size = padded_size * 4
-  }
-
-  local result = executor.run(fw, create_task)
-  if not result.ok then
-    error("[lua/sort-opt] Failed to create GPU buffer: " .. tostring(result.error))
-  end
-
-  -- Step 2: Upload initial data to GPU buffer (only one CPU-GPU transfer!)
-  local upload_task = {
-    action = "compile_and_run",
-    source = source,
-    entry = "upload_to_gpu_buffer",
-    uniforms = { padded_size },
-    inputs = { { b64 = b64encode(initial_data) } },
-    outputSizes = { 0 }, -- No output needed
-    grid = { 1, 1, 1 },
-    block = { 1, 1, 1 },
-    bufferId = buffer_id  -- Special flag for upload
-  }
-
-  result = executor.run(fw, upload_task)
-  if not result.ok then
-    -- Clean up buffer
-    executor.run(fw, { action = "destroy_gpu_buffer", bufferId = buffer_id })
-    error("[lua/sort-opt] Failed to upload data to GPU: " .. tostring(result.error))
-  end
-
-  -- Step 3: Process stages in batches (all on GPU, no CPU-GPU transfers!)
+  -- Process stages in batches to reduce CPU-GPU round trips
   for batch_start = 1, #stages, BATCH_SIZE do
     local batch_end = math.min(batch_start + BATCH_SIZE - 1, #stages)
     local batch_stages = {}
@@ -211,7 +179,7 @@ local function run_optimized_bitonic_sort(stages, initial_data, padded_size, asc
     end
 
     local num_stages = #batch_stages
-    print(string.format("[lua/sort-opt] Processing batch %d-%d (%d stages) on GPU",
+    print(string.format("[lua/sort-opt] Processing batch %d-%d (%d stages)",
                        batch_start, batch_end, num_stages))
 
     -- Create stage data buffer
@@ -230,23 +198,28 @@ local function run_optimized_bitonic_sort(stages, initial_data, padded_size, asc
       stage_data = stage_data .. stage_bytes
     end
 
-    -- Run batch kernel on GPU buffer (no CPU-GPU transfer!)
+    -- Run batch kernel
     local batch_task = {
-      action = "run_kernel_on_gpu_buffer",
-      bufferId = buffer_id,
+      action = "compile_and_run",
       source = source,
       entry = "execute_task_batch",
       uniforms = { padded_size, num_stages, ascending },
+      inputs = {
+        { b64 = b64encode(current_data) },
+        { b64 = b64encode(stage_data) }
+      },
+      outputSizes = { padded_size * 4 },
       grid = { math.ceil(padded_size / WORKGROUP_SIZE), 1, 1 },
       block = { WORKGROUP_SIZE, 1, 1 }
     }
 
-    result = executor.run(fw, batch_task)
+    local result = executor.run(fw, batch_task)
     if not result.ok then
-      -- Clean up buffer
-      executor.run(fw, { action = "destroy_gpu_buffer", bufferId = buffer_id })
       error("[lua/sort-opt] Batch processing failed: " .. tostring(result.error))
     end
+
+    -- Update current data for next batch
+    current_data = b64decode(result.results[1])
 
     -- Track timing
     local dt = tonumber(result.ms) or 0
@@ -257,33 +230,7 @@ local function run_optimized_bitonic_sort(stages, initial_data, padded_size, asc
                        batch_start, batch_end, dt, dt / num_stages))
   end
 
-  -- Step 4: Download final result (only one GPU-CPU transfer!)
-  local download_task = {
-    action = "compile_and_run",
-    source = source,
-    entry = "download_from_gpu_buffer",
-    uniforms = { padded_size },
-    inputs = {},
-    outputSizes = { padded_size * 4 },
-    grid = { 1, 1, 1 },
-    block = { 1, 1, 1 },
-    bufferId = buffer_id  -- Special flag for download
-  }
-
-  result = executor.run(fw, download_task)
-  if not result.ok then
-    -- Clean up buffer
-    executor.run(fw, { action = "destroy_gpu_buffer", bufferId = buffer_id })
-    error("[lua/sort-opt] Failed to download result from GPU: " .. tostring(result.error))
-  end
-
-  -- Step 5: Clean up GPU buffer
-  executor.run(fw, { action = "destroy_gpu_buffer", bufferId = buffer_id })
-
-  -- Decode final result
-  local final_data = b64decode(result.results[1])
-
-  return final_data, total_gpu_time, stage_count
+  return current_data, total_gpu_time, stage_count
 end
 
 ----------------------------------------------------------------------
@@ -350,7 +297,7 @@ function compile_and_run(chunk)
       workgroupSize = WORKGROUP_SIZE,
       batchSize = BATCH_SIZE,
       totalBatches = math.ceil(#stages / BATCH_SIZE),
-      optimization = "gpu_buffer"
+      optimization = "batch_processing"
     }
   }
 
