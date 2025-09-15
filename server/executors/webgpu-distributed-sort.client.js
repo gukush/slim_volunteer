@@ -99,15 +99,21 @@ function createTimingContext(device, capacity = 64) {
       count: capacity,
     });
 
+    // Ensure buffer size is large enough for 256-byte aligned offsets
+    // We need space for the maximum possible aligned offset plus data
+    const maxDataSize = capacity * 8;
+    const maxAlignedOffset = Math.ceil(maxDataSize / 256) * 256;
+    const alignedSize = maxAlignedOffset + maxDataSize;
+
     const resolveBuffer = device.createBuffer({
       label: 'sort-timing-resolve',
-      size: capacity * 8, // 8 bytes per timestamp
+      size: alignedSize,
       usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
     });
 
     const resultBuffer = device.createBuffer({
       label: 'sort-timing-result',
-      size: capacity * 8,
+      size: alignedSize,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
 
