@@ -104,7 +104,7 @@ async function readWindowAsync(fd, rowStart, rowCount, colStart, colCount, rowLe
       });
     });
   }
-  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+  return out;
 }
 
 function pickTileParams({ N, M, K, C }){
@@ -243,8 +243,8 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             ]);
 
             // Pack data if needed for non-32bit types
-            const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
-            const bData = packData(Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength), datatype);
+            const aData = packData(Ablock.buffer, datatype);
+            const bData = packData(Bblock.buffer, datatype);
 
             // For int8, we need to adjust dimensions to account for packing
             let uniforms;
