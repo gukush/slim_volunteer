@@ -99,8 +99,11 @@ function createTimingContext(device, capacity = 64) {
       count: capacity,
     });
 
-    // Ensure buffer size is aligned to 256 bytes for WebGPU requirements
-    const alignedSize = Math.ceil(capacity * 8 / 256) * 256;
+    // Ensure buffer size is large enough for 256-byte aligned offsets
+    // We need space for the maximum possible aligned offset plus data
+    const maxDataSize = capacity * 8;
+    const maxAlignedOffset = Math.ceil(maxDataSize / 256) * 256;
+    const alignedSize = maxAlignedOffset + maxDataSize;
 
     const resolveBuffer = device.createBuffer({
       label: 'sort-timing-resolve',
