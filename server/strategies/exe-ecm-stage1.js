@@ -63,7 +63,8 @@ export function getClientExecutorInfo({ config = {}, inputArgs = {} } = {}) {
 // Build chunks using the *same* IO buffer the WebGPU path expects,
 // but convert each chunk to the exe transport using common protocol.
 export function buildChunker(args) {
-  const webChunker = buildChunkerWeb(args);
+  const { taskId, taskDir, K, config, inputArgs, inputFiles } = args;
+  const webChunker = buildChunkerWeb({ taskId, taskDir, K, config, inputArgs, inputFiles });
 
   function* generator() {
     for (const chunk of webChunker) {
