@@ -11,6 +11,7 @@
 extern "C" {
 
 typedef unsigned int uint32_t;
+typedef unsigned long long uint64_t;
 
 // --------------------------- Types & IO ---------------------------
 struct U256 { uint32_t limbs[8]; };
@@ -138,23 +139,23 @@ __device__ __forceinline__ void montgomery_mul(U256& result, const U256& a, cons
 
     for (uint32_t i = 0; i < LIMBS; i++) {
         uint64_t carry = 0;
-        uint32_t ai = a.limbs[i];
+        const uint32_t ai = a.limbs[i];
 
         // T = T + a[i] * b
         for (uint32_t j = 0; j < LIMBS; j++) {
-            uint64_t prod = (uint64_t)ai * (uint64_t)b.limbs[j] + (uint64_t)T.limbs[j] + carry;
+            const uint64_t prod = (uint64_t)ai * (uint64_t)b.limbs[j] + (uint64_t)T.limbs[j] + carry;
             T.limbs[j] = (uint32_t)(prod & 0xFFFFFFFFu);
             carry = prod >> 32;
         }
         if (i + 1 < LIMBS) T.limbs[i + 1] = (uint32_t)carry;
 
         // m = (T[0] * n0inv) mod 2^32
-        uint32_t m = T.limbs[0] * n0inv;
+        const uint32_t m = T.limbs[0] * n0inv;
 
         // T = T + m * N
         carry = 0;
         for (uint32_t j = 0; j < LIMBS; j++) {
-            uint64_t prod = (uint64_t)m * (uint64_t)N.limbs[j] + (uint64_t)T.limbs[j] + carry;
+            const uint64_t prod = (uint64_t)m * (uint64_t)N.limbs[j] + (uint64_t)T.limbs[j] + carry;
             T.limbs[j] = (uint32_t)(prod & 0xFFFFFFFFu);
             carry = prod >> 32;
         }
@@ -376,23 +377,28 @@ __device__ __forceinline__ void point_add(PointXZ& result, const PointXZ& P, con
 
 __device__ __forceinline__ void point_mul_small(PointXZ& result, const PointXZ& P, uint32_t k, const U256& A24m, const U256& N, uint32_t n0inv) {
     PointXZ R0, R1, temp;
-    copy(R0, P);
-    copy(R1, P);
+    R0.X = P.X;
+    R0.Z = P.Z;
+    R1.X = P.X;
+    R1.Z = P.Z;
     point_dbl(R1, R1, A24m, N, n0inv);
 
     for (int i = 31; i >= 0; i--) {
         if ((k >> i) & 1u) {
             point_add(temp, R0, R1, P, N, n0inv);
             point_dbl(R0, R0, A24m, N, n0inv);
-            copy(R1, temp);
+            R1.X = temp.X;
+            R1.Z = temp.Z;
         } else {
             point_add(temp, R0, R1, P, N, n0inv);
             point_dbl(R1, R1, A24m, N, n0inv);
-            copy(R0, temp);
+            R0.X = temp.X;
+            R0.Z = temp.Z;
         }
     }
 
-    copy(result, R0);
+    result.X = R0.X;
+    result.Z = R0.Z;
 }
 
 // --------------------------- State Management ---------------------------
