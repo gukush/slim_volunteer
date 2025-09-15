@@ -145,6 +145,11 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
   if (!timingCtx.supportsTimestamps) return null;
 
   try {
+    // Calculate aligned offsets for WebGPU requirements (256-byte alignment)
+    const dataOffset = queryStart * 8;
+    const alignedOffset = Math.ceil(dataOffset / 256) * 256;
+    const dataSize = (queryEnd - queryStart + 1) * 8;
+
     // Resolve timestamps to buffer
     const encoder = device.createCommandEncoder({ label: 'sort-timing-resolve' });
     encoder.resolveQuerySet(
@@ -152,27 +157,27 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
       queryStart,
       queryEnd - queryStart + 1,
       timingCtx.resolveBuffer,
-      queryStart * 8
+      alignedOffset
     );
     encoder.copyBufferToBuffer(
       timingCtx.resolveBuffer,
-      queryStart * 8,
+      alignedOffset,
       timingCtx.resultBuffer,
-      queryStart * 8,
-      (queryEnd - queryStart + 1) * 8
+      alignedOffset,
+      dataSize
     );
     device.queue.submit([encoder.finish()]);
 
     // Read back results
     await timingCtx.resultBuffer.mapAsync(
       GPUMapMode.READ,
-      queryStart * 8,
-      (queryEnd - queryStart + 1) * 8
+      alignedOffset,
+      dataSize
     );
 
     const arrayBuffer = timingCtx.resultBuffer.getMappedRange(
-      queryStart * 8,
-      (queryEnd - queryStart + 1) * 8
+      alignedOffset,
+      dataSize
     );
     const timestamps = new BigUint64Array(arrayBuffer);
     const startTime = timestamps[0];
@@ -191,8 +196,20 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
   }
 }
 
-async function getDevice() {
-  if (__WGPU_SORT_CACHE__.device) return __WGPU_SORT_CACHE__.device;
+async function getDevice(forceRecreate = false) {
+  if (__WGPU_SORT_CACHE__.device && !forceRecreate) return __WGPU_SORT_CACHE__.device;
+
+  // Clear cache if force recreating
+  if (forceRecreate) {
+    if (__WGPU_SORT_CACHE__.device) {
+      try { __WGPU_SORT_CACHE__.device.destroy?.(); } catch {}
+    }
+    __WGPU_SORT_CACHE__.device = null;
+    __WGPU_SORT_CACHE__.deviceId = null;
+    __WGPU_SORT_CACHE__.pipelinesByDevice = new WeakMap();
+    __WGPU_SORT_CACHE__.timingByDevice = new WeakMap();
+    console.log('[Sort] Cleared WebGPU cache for device recreation');
+  }
 
   if (!('gpu' in navigator)) throw new Error('WebGPU not available');
   const adapter = await navigator.gpu.requestAdapter();
@@ -301,12 +318,6 @@ export function createExecutor({ kernels, config, inputArgs }) {
     const paddedSize = (payload && payload.paddedSize) ?? (meta?.paddedSize) ?? nextPow2(originalSize);
     const ascending = (payload && 'ascending' in payload) ? !!payload.ascending : !!(meta?.ascending ?? true);
 
-    const dev = await getDevice();
-    const { pipeline, bgl } = getPipeline(dev, kernelCode);
-    const timingCtx = getTimingContext(dev);
-
-    console.log(`Processing chunk: ${originalSize} integers (padded to ${paddedSize}) with device ${__WGPU_SORT_CACHE__.deviceId}`);
-
     // --- Prepare properly padded data ---
     let paddedData;
     const srcArray = new Uint32Array(payloadBuf);
@@ -328,13 +339,36 @@ export function createExecutor({ kernels, config, inputArgs }) {
       paddedData = srcArray;
     }
 
-    // --- Create GPU resources ---
+    // --- Create GPU resources with retry logic ---
     const dataSize = paddedSize * 4; // Size in bytes
-    const dataBuf = dev.createBuffer({
-      label: 'bitonic-sort-data',
-      size: dataSize,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
-    });
+    let dev, pipeline, bgl, timingCtx, dataBuf;
+    let retryCount = 0;
+    const maxRetries = 2;
+
+    while (retryCount <= maxRetries) {
+      try {
+        dev = await getDevice(retryCount > 0); // Force recreate on retry
+        pipeline = getPipeline(dev, kernelCode).pipeline;
+        bgl = getPipeline(dev, kernelCode).bgl;
+        timingCtx = getTimingContext(dev);
+
+        console.log(`Processing chunk: ${originalSize} integers (padded to ${paddedSize}) with device ${__WGPU_SORT_CACHE__.deviceId} (attempt ${retryCount + 1})`);
+
+        dataBuf = dev.createBuffer({
+          label: 'bitonic-sort-data',
+          size: dataSize,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+        });
+        break; // Success, exit retry loop
+      } catch (error) {
+        if (error.message && error.message.includes('max buffer size limit') && retryCount < maxRetries) {
+          console.warn(`[Sort] Buffer size error on attempt ${retryCount + 1}, retrying with fresh device: ${error.message}`);
+          retryCount++;
+          continue;
+        }
+        throw error; // Re-throw if not a buffer size error or max retries exceeded
+      }
+    }
 
     // Upload padded data
     dev.queue.writeBuffer(dataBuf, 0, paddedData);
