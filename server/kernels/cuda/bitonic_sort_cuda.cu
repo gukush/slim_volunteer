@@ -11,7 +11,7 @@ void execute_task(
     const uint32_t stage,         // current k
     const uint32_t substage,      // current j
     const uint32_t ascending,     // 1 for ascending, 0 for descending
-    const uint32_t* __restrict__ data       // data buffer (in-place)
+    uint32_t* __restrict__ data   // data buffer (in-place)
 ) {
 
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -48,7 +48,7 @@ void bitonic_sort_stage(
     const uint32_t stage,         // current k
     const uint32_t substage,      // current j
     const uint32_t ascending,     // 1 for ascending, 0 for descending
-    const uint32_t* __restrict__ data       // data buffer (in-place)
+    uint32_t* __restrict__ data   // data buffer (in-place)
 ) {
 
     const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
