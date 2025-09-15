@@ -55,12 +55,18 @@ function makeArtifact({ type = 'text', name, program, backend, exec = false, byt
 export function getClientExecutorInfo(config, inputArgs) {
   const framework = String(config?.framework || 'native-cuda').toLowerCase();
 
-  // Find the Lua host script
-  const hostCandidates = resolveCandidates('executors/host-distributed-sort.lua');
+  // Find the Lua host script (prefer batch optimized version)
+  const hostCandidates = [
+    ...resolveCandidates('executors/host-distributed-sort-batch.lua'),
+    ...resolveCandidates('executors/host-distributed-sort.lua')
+  ];
   const host = findFirstExisting(hostCandidates);
 
-  // Find the CUDA kernel
-  const cudaCandidates = resolveCandidates('kernels/cuda/bitonic_sort_cuda.cu');
+  // Find the CUDA kernel (prefer batch optimized version)
+  const cudaCandidates = [
+    ...resolveCandidates('kernels/cuda/bitonic_sort_batch.cu'),
+    ...resolveCandidates('kernels/cuda/bitonic_sort_cuda.cu')
+  ];
   const cuda = findFirstExisting(cudaCandidates);
 
   // Optional OpenCL fallback
