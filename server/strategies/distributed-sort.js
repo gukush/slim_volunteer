@@ -20,10 +20,15 @@ export function getClientExecutorInfo(config) {
 
 function readIntegersChunk(fd, offset, count, totalIntegers) {
   const actualCount = Math.min(count, totalIntegers - offset);
-  if (actualCount <= 0) return new Uint32Array(0);
+  if (actualCount <= 0) {
+    logger.debug(`readIntegersChunk: actualCount=${actualCount}, returning empty array`);
+    return new Uint32Array(0);
+  }
 
   const buffer = Buffer.alloc(actualCount * 4);
   const bytesRead = fs.readSync(fd, buffer, 0, actualCount * 4, offset * 4);
+
+  logger.debug(`readIntegersChunk: offset=${offset}, count=${count}, actualCount=${actualCount}, bytesRead=${bytesRead}`);
 
   // Convert to Uint32Array
   const integers = new Uint32Array(buffer.buffer, buffer.byteOffset, actualCount);
@@ -115,18 +120,24 @@ if (!inputFile) {
 const fd = fs.openSync(inputFile, 'r');
 
   const fileStats = fs.fstatSync(fd);
+  logger.info(`Input file: ${inputFile}, size: ${fileStats.size} bytes`);
+
   if (fileStats.size % 4 !== 0) throw new Error(`Input file size (${fileStats.size} bytes) is not a multiple of 4.`);
   let totalIntegers = Math.floor(fileStats.size / 4); // 4 bytes per 32-bit integer
-  
+
+  if (totalIntegers === 0) {
+    throw new Error(`Input file is empty or contains no integers (${fileStats.size} bytes)`);
+  }
+
   // Apply maxElements limit if specified
   if (maxElements && maxElements > 0 && maxElements < totalIntegers) {
     totalIntegers = maxElements;
     logger.info(`Limiting processing to ${maxElements} elements (file contains ${Math.floor(fileStats.size / 4)} elements)`);
   }
-  
+
   const chunksCount = Math.ceil(totalIntegers / chunkSize);
 
-  logger.info(`Distributed sort: ${totalIntegers} integers, ${chunksCount} chunks`);
+  logger.info(`Distributed sort: ${totalIntegers} integers, ${chunksCount} chunks, chunkSize: ${chunkSize}`);
 
   return {
     async *stream() {
@@ -135,7 +146,10 @@ const fd = fs.openSync(inputFile, 'r');
         const actualChunkSize = Math.min(chunkSize, totalIntegers - offset);
         const paddedSize = nextPowerOf2(actualChunkSize); // Pad to power of 2 for bitonic sort
 
+        logger.debug(`Chunk ${chunkIndex}: offset=${offset}, actualChunkSize=${actualChunkSize}, paddedSize=${paddedSize}`);
+
         const integers = readIntegersChunk(fd, offset, actualChunkSize, totalIntegers);
+        logger.debug(`Chunk ${chunkIndex}: read ${integers.length} integers`);
 
         // Pad with max/min values depending on sort direction
         const paddedIntegers = new Uint32Array(paddedSize);
@@ -153,6 +167,8 @@ const fd = fs.openSync(inputFile, 'r');
           paddedSize: paddedSize,
           ascending: ascending
         };
+
+        logger.debug(`Chunk ${chunkIndex}: payload data size=${payload.data.byteLength} bytes`);
 
         const meta = {
           chunkIndex,
