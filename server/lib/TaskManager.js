@@ -97,6 +97,28 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   ensureDir(taskDir);
   const descriptor = { id, label, strategyId, status: 'created', createdAt: now(), K, config, inputArgs, inputFiles: [], cachedFilePaths };
 
+  // Process cachedFilePaths first
+  logger.info(`Processing ${cachedFilePaths.length} cached file paths:`, cachedFilePaths);
+  for (const fileName of cachedFilePaths) {
+    const uploadsDir = path.join(this.storageDir, 'uploads');
+    const filePath = path.join(uploadsDir, fileName);
+
+    logger.info(`Looking for cached file: ${filePath}`);
+    if (fs.existsSync(filePath)) {
+      const stats = fs.statSync(filePath);
+      descriptor.inputFiles.push({
+        path: filePath,
+        originalName: fileName,
+        size: stats.size
+      });
+      logger.info(`Added cached file: ${fileName} (${stats.size} bytes)`);
+    } else {
+      logger.warn(`Cached file not found: ${filePath}`);
+    }
+  }
+  logger.info(`Total inputFiles after processing cachedFilePaths: ${descriptor.inputFiles.length}`);
+
+  // Process regular inputFiles
   for (const f of inputFiles){
     const dest = path.join(taskDir, f.originalName || path.basename(f.path));
 
@@ -313,7 +335,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     let count = 0;
     const BATCH_SIZE = 50;  // Smaller batches for better responsiveness
     const YIELD_INTERVAL = 25; // Yield more frequently
-    const MAX_PENDING = 5000; // Limit pending chunks
+    const MAX_PENDING = 1000; // Limit pending chunks to prevent memory issues
 
     let batch = 0;
     const startTime = Date.now();
@@ -374,11 +396,15 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         }
 
         // Memory pressure check
-        if (count % 1000 === 0) {
+        if (count % 500 === 0) {
           const memUsage = process.memoryUsage();
           const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-          if (heapUsedMB > 2048) { // Over 2GB heap usage
+          if (heapUsedMB > 1024) { // Over 1GB heap usage
             logger.warn(`Task ${task.id}: High memory usage: ${heapUsedMB}MB heap`);
+            // Force garbage collection if available
+            if (global.gc) {
+              global.gc();
+            }
           }
         }
       }
@@ -475,6 +501,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
             ...entry.payload,
             buffers: entry.payload.buffers.map((buf, i) => {
               if (buf instanceof ArrayBuffer) {
+                // CRITICAL: ArrayBuffer serializes to {} in JSON, so convert to base64 immediately
                 const base64 = Buffer.from(buf).toString('base64');
                 return base64;
               } else if (Array.isArray(buf)) {
@@ -484,6 +511,12 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
                   return Buffer.from(uint8Array).toString('base64');
                 }
                 return buf;
+              }
+              // Handle other buffer types (TypedArray views, etc.)
+              if (buf && typeof buf === 'object' && (buf.buffer || buf.byteLength !== undefined)) {
+                // Convert TypedArray or DataView to base64
+                const uint8Array = new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength || buf.length);
+                return Buffer.from(uint8Array).toString('base64');
               }
               return buf;
             })
@@ -497,12 +530,22 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       // Calculate payload size safely for logging
       let payloadSize = 0;
       try {
-        if (serializedPayload && serializedPayload.buffers) {
-          payloadSize = serializedPayload.buffers.reduce((sum, buf) => {
-            if (Array.isArray(buf)) return sum + buf.length;
-            if (typeof buf === 'string') return sum + buf.length;
-            return sum + (buf?.byteLength || 0);
-          }, 0);
+        if (serializedPayload) {
+          if (serializedPayload.buffers) {
+            // Standard format with buffers array
+            payloadSize = serializedPayload.buffers.reduce((sum, buf) => {
+              if (Array.isArray(buf)) return sum + buf.length;
+              if (typeof buf === 'string') return sum + buf.length;
+              return sum + (buf?.byteLength || 0);
+            }, 0);
+          } else if (serializedPayload.data) {
+            // Distributed sort format with data ArrayBuffer
+            payloadSize = serializedPayload.data.byteLength || 0;
+          } else {
+            // Fallback: try to calculate from the entire payload
+            const payloadStr = JSON.stringify(serializedPayload);
+            payloadSize = Buffer.byteLength(payloadStr, 'utf8');
+          }
         }
       } catch (e) {
         payloadSize = -1; // Unable to calculate

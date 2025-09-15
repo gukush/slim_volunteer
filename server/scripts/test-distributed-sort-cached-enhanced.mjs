@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Enhanced cached distributed sort script with multi-framework support
-// Supports: webgpu, cuda (via exe-distributed-sort)
+// Supports: webgpu, cuda, exe, native
 // Can use matrix data (A.bin, B.bin) as input for sorting
+// Backend options: cuda, opencl (for exe and native frameworks)
 
 import fs from 'fs';
 import path from 'path';
@@ -16,7 +17,7 @@ const args = Object.fromEntries(process.argv.slice(2).map(s => {
 }));
 
 const host = args.host || 'https://localhost:3000';
-const framework = args.framework || 'webgpu'; // 'webgpu' | 'cuda'
+const framework = args.framework || 'webgpu'; // 'webgpu' | 'cuda' | 'exe' | 'native'
 const backend = args.backend || 'cuda'; // For CUDA strategy
 const chunkSize = parseInt(args.chunkSize || '65536', 10);
 const ascending = args.descending ? false : true;
@@ -108,8 +109,31 @@ function getStrategyAndConfig(framework, backend, chunkSize, ascending, maxEleme
         }
       };
 
+    case 'exe':
+      return {
+        strategyId: 'exe-distributed-sort',
+        config: {
+          chunkSize,
+          ascending,
+          backend: backend || 'cuda',
+          maxElements
+        }
+      };
+
+    case 'native':
+      return {
+        strategyId: 'native-distributed-sort',
+        config: {
+          chunkSize,
+          ascending,
+          framework: 'native-cuda',
+          backend: backend || 'cuda',
+          maxElements
+        }
+      };
+
     default:
-      throw new Error(`Unsupported framework: ${framework}. Use 'webgpu' or 'cuda'`);
+      throw new Error(`Unsupported framework: ${framework}. Use 'webgpu', 'cuda', 'exe', or 'native'`);
   }
 }
 
@@ -185,7 +209,9 @@ async function runDistributedSort() {
   console.log(`🚀 Running Distributed Sort with ${framework.toUpperCase()}...`);
   console.log(`⚙️  Chunk size: ${chunkSize}, Ascending: ${ascending}`);
   if (maxElements) console.log(`🔢 Max elements: ${maxElements}`);
-  if (framework === 'cuda') console.log(`🎯 Backend: ${backend}`);
+  if (['cuda', 'exe', 'native'].includes(framework.toLowerCase())) {
+    console.log(`🎯 Backend: ${backend}`);
+  }
 
   // Find input file
   const uploadsDir = path.join(__dirname, '..', 'storage', 'uploads');
@@ -337,6 +363,9 @@ async function main() {
   console.log('🎯 Enhanced Cached Distributed Sort Test');
   console.log('=========================================');
   console.log(`Framework: ${framework.toUpperCase()}`);
+  if (['cuda', 'exe', 'native'].includes(framework.toLowerCase())) {
+    console.log(`Backend: ${backend.toUpperCase()}`);
+  }
   console.log(`Host: ${host}`);
   console.log(`Input file: ${cachedFile}`);
   console.log(`Use matrix data: ${useMatrixData}`);
