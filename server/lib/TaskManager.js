@@ -470,22 +470,46 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       // Convert ArrayBuffers to base64 for native clients (unless already in raw format)
       let serializedPayload = entry.payload;
       if (c.clientType === 'native' && entry.payload && entry.payload.buffers) {
-        serializedPayload = {
-          ...entry.payload,
-          buffers: entry.payload.buffers.map((buf, i) => {
-            if (buf instanceof ArrayBuffer) {
-              const base64 = Buffer.from(buf).toString('base64');
-              return base64;
-            } else if (Array.isArray(buf)) {
-              // Already in raw byte array format, keep as is
+        try {
+          serializedPayload = {
+            ...entry.payload,
+            buffers: entry.payload.buffers.map((buf, i) => {
+              if (buf instanceof ArrayBuffer) {
+                const base64 = Buffer.from(buf).toString('base64');
+                return base64;
+              } else if (Array.isArray(buf)) {
+                // Convert large arrays to base64 to avoid JSON.stringify issues
+                if (buf.length > 10000) { // Large arrays should be base64 encoded
+                  const uint8Array = new Uint8Array(buf);
+                  return Buffer.from(uint8Array).toString('base64');
+                }
+                return buf;
+              }
               return buf;
-            }
-            return buf;
-          })
-        };
+            })
+          };
+        } catch (error) {
+          logger.error(`Failed to serialize payload for chunk ${chunkId}: ${error.message}`);
+          throw error;
+        }
+      }
+
+      // Calculate payload size safely for logging
+      let payloadSize = 0;
+      try {
+        if (serializedPayload && serializedPayload.buffers) {
+          payloadSize = serializedPayload.buffers.reduce((sum, buf) => {
+            if (Array.isArray(buf)) return sum + buf.length;
+            if (typeof buf === 'string') return sum + buf.length;
+            return sum + (buf?.byteLength || 0);
+          }, 0);
+        }
+      } catch (e) {
+        payloadSize = -1; // Unable to calculate
       }
 
       // Emit chunk assignment with replica ID
+      logger.debug(`📤 Sending chunk ${chunkId} replica ${replica} to client ${c.socket.id} (payload size: ${payloadSize} bytes)`);
       c.socket.emit('chunk:assign', {
         taskId: task.id,
         chunkId,

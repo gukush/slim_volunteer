@@ -29,15 +29,18 @@ function createTimingContext(device, capacity = 32) {
       count: capacity,
     });
 
+    // Ensure buffer size is aligned to 256 bytes for WebGPU requirements
+    const alignedSize = Math.ceil(capacity * 8 / 256) * 256;
+
     const resolveBuffer = device.createBuffer({
       label: 'matmul-timing-resolve',
-      size: capacity * 8, // 8 bytes per timestamp
+      size: alignedSize,
       usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
     });
 
     const resultBuffer = device.createBuffer({
       label: 'matmul-timing-result',
-      size: capacity * 8,
+      size: alignedSize,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
 
@@ -66,6 +69,11 @@ async function measureGpuTime(device, timingCtx, queryStart, queryEnd) {
   if (!timingCtx.supportsTimestamps) return null;
 
   try {
+    // Calculate aligned offsets for WebGPU requirements (256-byte alignment)
+    const dataOffset = queryStart * 8;
+    const alignedOffset = Math.ceil(dataOffset / 256) * 256;
+    const dataSize = (queryEnd - queryStart + 1) * 8;
+
     // Resolve timestamps to buffer
     const encoder = device.createCommandEncoder({ label: 'matmul-timing-resolve' });
     encoder.resolveQuerySet(
@@ -73,27 +81,27 @@ async function measureGpuTime(device, timingCtx, queryStart, queryEnd) {
       queryStart,
       queryEnd - queryStart + 1,
       timingCtx.resolveBuffer,
-      queryStart * 8
+      alignedOffset
     );
     encoder.copyBufferToBuffer(
       timingCtx.resolveBuffer,
-      queryStart * 8,
+      alignedOffset,
       timingCtx.resultBuffer,
-      queryStart * 8,
-      (queryEnd - queryStart + 1) * 8
+      alignedOffset,
+      dataSize
     );
     device.queue.submit([encoder.finish()]);
 
     // Read back results
     await timingCtx.resultBuffer.mapAsync(
       GPUMapMode.READ,
-      queryStart * 8,
-      (queryEnd - queryStart + 1) * 8
+      alignedOffset,
+      dataSize
     );
 
     const arrayBuffer = timingCtx.resultBuffer.getMappedRange(
-      queryStart * 8,
-      (queryEnd - queryStart + 1) * 8
+      alignedOffset,
+      dataSize
     );
     const timestamps = new BigUint64Array(arrayBuffer);
     const startTime = timestamps[0];

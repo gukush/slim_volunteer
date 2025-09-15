@@ -202,14 +202,14 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             const uniformsBytes = new Uint8Array(uniforms.buffer);
 
             // Payload prepared in strict order: UNIFORMS, then INPUTS, then OUTPUTS (placeholder)
-            // Send as raw binary data, not base64 encoded
+            // Use ArrayBuffers so TaskManager can convert to base64 for WebSocket transmission
             const payload = {
               action: 'exec',
               framework: 'exe',
               buffers: [
-                Array.from(uniformsBytes),  // Raw bytes for uniforms
-                Array.from(new Uint8Array(Ablock)),  // Raw bytes for A
-                Array.from(new Uint8Array(Bblock))   // Raw bytes for B
+                uniformsBytes.buffer.slice(uniformsBytes.byteOffset, uniformsBytes.byteOffset + uniformsBytes.byteLength),  // ArrayBuffer for uniforms
+                Ablock,  // ArrayBuffer for A
+                Bblock   // ArrayBuffer for B
               ],
               outputs: [ { byteLength: outputBytes } ]
             };
