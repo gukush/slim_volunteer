@@ -138,7 +138,7 @@ local CURVE_OUT_WORDS_PER = 8 + 1 + 3  -- result(8) + status(1) + pad(3)
 local STATE_WORDS_PER_CURVE = 8 + 8 + 8 + 2 -- X(8) + Z(8) + A24(8) + (sigma, curve_ok)
 
 -- choose a sane entry name. If your CUDA kernel uses another name, set payload.entry in strategy.
-local DEFAULT_ENTRY_BY_FW = { cuda = "execute_task", opencl = "execute_task", vulkan = "main" }
+local DEFAULT_ENTRY_BY_FW = { cuda = "ecm_stage1_v3_optimized", opencl = "execute_task", vulkan = "main" }
 
 local function get_entry_point(fw, payload)
   if payload and payload.entry and #payload.entry > 0 then return payload.entry end

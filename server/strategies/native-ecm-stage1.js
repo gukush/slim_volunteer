@@ -56,8 +56,9 @@ export function getClientExecutorInfo(config, inputArgs) {
   const hostCandidates = resolveCandidates('executors/host-ecm-stage1.lua');
   const host = findFirstExisting(hostCandidates);
 
-  // Optional kernels (these are just hints; Lua host can also generate or use its own)
-  const ku = findFirstExisting(resolveCandidates('kernels/cuda/ecm_stage1_cuda.cu'));
+  // Optional kernels (prefer optimized version)
+  const ku = findFirstExisting(resolveCandidates('kernels/cuda/ecm_stage1_cuda_optimized.cu')) ||
+             findFirstExisting(resolveCandidates('kernels/cuda/ecm_stage1_cuda.cu'));
   const kl = findFirstExisting(resolveCandidates('kernels/opencl/ecm_stage1_opencl.cl'));
 
   const artifacts = [];
