@@ -101,8 +101,9 @@ function createTimingContext(device, capacity = 64) {
 
     // Ensure buffer size is large enough for 256-byte aligned offsets
     // We need space for the maximum possible aligned offset plus data
-    const maxDataSize = capacity * 8;
-    const maxAlignedOffset = Math.ceil(maxDataSize / 256) * 256;
+    // For worst case: all queries at maximum offset
+    const maxDataSize = capacity * 8; // 8 bytes per timestamp
+    const maxAlignedOffset = Math.ceil((capacity - 1) * 8 / 256) * 256; // Worst case offset
     const alignedSize = maxAlignedOffset + maxDataSize;
 
     const resolveBuffer = device.createBuffer({
@@ -155,6 +156,16 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
     const dataOffset = queryStart * 8;
     const alignedOffset = Math.ceil(dataOffset / 256) * 256;
     const dataSize = (queryEnd - queryStart + 1) * 8;
+
+    // Debug logging
+    console.log(`[Sort] Timing: queryStart=${queryStart}, queryEnd=${queryEnd}, dataOffset=${dataOffset}, alignedOffset=${alignedOffset}, dataSize=${dataSize}`);
+    console.log(`[Sort] Buffer sizes: resolve=${timingCtx.resolveBuffer.size}, result=${timingCtx.resultBuffer.size}`);
+
+    // Check if we have enough space
+    if (alignedOffset + dataSize > timingCtx.resolveBuffer.size) {
+      console.error(`[Sort] Buffer too small: need ${alignedOffset + dataSize} bytes, have ${timingCtx.resolveBuffer.size} bytes`);
+      return null;
+    }
 
     // Resolve timestamps to buffer
     const encoder = device.createCommandEncoder({ label: 'sort-timing-resolve' });
