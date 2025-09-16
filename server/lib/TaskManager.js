@@ -483,6 +483,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       return false;
     }
 
+    let assigned = false; // Track if we successfully assigned this chunk
+
     // Check if chunk is stuck (assigned but not completed for too long)
     const now = Date.now();
     const stuckTimeout = 30000; // 30 seconds
