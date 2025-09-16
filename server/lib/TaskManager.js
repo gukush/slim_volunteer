@@ -473,6 +473,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   }
 
   _assignChunkReplica(task, chunkId){
+    let assigned = false;
+
     // First check if chunk is completed or doesn't exist
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) {
