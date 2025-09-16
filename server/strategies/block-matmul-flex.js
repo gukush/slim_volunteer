@@ -335,26 +335,29 @@ export function buildAssembler({ taskId, taskDir, config }){
 // Kill-switch support: Calculate total chunks deterministically
 export function getTotalChunks(config, inputArgs) {
   const { N, M, K } = config;
-  const { tileSize = 256 } = config;
 
-  const { rows: baseRows, cols: baseCols, kTileSize: kSpan } = pickTileParams({
-    N, M, K,
-    C: tileSize,
-    outFrac: 1/3,
-    align: 32
-  });
+  // Use the same logic as buildChunker to determine tile parameters
+  const C = Number(config.chunk_size ?? config.C);
+  let baseRows, baseCols, kSpan;
+  if (config.tileSize || config.kTileSize){
+    const ts = Math.max(1, Number(config.tileSize || 256));
+    const ks = Math.max(1, Number(config.kTileSize || Math.min(K, ts)));
+    baseRows = ts; baseCols = ts; kSpan = Math.min(ks, K);
+  } else {
+    const pick = pickTileParams({ N, M, K, C: C || 8*1024*1024 });
+    baseRows = pick.rows; baseCols = pick.cols; kSpan = pick.kTileSize;
+  }
 
   const nIB = Math.ceil(N / baseRows);
   const nJB = Math.ceil(M / baseCols);
-  const KK = K;
 
   // Calculate k iterations (same logic as in buildChunker)
   let kIterations = 0;
-  for (let kb = 0; kb < KK; kb += kSpan) {
+  for (let kb = 0; kb < K; kb += kSpan) {
     kIterations++;
   }
 
   const totalChunks = nIB * nJB * kIterations;
-  logger.info(`Block-matmul-flex getTotalChunks: N=${N}, M=${M}, K=${K}, tileSize=${tileSize} -> ${totalChunks} chunks`);
+  logger.info(`Block-matmul-flex getTotalChunks: N=${N}, M=${M}, K=${K}, tileSize=${baseRows}, kSpan=${kSpan} -> ${totalChunks} chunks`);
   return totalChunks;
 }
