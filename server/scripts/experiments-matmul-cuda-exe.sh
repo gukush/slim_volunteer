@@ -8,10 +8,11 @@ SCRIPT="/app/scripts/test-block-matmul-cached-enhanced.mjs"
 
 # Configs: N:tileSize  (K=M=N)
 CONFIGS=(
-  "10240:1024"
-  "10240:1536"
   "10240:2048"
-  "10240:512"
+  "10240:1536"
+  "10240:3072"
+  "10240:4096"
+  "10240:1024"
 )
 
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
