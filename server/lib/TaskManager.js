@@ -182,17 +182,18 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       task.status = 'running';
       task.startTime = now();
 
-      // Set completion threshold for kill-switch mechanism
-      try {
-        if (typeof task.strategy.getTotalChunks === 'function') {
-          task.completionThreshold = task.strategy.getTotalChunks(task.descriptor.config, task.descriptor.inputArgs);
-          logger.info(`Task ${task.id}: Kill-switch threshold set to ${task.completionThreshold} chunks`);
-        } else {
-          logger.warn(`Task ${task.id}: Strategy ${task.strategy.id} does not provide getTotalChunks() method - no kill-switch protection`);
-        }
-      } catch (e) {
-        logger.warn(`Task ${task.id}: Failed to calculate completion threshold:`, e.message);
-      }
+           // Set completion threshold for kill-switch mechanism
+           try {
+             if (typeof task.strategy.getTotalChunks === 'function') {
+               task.completionThreshold = task.strategy.getTotalChunks(task.descriptor.config, task.descriptor.inputArgs);
+               logger.info(`Task ${task.id}: Kill-switch threshold set to ${task.completionThreshold} chunks`);
+               logger.info(`Task ${task.id}: Config used for threshold calculation:`, JSON.stringify(task.descriptor.config, null, 2));
+             } else {
+               logger.warn(`Task ${task.id}: Strategy ${task.strategy.id} does not provide getTotalChunks() method - no kill-switch protection`);
+             }
+           } catch (e) {
+             logger.warn(`Task ${task.id}: Failed to calculate completion threshold:`, e.message);
+           }
 
       // Send metrics:start message to listeners immediately when task starts
       this.sendMetricsToListeners('metrics:start', { taskId: task.id });
@@ -473,8 +474,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   }
 
   _assignChunkReplica(task, chunkId){
-    let assigned = false;
-
     // First check if chunk is completed or doesn't exist
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) {
@@ -698,41 +697,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
           logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, queue removed, assignments cleared`);
 
-          // KILL-SWITCH: Check if we've reached the completion threshold
-          if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
-            logger.warn(`🚨 KILL-SWITCH ACTIVATED: Task ${task.id} reached completion threshold (${task.completedChunks}/${task.completionThreshold}) - forcing completion`);
-
-            // Force task completion immediately
-            task.status = 'completed';
-            task.endTime = now();
-            task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
-
-            // Clean up resources
-            try {
-              if(task.assembler && typeof task.assembler.cleanup === 'function') {
-                task.assembler.cleanup();
-                logger.info(`Task ${task.id}: Assembler cleanup completed (kill-switch)`);
-              }
-            } catch(e) {
-              logger.warn(`Task ${task.id}: Assembler cleanup failed (kill-switch):`, e.message);
-            }
-
-            // OSUsageTracker
-            try { task.osTracker?.stop('completed'); } catch {}
-
-            // Send metrics:stop message
-            this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true });
-            logger.info(`Task ${task.id}: Sent metrics:stop to listener (kill-switch activated)`);
-
-            // Clean up output files if requested
-            if (task.descriptor.config?.cleanupOutputFiles === true) {
-              this._cleanupOutputFiles(task, { killSwitch: true });
-            }
-
-            logger.warn(`🚨 Task ${task.id} COMPLETED BY KILL-SWITCH - no more chunks will be processed`);
-            return; // Exit early, don't process any more chunks
-          }
-
           this._maybeFinish(task.id);
           this._drainTaskQueue(task);
         }catch(e){
@@ -740,6 +704,44 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         }
         return;
       }
+    }
+
+    // KILL-SWITCH: Check if we've reached the completion threshold (moved outside replica check)
+    // Debug logging for kill-switch
+    logger.debug(`🔍 Kill-switch check: completedChunks=${task.completedChunks}, threshold=${task.completionThreshold}`);
+
+    if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
+      logger.warn(`🚨 KILL-SWITCH ACTIVATED: Task ${task.id} reached completion threshold (${task.completedChunks}/${task.completionThreshold}) - forcing completion`);
+
+      // Force task completion immediately
+      task.status = 'completed';
+      task.endTime = now();
+      task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
+
+      // Clean up resources
+      try {
+        if(task.assembler && typeof task.assembler.cleanup === 'function') {
+          task.assembler.cleanup();
+          logger.info(`Task ${task.id}: Assembler cleanup completed (kill-switch)`);
+        }
+      } catch(e) {
+        logger.warn(`Task ${task.id}: Assembler cleanup failed (kill-switch):`, e.message);
+      }
+
+      // OSUsageTracker
+      try { task.osTracker?.stop('completed'); } catch {}
+
+      // Send metrics:stop message
+      this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true });
+      logger.info(`Task ${task.id}: Sent metrics:stop to listener (kill-switch activated)`);
+
+      // Clean up output files if requested
+      if (task.descriptor.config?.cleanupOutputFiles === true) {
+        this._cleanupOutputFiles(task, { killSwitch: true });
+      }
+
+      logger.warn(`🚨 Task ${task.id} COMPLETED BY KILL-SWITCH - no more chunks will be processed`);
+      return; // Exit early, don't process any more chunks
     }
   }
 
