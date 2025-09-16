@@ -89,6 +89,19 @@ export class TaskManager{
     }
   }
 
+  _finishByKillSwitch(task){
+    if (!task || task.status === 'completed' || task.status === 'assembling' || task.status === 'error') return;
+    task.cancelRequested = true;                 // stop chunking/scheduling ASAP
+    task.status = 'completed';
+    task.endTime = now();
+    task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
+    try { task.assembler?.cleanup?.(); } catch {}
+    try { task.osTracker?.stop('completed'); } catch {}
+    this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true });
+    if (task.descriptor.config?.cleanupOutputFiles) this._cleanupOutputFiles(task, { killSwitch: true });
+    this.io.emit('task:done', { taskId: task.id, killSwitch: true });
+  }
+
 
 createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[], cachedFilePaths=[]}){
   const strategy = getStrategy(strategyId);
@@ -369,11 +382,10 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
         // Throttle check BEFORE processing the chunk
         const pending = task.assignments.size - task.completedChunks;
-        if (pending > MAX_PENDING && !task.cancelRequested) {
+        while ((task.assignments.size - task.completedChunks) > MAX_PENDING && !task.cancelRequested) {
           logger.debug(`Task ${task.id}: Throttling chunk generation (${pending} pending, ${task.queue.length} in queue)`);
           // Use setImmediate to yield control to other operations (like result processing)
-          await new Promise(resolve => setImmediate(resolve));
-          continue; // Skip this iteration and recheck conditions
+          await new Promise(r => setTimeout(r, 5)); // Skip this iteration
         }
 
         const entry = {
@@ -384,6 +396,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           payload: chunk.payload,
           meta: chunk.meta || {},
           tCreate: chunk.tCreate || now(),
+          lastAssignedAt: 0,
+          reassigns: 0,
         };
 
         task.assignments.set(chunk.id, entry);
@@ -474,6 +488,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   }
 
   _assignChunkReplica(task, chunkId){
+    if (!task || task.status !== 'running' || task.cancelRequested) return false;
     // First check if chunk is completed or doesn't exist
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) {
@@ -532,6 +547,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       c.inFlight = (c.inFlight||0) + 1;
       c.tasks.add(task.id);
       assigned = true;
+      entry.lastAssignedAt = Date.now();
 
 
       // Convert ArrayBuffers to base64 for native clients (unless already in raw format)
@@ -617,7 +633,10 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     if(!task){ logger.warn('Result for unknown task', taskId); return; }
     const entry = task.assignments.get(chunkId);
     if(!entry){ logger.warn('Result for unknown chunk', chunkId); return; }
-
+    if (entry.completed) {
+      logger.debug(`Dropping late result for completed chunk ${chunkId} (replica ${replica})`);
+      return;
+    }
     const tServerRecv = now();
     const client = this.clients.get(socketId);
     if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
@@ -682,7 +701,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           try {
             entry.completed = true;
             task.completedChunks += 1;
-
+            entry.results.clear();
             // Immediately remove from queue to prevent any further assignment attempts
             const queueIndex = task.queue.indexOf(chunkId);
             if (queueIndex !== -1) {
@@ -698,7 +717,12 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           }
 
           logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, queue removed, assignments cleared`);
-
+          // KILL-SWITCH: evaluate immediately after counting a completion
+          if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
+            logger.warn(`🚨 KILL-SWITCH: Task ${task.id} reached ${task.completedChunks}/${task.completionThreshold}`);
+            this._finishByKillSwitch(task);   // helper below
+            return;
+          }
           this._maybeFinish(task.id);
           this._drainTaskQueue(task);
         }catch(e){
@@ -712,6 +736,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     // Debug logging for kill-switch
     logger.debug(`🔍 Kill-switch check: completedChunks=${task.completedChunks}, threshold=${task.completionThreshold}`);
 
+    /*
     if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
       logger.warn(`🚨 KILL-SWITCH ACTIVATED: Task ${task.id} reached completion threshold (${task.completedChunks}/${task.completionThreshold}) - forcing completion`);
 
@@ -745,6 +770,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       logger.warn(`🚨 Task ${task.id} COMPLETED BY KILL-SWITCH - no more chunks will be processed`);
       return; // Exit early, don't process any more chunks
     }
+    */
   }
 
   _maybeFinish(taskId){
@@ -912,7 +938,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
         // Check if chunk is stuck (assigned but not completed for too long)
         if(entry.replicas >= task.K && !entry.completed) {
-          const timeSinceAssignment = now - (entry.tCreate || now);
+          const last = entry.lastAssignedAt || entry.tCreate || now;
+          const timeSinceAssignment = now - last;
           if(timeSinceAssignment > stuckTimeout) {
             logger.debug(`🔄 Resetting stuck chunk ${chunkId} in drainQueue after ${timeSinceAssignment}ms`);
             // Reset client inFlight counts first
