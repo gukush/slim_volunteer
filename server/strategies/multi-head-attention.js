@@ -296,6 +296,27 @@ export function buildAssembler({ taskId, taskDir, config }) {
         receivedHeads: receivedHeads.length,
         outputShape: [seq_len, d_model]
       };
+    },
+
+    cleanup() {
+      try {
+        fs.closeSync(fdOut);
+        headResults.clear();
+        logger.info(`Multi-head-attention assembler cleanup: closed output file descriptor and cleared memory`);
+      } catch (e) {
+        logger.warn(`Multi-head-attention assembler cleanup failed:`, e.message);
+      }
     }
   };
+}
+
+// Kill-switch support: Calculate total chunks deterministically
+export function getTotalChunks(config, inputArgs) {
+  const { num_heads } = config;
+
+  // Multi-head attention has exactly one chunk per head
+  const totalChunks = num_heads;
+
+  logger.info(`Multi-head-attention getTotalChunks: num_heads=${num_heads} -> ${totalChunks} chunks`);
+  return totalChunks;
 }

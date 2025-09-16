@@ -158,6 +158,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     status: 'created', startTime: null, endTime: null, K,
     queue: [], assignments: new Map(),
     totalChunks: null, completedChunks: 0,
+    completionThreshold: null, // Kill-switch threshold for deterministic completion
     cancelRequested: false, chunkerFinished: false,
     framework: null,
     osTracker: null,
@@ -180,6 +181,18 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     try {
       task.status = 'running';
       task.startTime = now();
+
+      // Set completion threshold for kill-switch mechanism
+      try {
+        if (typeof task.strategy.getTotalChunks === 'function') {
+          task.completionThreshold = task.strategy.getTotalChunks(task.descriptor.config, task.descriptor.inputArgs);
+          logger.info(`Task ${task.id}: Kill-switch threshold set to ${task.completionThreshold} chunks`);
+        } else {
+          logger.warn(`Task ${task.id}: Strategy ${task.strategy.id} does not provide getTotalChunks() method - no kill-switch protection`);
+        }
+      } catch (e) {
+        logger.warn(`Task ${task.id}: Failed to calculate completion threshold:`, e.message);
+      }
 
       // Send metrics:start message to listeners immediately when task starts
       this.sendMetricsToListeners('metrics:start', { taskId: task.id });
@@ -373,20 +386,20 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         };
 
         task.assignments.set(chunk.id, entry);
-        
+
         // Acquire queue lock to safely add to queue
         while (task.queueLock) {
           await new Promise(resolve => setImmediate(resolve)); // Yield to event loop
         }
         task.queueLock = true;
-        
+
         try {
           task.queue.push(chunk.id);
           logger.debug(`🔧 Created chunk ${chunk.id} - queue size: ${task.queue.length}, assignments: ${task.assignments.size}`);
         } finally {
           task.queueLock = false;
         }
-        
+
         task.timers.chunkRow({
             chunkId: chunk.id, replica: -1,
             tCreate: entry.tCreate
@@ -460,13 +473,13 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   }
 
   _assignChunkReplica(task, chunkId){
-    let assigned = false;
+    // First check if chunk is completed or doesn't exist
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) {
       if(entry && entry.completed) {
         logger.debug(`🚫 Skipping assignment of completed chunk ${chunkId}`);
       }
-      return;
+      return false;
     }
 
     // Check if chunk is stuck (assigned but not completed for too long)
@@ -475,6 +488,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     if(entry.replicas >= task.K && !entry.completed) {
       const timeSinceAssignment = now - (entry.tCreate || now);
       if(timeSinceAssignment > stuckTimeout) {
+        logger.debug(`🔄 Resetting stuck chunk ${chunkId} after ${timeSinceAssignment}ms`);
         // Reset client inFlight counts first
         for(const clientId of entry.assignedTo) {
           const client = this.clients.get(clientId);
@@ -486,17 +500,17 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         entry.replicas = 0;
         entry.assignedTo.clear();
       } else {
-        return; // Chunk is assigned but not stuck yet
+        return false; // Chunk is assigned but not stuck yet
       }
     }
 
-    if(entry.replicas >= task.K) return;
+    if(entry.replicas >= task.K) return false;
 
     // Prevent reassignment of chunks that are already assigned and in progress
     // This fixes the race condition where chunks get reassigned while being processed
     if(entry.assignedTo.size > 0 && !entry.completed) {
       logger.debug(`🚫 Skipping reassignment of chunk ${chunkId} - already assigned to [${Array.from(entry.assignedTo).join(',')}]`);
-      return; // Chunk is already assigned to someone, don't reassign
+      return false; // Chunk is already assigned to someone, don't reassign
     }
 
     // Check if we allow same client multiple replicas (for research/testing)
@@ -661,27 +675,62 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
             await new Promise(resolve => setImmediate(resolve)); // Yield to event loop
           }
           task.queueLock = true;
-          
+
           try {
             entry.completed = true;
             task.completedChunks += 1;
-            
+
             // Immediately remove from queue to prevent any further assignment attempts
             const queueIndex = task.queue.indexOf(chunkId);
             if (queueIndex !== -1) {
               task.queue.splice(queueIndex, 1);
               logger.debug(`🗑️ Atomically removed completed chunk ${chunkId} from queue (index ${queueIndex})`);
             }
-            
+
             // Clear assignment tracking to ensure no further assignments
             entry.assignedTo.clear();
             entry.replicas = 0;
           } finally {
             task.queueLock = false;
           }
-          
+
           logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, queue removed, assignments cleared`);
-          
+
+          // KILL-SWITCH: Check if we've reached the completion threshold
+          if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
+            logger.warn(`🚨 KILL-SWITCH ACTIVATED: Task ${task.id} reached completion threshold (${task.completedChunks}/${task.completionThreshold}) - forcing completion`);
+
+            // Force task completion immediately
+            task.status = 'completed';
+            task.endTime = now();
+            task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
+
+            // Clean up resources
+            try {
+              if(task.assembler && typeof task.assembler.cleanup === 'function') {
+                task.assembler.cleanup();
+                logger.info(`Task ${task.id}: Assembler cleanup completed (kill-switch)`);
+              }
+            } catch(e) {
+              logger.warn(`Task ${task.id}: Assembler cleanup failed (kill-switch):`, e.message);
+            }
+
+            // OSUsageTracker
+            try { task.osTracker?.stop('completed'); } catch {}
+
+            // Send metrics:stop message
+            this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true });
+            logger.info(`Task ${task.id}: Sent metrics:stop to listener (kill-switch activated)`);
+
+            // Clean up output files if requested
+            if (task.descriptor.config?.cleanupOutputFiles === true) {
+              this._cleanupOutputFiles(task, { killSwitch: true });
+            }
+
+            logger.warn(`🚨 Task ${task.id} COMPLETED BY KILL-SWITCH - no more chunks will be processed`);
+            return; // Exit early, don't process any more chunks
+          }
+
           this._maybeFinish(task.id);
           this._drainTaskQueue(task);
         }catch(e){
@@ -830,51 +879,66 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       return;
     }
     task.queueLock = true;
-    
+
     try {
-      // Check for stuck chunks first
+      // First, clean up the queue by removing completed chunks
+      // This is critical to prevent processing of already completed chunks
+      const originalQueueLength = task.queue.length;
+      task.queue = task.queue.filter(chunkId => {
+        const entry = task.assignments.get(chunkId);
+        if (!entry || entry.completed) {
+          logger.debug(`🧹 Removing completed/missing chunk ${chunkId} from queue`);
+          return false;
+        }
+        return true;
+      });
+
+      if (task.queue.length !== originalQueueLength) {
+        logger.debug(`🧹 Queue cleanup: removed ${originalQueueLength - task.queue.length} completed chunks, ${task.queue.length} remaining`);
+      }
+
+      // Check for stuck chunks
       const now = Date.now();
       const stuckTimeout = 10000; // 10 seconds
       for(const chunkId of task.queue){
-      const entry = task.assignments.get(chunkId);
-      if(!entry || entry.completed) continue;
+        const entry = task.assignments.get(chunkId);
+        if(!entry || entry.completed) continue;
 
-      // Check if chunk is stuck (assigned but not completed for too long)
-      if(entry.replicas >= task.K && !entry.completed) {
-        const timeSinceAssignment = now - (entry.tCreate || now);
-        if(timeSinceAssignment > stuckTimeout) {
-          // Reset client inFlight counts first
-          for(const clientId of entry.assignedTo) {
-            const client = this.clients.get(clientId);
-            if(client) {
-              client.inFlight = Math.max(0, (client.inFlight || 0) - 1);
+        // Check if chunk is stuck (assigned but not completed for too long)
+        if(entry.replicas >= task.K && !entry.completed) {
+          const timeSinceAssignment = now - (entry.tCreate || now);
+          if(timeSinceAssignment > stuckTimeout) {
+            logger.debug(`🔄 Resetting stuck chunk ${chunkId} in drainQueue after ${timeSinceAssignment}ms`);
+            // Reset client inFlight counts first
+            for(const clientId of entry.assignedTo) {
+              const client = this.clients.get(clientId);
+              if(client) {
+                client.inFlight = Math.max(0, (client.inFlight || 0) - 1);
+              }
             }
+            // Reset the chunk assignment
+            entry.replicas = 0;
+            entry.assignedTo.clear();
           }
-          // Reset the chunk assignment
-          entry.replicas = 0;
-          entry.assignedTo.clear();
         }
       }
-    }
 
-    // Iterate over queued chunks and try to assign replicas
-    // Make a copy of the queue to avoid issues if queue is modified during iteration
-    const queueCopy = [...task.queue];
-    for(const chunkId of queueCopy){
-      const entry = task.assignments.get(chunkId);
-      if(!entry || entry.completed) {
-        // If chunk is no longer in queue or completed, skip it
-        if(!task.queue.includes(chunkId)) {
-          logger.debug(`🚫 Skipping chunk ${chunkId} - no longer in queue`);
+      // Iterate over queued chunks and try to assign replicas
+      // Make a copy of the queue to avoid issues if queue is modified during iteration
+      const queueCopy = [...task.queue];
+      for(const chunkId of queueCopy){
+        const entry = task.assignments.get(chunkId);
+        if(!entry || entry.completed) {
+          // This should not happen after cleanup, but just in case
+          logger.debug(`🚫 Skipping chunk ${chunkId} - missing or completed after cleanup`);
+          continue;
         }
-        continue;
+        // Try to assign as many replicas as needed (up to K)
+        while(entry.replicas < task.K){
+          const assigned = this._assignChunkReplica(task, chunkId);
+          if(!assigned) break; // No capacity right now
+        }
       }
-      // Try to assign as many replicas as needed (up to K)
-      while(entry.replicas < task.K){
-        const assigned = this._assignChunkReplica(task, chunkId);
-        if(!assigned) break; // No capacity right now
-      }
-    }
     } finally {
       task.queueLock = false;
     }

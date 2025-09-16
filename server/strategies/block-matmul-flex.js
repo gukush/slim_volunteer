@@ -37,7 +37,50 @@ export function getClientExecutorInfo(config){
   throw new Error('Unsupported framework in config.framework: '+fw);
 }
 
-// ---------- Helpers ----------
+// ---------- Data type helpers ----------
+function getDataTypeInfo(datatype) {
+  const type = (datatype || 'f32').toLowerCase();
+  switch (type) {
+    case 'f32':
+    case 'int32':
+      return { elementSize: 4, isPacked: false, packFactor: 1 };
+    case 'f16':
+      return { elementSize: 2, isPacked: true, packFactor: 2 };
+    case 'int8':
+      return { elementSize: 1, isPacked: true, packFactor: 4 };
+    default:
+      logger.warn(`Unknown datatype '${type}', using default f32`);
+      return { elementSize: 4, isPacked: false, packFactor: 1 };
+  }
+}
+
+function packData(buffer, datatype) {
+  const typeInfo = getDataTypeInfo(datatype);
+  if (!typeInfo.isPacked) return buffer;
+
+  const view = new Uint8Array(buffer);
+
+  if (typeInfo.elementSize === 2) { // fp16 -> no packing needed, kernels use native fp16
+    return buffer;
+  } else if (typeInfo.elementSize === 1) { // int8 -> pack 4 values per 32-bit word
+    const packedSize = Math.ceil(view.length / 4) * 4; // Always pack into 32-bit words
+    const packed = new Uint8Array(packedSize);
+    const output = new Uint32Array(packed.buffer, packed.byteOffset, packedSize / 4);
+
+    for (let i = 0; i < view.length; i += 4) {
+      const val1 = view[i] || 0;
+      const val2 = view[i + 1] || 0;
+      const val3 = view[i + 2] || 0;
+      const val4 = view[i + 3] || 0;
+      output[i / 4] = val1 | (val2 << 8) | (val3 << 16) | (val4 << 24);
+    }
+
+    return packed.buffer;
+  }
+
+  return buffer;
+}
+
 function toF32(x){
   if (x instanceof ArrayBuffer) return new Float32Array(x);
   if (ArrayBuffer.isView(x)) return new Float32Array(x.buffer, x.byteOffset, Math.floor(x.byteLength / 4));
@@ -89,7 +132,7 @@ function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }){
 
 // ---------- Chunker (depth-tiling over K, payload bounded by chunk_size) ----------
 export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
-    function pickInputs(files, N, K, M){
+    function pickInputs(files, N, K, M, elementSize){
     if (!files || files.length < 2) throw new Error('No input files provided (either upload files or use cachedFilePaths)');
 
     const nameOf = f => f.originalName || (f.path ? path.basename(f.path) : '');
@@ -100,10 +143,10 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
     let Bf = files.find(endsWithB);
     if (Af && Bf) return [Af.path, Bf.path];
 
-    // Size-based fallback: choose closest to expected bytes N*K*4 and K*M*4
+    // Size-based fallback: choose closest to expected bytes N*K*elementSize and K*M*elementSize
     const withSize = files.map(f => ({ ...f, size: f.size ?? (f.path ? fs.statSync(f.path).size : 0) }));
-    const targetA = BigInt(N) * BigInt(K) * 4n;
-    const targetB = BigInt(K) * BigInt(M) * 4n;
+    const targetA = BigInt(N) * BigInt(K) * BigInt(elementSize);
+    const targetB = BigInt(K) * BigInt(M) * BigInt(elementSize);
     const closest = target => withSize.reduce((best, cur) => {
       const s = BigInt(cur.size);
       const d = s > target ? s - target : target - s;
@@ -120,12 +163,13 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
     }
     return [Af.path, Bf.path];
   }
-  const [Afile, Bfile] = pickInputs(inputFiles, config.N, config.K, config.M);
-  //const Afile = inputFiles.find(f=>/A\.bin$/i.test(f.originalName))?.path || inputFiles[0]?.path;
-  //const Bfile = inputFiles.find(f=>/B\.bin$/i.test(f.originalName))?.path || inputFiles[1]?.path;
-  if(!Afile || !Bfile) throw new Error('Need A.bin and B.bin');
 
   const { N, K:KK, M } = config;
+  const datatype = config.datatype || 'f32';
+  const typeInfo = getDataTypeInfo(datatype);
+
+  const [Afile, Bfile] = pickInputs(inputFiles, N, KK, M, typeInfo.elementSize);
+  if(!Afile || !Bfile) throw new Error('Need A.bin and B.bin');
 
   // Choose tile sizes:
   // if explicit tileSize/kTileSize provided -> honor them (backwards compat)
@@ -146,37 +190,71 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const nIB = Math.ceil(N / baseRows);
   const nJB = Math.ceil(M / baseCols);
 
+  logger.info(`Block-matmul-flex chunker: datatype=${datatype}, elementSize=${typeInfo.elementSize}, isPacked=${typeInfo.isPacked}`);
+
+  // Calculate total chunk count for better estimation
+  // The K loop uses kb += kSpan, so we need to count actual iterations
+  let kIterations = 0;
+  for (let kb = 0; kb < KK; kb += kSpan) {
+    kIterations++;
+  }
+  const totalChunks = nIB * nJB * kIterations;
+  logger.info(`Block-matmul-flex chunker: N=${N}, M=${M}, K=${KK}, tileSize=${baseRows}, kSpan=${kSpan}`);
+  logger.info(`Block-matmul-flex chunker: nIB=${nIB}, nJB=${nJB}, kIterations=${kIterations} = ${totalChunks.toLocaleString()} chunks expected`);
+
   return {
     async *stream(){
+      let actualChunkCount = 0;
       for (let ib = 0; ib < nIB; ib++){
         const rNow = Math.min(baseRows, N - ib*baseRows);
         for (let jb = 0; jb < nJB; jb++){
           const cNow = Math.min(baseCols, M - jb*baseCols);
           for (let kb = 0; kb < KK; kb += kSpan){
             const kNow = Math.min(kSpan, KK - kb);
+            actualChunkCount++;
 
             // A slice: rows x kNow from (rowStart=ib*baseRows, colStart=kb)
-            const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK, 4);
+            const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK, typeInfo.elementSize);
             // B slice: kNow x cols from (rowStart=kb, colStart=jb*baseCols)
-            const Bblock = readWindow(fdB, kb, kNow, jb*baseCols, cNow, M, 4);
+            const Bblock = readWindow(fdB, kb, kNow, jb*baseCols, cNow, M, typeInfo.elementSize);
+
+            // Pack data if needed for non-32bit types
+            const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
+            const bData = packData(Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength), datatype);
+
+            // For int8, we need to adjust dimensions to account for packing
+            let dims;
+            if (datatype === 'int8') {
+              const groupsK = Math.ceil(kNow / 4); // 4 int8 values per 32-bit word
+              dims = { rows: rNow, K: kNow, cols: cNow, groupsK: groupsK };
+            } else {
+              dims = { rows: rNow, K: kNow, cols: cNow };
+            }
 
             const payload = {
-              a: Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength),
-              b: Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength),
+              a: aData,
+              b: bData,
               // executor multiplies (rows x kNow)*(kNow x cols) -> (rows x cols)
-              dims: { rows: rNow, K: kNow, cols: cNow },
+              dims: dims,
+              datatype: datatype,
+              isPacked: typeInfo.isPacked,
+              packFactor: typeInfo.packFactor,
             };
 
-            const meta = { ib, jb, kb, kSpan: kNow, rows: rNow, cols: cNow, baseRows, baseCols };
+            const meta = { ib, jb, kb, kSpan: kNow, rows: rNow, cols: cNow, baseRows, baseCols, datatype, elementSize: typeInfo.elementSize };
 
-
-            yield { id: uuidv4(), payload, meta, tCreate: Date.now() };
+            const chunkId = uuidv4();
+            logger.debug(`🔧 Generated chunk ${chunkId} for tile (${ib},${jb}) K[${kb}-${kb+kNow}) dims: ${rNow}x${kNow}x${cNow}`);
+            yield { id: chunkId, payload, meta, tCreate: Date.now() };
           }
         }
       }
       fs.closeSync(fdA);
       fs.closeSync(fdB);
-      logger.info('block-matmul-flex chunker done');
+      logger.info(`block-matmul-flex chunker done: generated ${actualChunkCount} chunks (expected ${totalChunks})`);
+      if (actualChunkCount !== totalChunks) {
+        logger.warn(`Chunk count mismatch: expected ${totalChunks}, generated ${actualChunkCount} (diff: ${actualChunkCount - totalChunks})`);
+      }
     }
   };
 }
@@ -242,6 +320,41 @@ export function buildAssembler({ taskId, taskDir, config }){
       }
       fs.closeSync(fdC);
       return { outPath, elements: N*M };
+    },
+    cleanup(){
+      try {
+        fs.closeSync(fdC);
+        logger.info(`Block-matmul-flex assembler cleanup: closed output file descriptor`);
+      } catch (e) {
+        logger.warn(`Block-matmul-flex assembler cleanup failed:`, e.message);
+      }
     }
   };
+}
+
+// Kill-switch support: Calculate total chunks deterministically
+export function getTotalChunks(config, inputArgs) {
+  const { N, M, K } = config;
+  const { tileSize = 256 } = config;
+
+  const { rows: baseRows, cols: baseCols, kTileSize: kSpan } = pickTileParams({
+    N, M, K,
+    C: tileSize,
+    outFrac: 1/3,
+    align: 32
+  });
+
+  const nIB = Math.ceil(N / baseRows);
+  const nJB = Math.ceil(M / baseCols);
+  const KK = K;
+
+  // Calculate k iterations (same logic as in buildChunker)
+  let kIterations = 0;
+  for (let kb = 0; kb < KK; kb += kSpan) {
+    kIterations++;
+  }
+
+  const totalChunks = nIB * nJB * kIterations;
+  logger.info(`Block-matmul-flex getTotalChunks: N=${N}, M=${M}, K=${K}, tileSize=${tileSize} -> ${totalChunks} chunks`);
+  return totalChunks;
 }

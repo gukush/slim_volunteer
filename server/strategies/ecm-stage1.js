@@ -528,6 +528,33 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }){
         totalCurves,
         factorsFound: rawCurveFinds.length
       };
+    },
+    cleanup(){
+      // ECM assembler doesn't maintain file descriptors, just clear memory
+      try {
+        results.length = 0;
+        rawCurveFinds.length = 0;
+        bag.hits.clear();
+        bag.mult.clear();
+        logger.info(`ECM-stage1 assembler cleanup: cleared memory structures`);
+      } catch (e) {
+        logger.warn(`ECM-stage1 assembler cleanup failed:`, e.message);
+      }
     }
   };
+}
+
+// Kill-switch support: Calculate total chunks deterministically
+export function getTotalChunks(config, inputArgs) {
+  const { N, B1 } = config;
+  const { chunk_size = 1000 } = config;
+
+  // Use the same logic as in buildChunker
+  const Nred = BigInt(N);
+  const B1Big = BigInt(B1);
+  const total_curves = Number(B1Big * B1Big / (2n * Nred));
+  const totalChunks = (Nred === 1n) ? 0 : Math.ceil(total_curves / chunk_size);
+
+  logger.info(`ECM-stage1 getTotalChunks: N=${N}, B1=${B1}, chunk_size=${chunk_size} -> ${totalChunks} chunks`);
+  return totalChunks;
 }

@@ -76,6 +76,32 @@ function nextPowerOf2(n) {
   return Math.pow(2, Math.ceil(Math.log2(n)));
 }
 
+// Memory-efficient conversion from Uint8Array to Array
+// Processes in chunks to avoid memory spikes and allows GC
+function convertUint8ArrayToArrayEfficient(uint8Array) {
+  const result = new Array(uint8Array.length);
+  const chunkSize = 16384; // Process 16KB at a time
+
+  for (let i = 0; i < uint8Array.length; i += chunkSize) {
+    const end = Math.min(i + chunkSize, uint8Array.length);
+
+    // Process chunk
+    for (let j = i; j < end; j++) {
+      result[j] = uint8Array[j];
+    }
+
+    // Yield control every few chunks to allow GC
+    if (i % (chunkSize * 4) === 0 && i > 0) {
+      // Force garbage collection if available
+      if (global.gc) {
+        global.gc();
+      }
+    }
+  }
+
+  return result;
+}
+
 function readIntegersChunk(fd, offset, count, totalIntegers) {
   const actualCount = Math.min(count, totalIntegers - offset);
   if (actualCount <= 0) return new Uint32Array(0);
@@ -156,7 +182,8 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
     throw new Error('Need input binary file with integers (.bin). None provided and none found in task/uploads.');
   }
 
-  const { chunkSize = 65536, ascending = true, maxElements } = config;
+  // Use smaller chunk size for exe strategy to reduce memory pressure
+  const { chunkSize = 32768, ascending = true, maxElements } = config;
   const fd = fs.openSync(inputFile, 'r');
 
   const fileStats = fs.fstatSync(fd);
@@ -182,11 +209,14 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
   const rel = config.binary || defaultBins[backend];
   const binaryName = config.program || path.basename(rel);
 
-  logger.info(`Exe distributed sort: ${totalIntegers} integers, ${chunksCount} chunks`);
+  logger.info(`Exe distributed sort: ${totalIntegers} integers, ${chunksCount} chunks (chunkSize: ${chunkSize})`);
+  logger.warn(`Exe distributed sort: Using smaller chunks (${chunkSize}) to reduce memory pressure`);
 
   return {
     async *stream() {
       let chunkIndex = 0;
+      let memoryCheckCounter = 0;
+
       for (let offset = 0; offset < totalIntegers; offset += chunkSize) {
         const actualChunkSize = Math.min(chunkSize, totalIntegers - offset);
         const paddedSize = nextPowerOf2(actualChunkSize);
@@ -206,15 +236,22 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
         const uniforms = new Int32Array([actualChunkSize, paddedSize, ascending ? 1 : 0]);
         const uniformsBytes = new Uint8Array(uniforms.buffer);
 
+        // Convert to arrays but use memory-efficient streaming approach
+        const uniformsArray = Array.from(uniformsBytes);
+        const dataArray = convertUint8ArrayToArrayEfficient(new Uint8Array(paddedIntegers.buffer));
+
         const payload = {
           action: 'exec',
           framework: 'exe',
           buffers: [
-            Array.from(uniformsBytes),  // uniforms
-            Array.from(new Uint8Array(paddedIntegers.buffer))  // input data
+            uniformsArray,  // uniforms
+            dataArray       // input data
           ],
           outputs: [{ byteLength: actualChunkSize * 4 }]  // Only output original size
         };
+
+        // Clear references to help GC
+        paddedIntegers = null;
 
         const meta = {
           chunkIndex,
@@ -230,6 +267,37 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
 
         yield { id: uuidv4(), payload, meta, tCreate: Date.now() };
         chunkIndex++;
+        memoryCheckCounter++;
+
+        // Memory pressure relief for exe strategy
+        if (memoryCheckCounter % 10 === 0) {
+          const memUsage = process.memoryUsage();
+          const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
+
+          if (heapUsedMB > 600) { // 600MB threshold for exe strategy
+            logger.warn(`Exe distributed sort: High memory usage ${heapUsedMB}MB, yielding control`);
+            await new Promise(resolve => setImmediate(resolve));
+
+            // Force GC if available
+            if (global.gc) {
+              global.gc();
+              const afterGC = process.memoryUsage();
+              const afterGCUsedMB = Math.round(afterGC.heapUsed / 1024 / 1024);
+              logger.info(`Exe distributed sort: After GC: ${afterGCUsedMB}MB heap`);
+            }
+
+            // If still high memory, pause longer
+            if (heapUsedMB > 800) {
+              logger.warn(`Exe distributed sort: Critical memory usage, pausing for 1 second`);
+              await new Promise(resolve => setTimeout(resolve, 1000));
+            }
+          }
+        }
+
+        // Yield control every 5 chunks to prevent memory buildup
+        if (chunkIndex % 5 === 0) {
+          await new Promise(resolve => setImmediate(resolve));
+        }
       }
 
       fs.closeSync(fd);
