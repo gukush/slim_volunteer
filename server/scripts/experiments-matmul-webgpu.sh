@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# --- Main Script ---
 cd /app
 
 REPEATS=10
@@ -20,8 +21,10 @@ CONFIGS=(
 
 RUN_TS="$(date -u +%Y%m%dT%H%M%SZ)"
 LOG_DIR="/app/logs/matmul/webgpu/${RUN_TS}"
+STUB_DIR="${LOG_DIR}/stubs" # Directory for completion stubs
 SUMMARY_CSV="${LOG_DIR}/summary.csv"
 mkdir -p "${LOG_DIR}"
+mkdir -p "${STUB_DIR}" # Create the directory for stub files
 
 # CSV header
 if [[ ! -f "$SUMMARY_CSV" ]]; then
@@ -36,6 +39,14 @@ run_cfg () {
   echo "==== Starting Matmul | WebGPU | N=K=M=$NVAL | tileSize=$TILE ====" | tee -a "$LOG_FILE"
 
   for i in $(seq 1 "$REPEATS"); do
+    # --- New: Define stub file path and check if it exists ---
+    local stub_file="${STUB_DIR}/N-${NVAL}_tile-${TILE}_iter-${i}.done"
+    if [[ -f "$stub_file" ]]; then
+      echo "[$(date -Is)] Matmul | WebGPU | SKIP  iter $i/$REPEATS | N=$NVAL tile=$TILE (already complete)" | tee -a "$LOG_FILE"
+      continue # Skip to the next iteration
+    fi
+
+    # This block now runs only if the stub file was not found
     {
       start_iso="$(date -Is)"
       start_sec="$(date +%s)"
@@ -55,7 +66,13 @@ run_cfg () {
       end_sec="$(date +%s)"
       duration="$(( end_sec - start_sec ))"
 
-      echo "[$end_iso] Matmul | WebGPU | END   iter $i/$REPEATS | exit_code=$rc | duration=${duration}s"
+      # --- Modified: Create stub file only on success (exit code 0) ---
+      if [[ $rc -eq 0 ]]; then
+        echo "[$end_iso] Matmul | WebGPU | END   iter $i/$REPEATS | exit_code=$rc | duration=${duration}s"
+        touch "$stub_file" # Create the empty stub file to mark completion
+      else
+        echo "[$end_iso] Matmul | WebGPU | FAIL  iter $i/$REPEATS | exit_code=$rc | duration=${duration}s"
+      fi
       echo
 
       printf "%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n" \
