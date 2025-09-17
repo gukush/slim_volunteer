@@ -1,6 +1,9 @@
 // server/strategies/exe_distributed_sort.js
 // Native binary execution strategy for distributed integer sorting via CUDA
 // Combines chunking from distributed-sort.js with binary execution from exe-block-matmul-flex.js
+//
+// MEMORY OPTIMIZATION: Uses base64 encoding instead of JavaScript arrays to prevent
+// memory explosion on large datasets. Native client supports both formats.
 
 import fs from 'fs';
 import path from 'path';
@@ -182,8 +185,9 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
     throw new Error('Need input binary file with integers (.bin). None provided and none found in task/uploads.');
   }
 
-  // Use smaller chunk size for exe strategy to reduce memory pressure
-  const { chunkSize = 32768, ascending = true, maxElements } = config;
+  // Use optimized chunk size for exe strategy to balance memory and performance
+  // Larger chunks reduce overhead and memory pressure
+  const { chunkSize = 8388608, ascending = true, maxElements } = config; // 8MB chunks (2M integers)
   const fd = fs.openSync(inputFile, 'r');
 
   const fileStats = fs.fstatSync(fd);
@@ -210,7 +214,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
   const binaryName = config.program || path.basename(rel);
 
   logger.info(`Exe distributed sort: ${totalIntegers} integers, ${chunksCount} chunks (chunkSize: ${chunkSize})`);
-  logger.warn(`Exe distributed sort: Using smaller chunks (${chunkSize}) to reduce memory pressure`);
+  logger.info(`Exe distributed sort: Using optimized chunks (${chunkSize} bytes = ${chunkSize/4} integers) with base64 encoding`);
 
   return {
     async *stream() {
@@ -236,16 +240,14 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
         const uniforms = new Int32Array([actualChunkSize, paddedSize, ascending ? 1 : 0]);
         const uniformsBytes = new Uint8Array(uniforms.buffer);
 
-        // Convert to arrays but use memory-efficient streaming approach
-        const uniformsArray = Array.from(uniformsBytes);
-        const dataArray = convertUint8ArrayToArrayEfficient(new Uint8Array(paddedIntegers.buffer));
-
+        // Use base64 encoding to avoid memory explosion from JavaScript arrays
+        // Native client supports both array format and base64 strings
         const payload = {
           action: 'exec',
           framework: 'exe',
           buffers: [
-            uniformsArray,  // uniforms
-            dataArray       // input data
+            Array.from(uniformsBytes),  // uniforms (small, safe to convert)
+            Buffer.from(paddedIntegers.buffer).toString('base64')  // input data as base64 string
           ],
           outputs: [{ byteLength: actualChunkSize * 4 }]  // Only output original size
         };
