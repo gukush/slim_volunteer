@@ -42,7 +42,8 @@ struct CurveResult { bool ok; U256 A24m; U256 X1m; };
 
 // --------------------------- Small helpers ---------------------------
 static inline __host__ __device__ U256 set_zero() {
-  U256 r; #pragma unroll
+  U256 r;
+  #pragma unroll
   for (int i=0;i<8;i++) r.limbs[i]=0u;
   return r;
 }
@@ -53,7 +54,8 @@ static inline __host__ __device__ U256 u256_from_u32(uint32_t x){
   U256 r=set_zero(); r.limbs[0]=x; return r;
 }
 static inline __host__ __device__ bool is_zero(const U256& a){
-  uint32_t x=0u; #pragma unroll
+  uint32_t x=0u;
+  #pragma unroll
   for (int i=0;i<8;i++) x |= a.limbs[i];
   return x==0u;
 }
@@ -124,7 +126,8 @@ static inline __host__ __device__ void mul32x32_64(uint32_t a, uint32_t b, uint3
 
 // --------------------------- Montgomery math (CIOS) ---------------------------
 static inline __host__ __device__ U256 mont_mul(const U256& a, const U256& b, const U256& N, uint32_t n0inv32){
-  uint32_t t[9]; #pragma unroll
+  uint32_t t[9];
+  #pragma unroll
   for (int i=0;i<9;i++) t[i]=0u;
 
   for (int i=0;i<8;i++){
@@ -222,7 +225,8 @@ static inline __host__ __device__ uint32_t lcg32(uint32_t& state){
   state = ns; return ns;
 }
 static inline __host__ __device__ U256 next_sigma(const U256& /*N*/, uint32_t& lcg_state){
-  U256 acc; #pragma unroll
+  U256 acc;
+  #pragma unroll
   for (int i=0;i<8;i++) acc.limbs[i]=lcg32(lcg_state);
   if (is_zero(acc)) acc.limbs[0]=6u;
   if (cmp(acc,set_one())==0) acc.limbs[0]=6u;
