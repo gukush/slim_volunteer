@@ -224,7 +224,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }) {
         const integers = readIntegersChunk(fd, offset, actualChunkSize, totalIntegers);
 
         // Pad with sentinel values for bitonic sort
-        const paddedIntegers = new Uint32Array(paddedSize);
+        let paddedIntegers = new Uint32Array(paddedSize);
         paddedIntegers.set(integers);
 
         const sentinelValue = ascending ? 0xFFFFFFFF : 0x00000000;
