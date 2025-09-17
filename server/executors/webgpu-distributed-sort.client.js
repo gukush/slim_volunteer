@@ -8,6 +8,8 @@ const __WGPU_SORT_CACHE__ = (globalThis.__WGPU_SORT_CACHE__ ||= {
   pipelinesByDevice: new WeakMap(), // WeakMap<GPUDevice, Map<string, CachedPipeline>>
   // Timing infrastructure
   timingByDevice: new WeakMap(), // WeakMap<GPUDevice, TimingContext>
+  // Mutex for timing operations to prevent concurrent buffer access
+  timingMutex: new Map(), // Map<GPUDevice, Promise<void>>
 });
 
 /**
@@ -148,8 +150,31 @@ function getTimingContext(device) {
   return timing;
 }
 
+// Clean up timing context to ensure buffers are properly unmapped
+function cleanupTimingContext(timingCtx) {
+  if (!timingCtx || !timingCtx.supportsTimestamps) return;
+
+  try {
+    // Ensure result buffer is unmapped
+    timingCtx.resultBuffer.unmap();
+  } catch (e) {
+    // Buffer might not be mapped, that's OK
+  }
+}
+
 async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
   if (!timingCtx.supportsTimestamps) return null;
+
+  // Wait for any pending timing operations on this device
+  const existingMutex = __WGPU_SORT_CACHE__.timingMutex.get(device);
+  if (existingMutex) {
+    await existingMutex;
+  }
+
+  // Create a new mutex for this operation
+  let resolveMutex;
+  const mutexPromise = new Promise(resolve => { resolveMutex = resolve; });
+  __WGPU_SORT_CACHE__.timingMutex.set(device, mutexPromise);
 
   try {
     // Calculate aligned offsets for WebGPU requirements (256-byte alignment)
@@ -165,6 +190,13 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
     if (alignedOffset + dataSize > timingCtx.resolveBuffer.size) {
       console.error(`[Sort] Buffer too small: need ${alignedOffset + dataSize} bytes, have ${timingCtx.resolveBuffer.size} bytes`);
       return null;
+    }
+
+    // CRITICAL: Ensure buffer is unmapped before use
+    try {
+      timingCtx.resultBuffer.unmap();
+    } catch (e) {
+      // Buffer might not be mapped, that's OK
     }
 
     // Resolve timestamps to buffer
@@ -185,6 +217,9 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
     );
     device.queue.submit([encoder.finish()]);
 
+    // Wait for GPU operations to complete before mapping
+    await device.queue.onSubmittedWorkDone();
+
     // Read back results
     await timingCtx.resultBuffer.mapAsync(
       GPUMapMode.READ,
@@ -200,6 +235,7 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
     const startTime = timestamps[0];
     const endTime = timestamps[1];
 
+    // CRITICAL: Always unmap the buffer
     timingCtx.resultBuffer.unmap();
 
     // Convert to milliseconds (timestamps are in nanoseconds)
@@ -209,7 +245,17 @@ async function measureStageTime(device, timingCtx, queryStart, queryEnd) {
     return elapsedMs;
   } catch (error) {
     console.error('[Sort] Failed to measure GPU timestamps:', error);
+    // CRITICAL: Ensure buffer is unmapped even on error
+    try {
+      timingCtx.resultBuffer.unmap();
+    } catch (e) {
+      // Ignore unmapping errors
+    }
     return null;
+  } finally {
+    // Release the mutex
+    resolveMutex();
+    __WGPU_SORT_CACHE__.timingMutex.delete(device);
   }
 }
 
@@ -219,12 +265,18 @@ async function getDevice(forceRecreate = false) {
   // Clear cache if force recreating
   if (forceRecreate) {
     if (__WGPU_SORT_CACHE__.device) {
+      // Clean up timing contexts before destroying device
+      const timingCtx = __WGPU_SORT_CACHE__.timingByDevice.get(__WGPU_SORT_CACHE__.device);
+      if (timingCtx) {
+        cleanupTimingContext(timingCtx);
+      }
       try { __WGPU_SORT_CACHE__.device.destroy?.(); } catch {}
     }
     __WGPU_SORT_CACHE__.device = null;
     __WGPU_SORT_CACHE__.deviceId = null;
     __WGPU_SORT_CACHE__.pipelinesByDevice = new WeakMap();
     __WGPU_SORT_CACHE__.timingByDevice = new WeakMap();
+    __WGPU_SORT_CACHE__.timingMutex.clear();
     console.log('[Sort] Cleared WebGPU cache for device recreation');
   }
 
@@ -241,11 +293,11 @@ async function getDevice(forceRecreate = false) {
     console.warn('[Sort] timestamp-query feature not available');
   }
 
+  const requestedMax = 2147483648;
+  const limit = Math.min(requestedMax, adapter.limits?.maxBufferSize ?? requestedMax);
   const device = await adapter.requestDevice({
     requiredFeatures,
-    requiredLimits: {
-      maxBufferSize: 1073741824  // 1GB
-    }
+    requiredLimits: { maxBufferSize: limit }
   });
 
   __WGPU_SORT_CACHE__.device = device;
@@ -259,10 +311,16 @@ async function getDevice(forceRecreate = false) {
   // If the device is lost, clear our caches so we can rebuild later
   device.lost.then((info) => {
     console.warn('WebGPU device lost (Sort):', info?.message || info);
+    // Clean up timing contexts before clearing cache
+    const timingCtx = __WGPU_SORT_CACHE__.timingByDevice.get(device);
+    if (timingCtx) {
+      cleanupTimingContext(timingCtx);
+    }
     __WGPU_SORT_CACHE__.device = null;
     __WGPU_SORT_CACHE__.deviceId = null;
     __WGPU_SORT_CACHE__.pipelinesByDevice = new WeakMap();
     __WGPU_SORT_CACHE__.timingByDevice = new WeakMap();
+    __WGPU_SORT_CACHE__.timingMutex.clear();
   }).catch(()=>{ /* no-op */ });
 
   return device;
@@ -488,6 +546,9 @@ export function createExecutor({ kernels, config, inputArgs }) {
     try { dataBuf.destroy?.(); } catch {}
     try { uniformBuf.destroy?.(); } catch {}
     try { readBuf.destroy?.(); } catch {}
+
+    // CRITICAL: Clean up timing context to ensure buffers are unmapped
+    cleanupTimingContext(timingCtx);
 
     const tClientDone = performance.now();
     const totalTime = tClientDone - tClientRecv;
