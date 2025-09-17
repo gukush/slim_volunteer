@@ -462,7 +462,7 @@ function mergeKSortedArrays(sortedArrays, ascending = true) {
 
 // Kill-switch support: Calculate total chunks deterministically
 export function getTotalChunks(config, inputArgs) {
-  const { chunk_size = 1000000 } = config;
+  const { chunkSize = 65536, maxElements } = config; // Use correct parameter name and default
 
   // For distributed sort, we need to know the total number of integers
   // This is typically provided in inputArgs or can be calculated from file size
@@ -484,7 +484,13 @@ export function getTotalChunks(config, inputArgs) {
     totalIntegers = 10000000; // Default estimate
   }
 
-  const totalChunks = Math.ceil(totalIntegers / chunk_size);
-  logger.info(`Distributed-sort getTotalChunks: totalIntegers=${totalIntegers}, chunk_size=${chunk_size} -> ${totalChunks} chunks`);
+  // Apply maxElements limit if specified (same logic as in buildChunker)
+  if (maxElements && maxElements > 0 && maxElements < totalIntegers) {
+    totalIntegers = maxElements;
+    logger.info(`getTotalChunks: Limiting processing to ${maxElements} elements (file contains ${Math.floor(totalIntegers)} elements)`);
+  }
+
+  const totalChunks = Math.ceil(totalIntegers / chunkSize);
+  logger.info(`Distributed-sort getTotalChunks: totalIntegers=${totalIntegers}, chunkSize=${chunkSize}, maxElements=${maxElements || 'none'} -> ${totalChunks} chunks`);
   return totalChunks;
 }
