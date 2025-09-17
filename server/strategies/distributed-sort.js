@@ -468,13 +468,19 @@ export function getTotalChunks(config, inputArgs) {
   // This is typically provided in inputArgs or can be calculated from file size
   let totalIntegers = 0;
 
-  if (inputArgs && inputArgs.totalIntegers) {
+  // If maxElements is specified, use it directly (most reliable)
+  if (maxElements && maxElements > 0) {
+    totalIntegers = maxElements;
+    logger.info(`getTotalChunks: Using maxElements=${maxElements} for calculation`);
+  } else if (inputArgs && inputArgs.totalIntegers) {
     totalIntegers = inputArgs.totalIntegers;
+    logger.info(`getTotalChunks: Using inputArgs.totalIntegers=${totalIntegers}`);
   } else if (inputArgs && inputArgs.inputFile) {
     // Calculate from file size (assuming 4 bytes per integer)
     try {
       const stats = fs.statSync(inputArgs.inputFile);
       totalIntegers = Math.floor(stats.size / 4);
+      logger.info(`getTotalChunks: Calculated from file size: ${totalIntegers} integers`);
     } catch (e) {
       logger.warn('Could not determine total integers from file size, using default estimate');
       totalIntegers = 10000000; // Default estimate
@@ -482,12 +488,6 @@ export function getTotalChunks(config, inputArgs) {
   } else {
     logger.warn('No total integers specified, using default estimate');
     totalIntegers = 10000000; // Default estimate
-  }
-
-  // Apply maxElements limit if specified (same logic as in buildChunker)
-  if (maxElements && maxElements > 0 && maxElements < totalIntegers) {
-    totalIntegers = maxElements;
-    logger.info(`getTotalChunks: Limiting processing to ${maxElements} elements (file contains ${Math.floor(totalIntegers)} elements)`);
   }
 
   const totalChunks = Math.ceil(totalIntegers / chunkSize);
