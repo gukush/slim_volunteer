@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Enhanced cached block matmul script with multi-framework support
-// Supports: webgpu, webgl2, cpp-wasm, native (opencl/cuda via lua), exe (opencl/cuda/vulkan via binaries)
+// Supports: webgpu, webgl2, cpp-wasm, native (opencl/cuda/vulkan via lua), exe (opencl/cuda/vulkan via binaries)
 
 import fs from 'fs';
 import path from 'path';
@@ -15,7 +15,7 @@ const args = Object.fromEntries(process.argv.slice(2).map(s=>{
 
 const host = args.host || 'https://localhost:3000';
 const framework = args.framework || 'webgpu'; // 'webgpu' | 'webgl2' | 'cpp-wasm' | 'native' | 'exe'
-const backend = args.backend || 'opencl'; // For native/exe: 'opencl' | 'cuda' | 'vulkan'
+const backend = args.backend || 'opencl'; // For native: 'opencl' | 'cuda' | 'vulkan'; For exe: 'opencl' | 'cuda' | 'vulkan'
 const N = parseInt(args.N||'64',10), K = parseInt(args.K||'64',10), M = parseInt(args.M||'64',10);
 const TS = parseInt(args.tileSize||'32',10);
 const Krep = parseInt(args.Krep||'1',10);
@@ -116,8 +116,8 @@ function getStrategyAndConfig(framework, backend, N, K, M, TS, datatype, chunkSi
 
     case 'native':
       // Use native-block-matmul for LuaJIT-based native execution
-      if (!['opencl', 'cuda'].includes(backendLower)) {
-        throw new Error(`Unsupported backend for native framework: ${backend}. Use 'opencl' or 'cuda'`);
+      if (!['opencl', 'cuda', 'vulkan'].includes(backendLower)) {
+        throw new Error(`Unsupported backend for native framework: ${backend}. Use 'opencl', 'cuda', or 'vulkan'`);
       }
       return {
         strategyId: 'native-block-matmul',

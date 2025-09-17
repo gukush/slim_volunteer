@@ -60,7 +60,8 @@ export function getClientExecutorInfo(config){
   // Optional kernels (these are just hints; Lua host can also generate or use its own)
   const ku = findFirstExisting(resolveCandidates('cuda/block_matrix_multiply_cuda_kernel.cu'));
   const kl = findFirstExisting(resolveCandidates('opencl/block_matrix_multiply.cl'));
-  const kv = findFirstExisting(resolveCandidates('vulkan/block_matrix_multiply_vulkan_compute.glsl'));
+  const kv = findFirstExisting(resolveCandidates('vulkan/block_matmul_vulkan_accelerated.glsl')) ||
+             findFirstExisting(resolveCandidates('vulkan/block_matrix_multiply_vulkan_compute.glsl'));
   //const kspv = findFirstExisting(resolveCandidates('kernels/block_matrix_multiply_vulkan_compute.spv'));
 
   const artifacts = [];
