@@ -3,6 +3,47 @@ import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../lib/logger.js';
 
+// Helper function to write large arrays to file using streaming approach
+// This avoids Node.js 2GB buffer limit by writing in chunks
+async function writeLargeArrayToFile(array, filePath) {
+  const chunkSize = 1024 * 1024 * 1024; // 1GB chunks
+  const totalBytes = array.length * 4; // 4 bytes per Uint32
+
+  logger.info(`Writing large array to file: ${array.length} elements (${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB)`);
+
+  if (totalBytes <= chunkSize) {
+    // Small enough to write in one go
+    const buffer = Buffer.from(array.buffer);
+    fs.writeFileSync(filePath, buffer);
+    return;
+  }
+
+  // Large file - write in chunks
+  const fd = fs.openSync(filePath, 'w');
+  let offset = 0;
+
+  try {
+    while (offset < array.length) {
+      const chunkLength = Math.min(chunkSize / 4, array.length - offset); // Convert bytes to elements
+      const chunk = array.subarray(offset, offset + chunkLength);
+      const buffer = Buffer.from(chunk.buffer);
+
+      fs.writeSync(fd, buffer, 0, buffer.length, offset * 4);
+      offset += chunkLength;
+
+      // Log progress for very large files
+      if (array.length > 100000000) { // Only log for > 100M elements
+        const progress = (offset / array.length * 100).toFixed(1);
+        logger.info(`Writing progress: ${progress}% (${offset.toLocaleString()}/${array.length.toLocaleString()} elements)`);
+      }
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  logger.info(`Successfully wrote ${array.length} elements to ${filePath}`);
+}
+
 export const id = 'distributed-sort';
 export const name = 'Distributed Integer Sort';
 
@@ -382,9 +423,8 @@ export function buildAssembler({ taskId, taskDir, config }) {
         ? mergeSources[0]
         : mergeKSortedArrays(mergeSources, ascending);
 
-      // Write final output
-      const outputBuffer = Buffer.from(finalResult.buffer);
-      fs.writeFileSync(outPath, outputBuffer);
+      // Write final output using streaming approach for large files
+      await writeLargeArrayToFile(finalResult, outPath);
 
       // Clean up temporary files
       try {
