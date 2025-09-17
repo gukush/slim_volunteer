@@ -308,7 +308,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           inputArgs: task.descriptor.inputArgs,
           schema: execInfo.schema || {},
           type: 'computation',
-          artifacts: artifacts
+          artifacts: artifacts,
+          clientId: client.socket.id // Add client ID to workload for native clients
         });
       }
 
@@ -700,7 +701,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
           try {
             entry.completed = true;
-            task.completedChunks += 1;
+            task.completedChunks += 1
             entry.results.clear();
             // Immediately remove from queue to prevent any further assignment attempts
             const queueIndex = task.queue.indexOf(chunkId);
