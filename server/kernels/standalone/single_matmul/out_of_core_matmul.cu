@@ -14,6 +14,9 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+// Fixed tile size for simplicity
+#define TILE_SIZE 16
+
 #define CHECK_CUDA(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -47,7 +50,7 @@ struct MatmulTimingResults {
     double avg_chunk_time_ms;
     double effective_gflops;
     double memory_bandwidth_gb_s;
-    size_t total_memory_transferred_gb;
+    double total_memory_transferred_gb;
 };
 
 // Generate unique CSV filename with timestamp
@@ -61,7 +64,7 @@ std::string generate_csv_filename(const std::string& custom_name = "") {
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
     std::stringstream ss;
-    ss << "matmul_timing_"
+    ss << "matmul_tile16_timing_"
        << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S")
        << "_" << std::setfill('0') << std::setw(3) << ms.count()
        << ".csv";
@@ -134,8 +137,8 @@ public:
     }
 };
 
-template<int TILE_SIZE>
-__global__ void tiled_matmul_kernel(const float* A, const float* B, float* C, int N, int K, int M) {
+// Fixed 16x16 tiled matrix multiplication kernel
+__global__ void tiled_matmul_kernel_16x16(const float* A, const float* B, float* C, int N, int K, int M) {
     __shared__ float As[TILE_SIZE][TILE_SIZE];
     __shared__ float Bs[TILE_SIZE][TILE_SIZE];
 
@@ -183,7 +186,8 @@ double read_tile(FILE* file, float* buffer, int start_row, int num_rows, int sta
     for (int i = 0; i < num_rows; ++i) {
         long long offset = (long long)(start_row + i) * total_cols + start_col;
         fseek(file, offset * sizeof(float), SEEK_SET);
-        fread(buffer + (long long)i * num_cols, sizeof(float), num_cols, file);
+        size_t bytes_read = fread(buffer + (long long)i * num_cols, sizeof(float), num_cols, file);
+        (void)bytes_read; // Suppress unused variable warning
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -197,7 +201,8 @@ double write_tile(FILE* file, const float* buffer, int start_row, int num_rows, 
     for (int i = 0; i < num_rows; ++i) {
         long long offset = (long long)(start_row + i) * total_cols + start_col;
         fseek(file, offset * sizeof(float), SEEK_SET);
-        fwrite(buffer + (long long)i * num_cols, sizeof(float), num_cols, file);
+        size_t bytes_written = fwrite(buffer + (long long)i * num_cols, sizeof(float), num_cols, file);
+        (void)bytes_written; // Suppress unused variable warning
     }
 
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -206,9 +211,10 @@ double write_tile(FILE* file, const float* buffer, int start_row, int num_rows, 
 
 int main(int argc, char** argv) {
     // --- Parse Command Line Arguments ---
-    if (argc < 9) {
-        std::cerr << "Usage: " << argv[0] << " <N> <K> <M> <TILE_SIZE> <A_file> <B_file> <C_file> <kernel_type> [--csv] [--csv-file=filename.csv]\n";
+    if (argc < 8) {
+        std::cerr << "Usage: " << argv[0] << " <N> <K> <M> <A_file> <B_file> <C_file> <kernel_type> [--csv] [--csv-file=filename.csv]\n";
         std::cerr << "  kernel_type: 'custom' or 'cublas'\n";
+        std::cerr << "  Fixed tile size: 16x16\n";
         std::cerr << "  --csv: Export timing results to auto-generated CSV file\n";
         std::cerr << "  --csv-file=filename.csv: Export to custom CSV filename\n";
         return 1;
@@ -217,16 +223,15 @@ int main(int argc, char** argv) {
     const int N = std::stoi(argv[1]);
     const int K = std::stoi(argv[2]);
     const int M = std::stoi(argv[3]);
-    const int TILE_SIZE = std::stoi(argv[4]);
-    const std::string a_path = argv[5];
-    const std::string b_path = argv[6];
-    const std::string c_path = argv[7];
-    const std::string kernel_type = argv[8];
+    const std::string a_path = argv[4];
+    const std::string b_path = argv[5];
+    const std::string c_path = argv[6];
+    const std::string kernel_type = argv[7];
 
     // Parse CSV export options
     bool export_csv = false;
     std::string csv_filename = "";
-    for (int i = 9; i < argc; i++) {
+    for (int i = 8; i < argc; i++) {
         std::string arg(argv[i]);
         if (arg == "--csv") {
             export_csv = true;
@@ -248,11 +253,11 @@ int main(int argc, char** argv) {
     timestamp_ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
     std::string timestamp = timestamp_ss.str();
 
-    std::cout << "CUDA Tiled Matrix Multiplication with Timing Export\n";
-    std::cout << "==================================================\n";
+    std::cout << "CUDA Tiled Matrix Multiplication (16x16 tiles) with Timing Export\n";
+    std::cout << "=================================================================\n";
     std::cout << "Configuration:\n";
     std::cout << "  Problem Size: C(" << N << "x" << M << ") = A(" << N << "x" << K << ") * B(" << K << "x" << M << ")\n";
-    std::cout << "  Tile Size: " << TILE_SIZE << "x" << TILE_SIZE << "\n";
+    std::cout << "  Tile Size: 16x16 (fixed)\n";
     std::cout << "  Kernel: " << kernel_type << "\n";
     std::cout << "  GPU: " << gpu_name << "\n";
     std::cout << "  CSV Export: " << (export_csv ? "enabled" : "disabled") << "\n";
@@ -356,7 +361,7 @@ int main(int argc, char** argv) {
                 if (kernel_type == "custom") {
                     dim3 block(16, 16);
                     dim3 grid((c_now + block.x - 1) / block.x, (r_now + block.y - 1) / block.y);
-                    tiled_matmul_kernel<TILE_SIZE><<<grid, block>>>(d_A, d_B, d_C, r_now, k_now, c_now);
+                    tiled_matmul_kernel_16x16<<<grid, block>>>(d_A, d_B, d_C, r_now, k_now, c_now);
                 } else { // cublas
                     const float alpha = 1.0f, beta = 0.0f;
                     CHECK_CUBLAS(cublasSgemm(cublas_handle, CUBLAS_OP_N, CUBLAS_OP_N,
