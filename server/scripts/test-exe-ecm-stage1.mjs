@@ -27,7 +27,7 @@ const argv = Object.fromEntries(
 const baseURL = argv.server || process.env.SERVER_URL || 'https://localhost:3000';
 const backend = (argv.backend || 'cuda').toLowerCase();
 const program = argv.program || 'ecm_stage1_cuda';
-const binaryPath = argv.binary || 'binaries/exec_cuda_ecm_stage1';
+const binaryPath = argv.binary || 'binaries/exe_cuda_ecm_stage1';
 
 // Target number N (hex string or decimal). Provide your own or use a small demo semiprime.
 let N = argv.N;
