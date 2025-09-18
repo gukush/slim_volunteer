@@ -129,7 +129,7 @@ async function main() {
   const startPayload = {
     strategyId: 'exe-ecm-stage1',
     label,
-    inputArgs: {
+    input: {
       N,
       total_curves,
       chunk_size,
