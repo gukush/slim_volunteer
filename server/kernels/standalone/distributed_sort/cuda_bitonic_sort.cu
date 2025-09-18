@@ -230,11 +230,12 @@ std::vector<uint32_t> merge_k_sorted_chunks(const std::vector<std::vector<uint32
         uint32_t value;
         size_t chunk_idx;
         size_t element_idx;
+        bool ascending_order;
 
         bool operator>(const HeapElement& other) const {
             // For ascending sort: smaller values have higher priority
             // For descending sort: larger values have higher priority
-            return ascending ? value > other.value : value < other.value;
+            return ascending_order ? value > other.value : value < other.value;
         }
     };
 
@@ -243,7 +244,7 @@ std::vector<uint32_t> merge_k_sorted_chunks(const std::vector<std::vector<uint32
     // Initialize heap with first element from each chunk
     for (size_t i = 0; i < sorted_chunks.size(); i++) {
         if (!sorted_chunks[i].empty()) {
-            heap.push({sorted_chunks[i][0], i, 0});
+            heap.push({sorted_chunks[i][0], i, 0, ascending});
         }
     }
 
@@ -259,7 +260,8 @@ std::vector<uint32_t> merge_k_sorted_chunks(const std::vector<std::vector<uint32
             heap.push({
                 sorted_chunks[min_elem.chunk_idx][next_idx],
                 min_elem.chunk_idx,
-                next_idx
+                next_idx,
+                ascending
             });
         }
     }
@@ -342,6 +344,7 @@ void export_timing_to_csv(const TimingResults& results, const std::string& filen
     csv_file.close();
     std::cout << "Timing results exported to: " << filename << std::endl;
 }
+
 class OutOfCoreBitonicSort {
 private:
     BitonicSortExecutor executor;
@@ -351,12 +354,16 @@ private:
     bool ascending;
     bool validate;
     size_t max_elements;
+    bool export_csv;
+    std::string csv_file;
 
 public:
     OutOfCoreBitonicSort(const std::string& input, const std::string& output,
-                         size_t chunk_sz, bool asc, bool val, size_t max_elem = 0)
+                         size_t chunk_sz, bool asc, bool val, size_t max_elem = 0,
+                         bool csv_export = false, const std::string& csv_filename = "")
         : input_file(input), output_file(output), chunk_size(chunk_sz),
-          ascending(asc), validate(val), max_elements(max_elem) {}
+          ascending(asc), validate(val), max_elements(max_elem),
+          export_csv(csv_export), csv_file(csv_filename) {}
 
     void sort() {
         CpuTimer total_timer;
@@ -397,6 +404,7 @@ public:
         sorted_chunks.reserve(chunks_count);
 
         double total_gpu_time = 0.0;
+        int total_stages = 0;
 
         for (size_t chunk_idx = 0; chunk_idx < chunks_count; chunk_idx++) {
             size_t offset = chunk_idx * chunk_size;
@@ -417,6 +425,14 @@ public:
             // Sort chunk on GPU
             double chunk_gpu_time = executor.sort_chunk(chunk_data, ascending, validate);
             total_gpu_time += chunk_gpu_time;
+
+            // Calculate stages for this chunk
+            uint32_t padded_size = next_power_of_2(current_chunk_size);
+            for (uint32_t k = 2; k <= padded_size; k <<= 1) {
+                for (uint32_t j = k >> 1; j > 0; j >>= 1) {
+                    total_stages++;
+                }
+            }
 
             sorted_chunks.push_back(std::move(chunk_data));
         }
@@ -455,6 +471,11 @@ public:
         std::cout << "Throughput: " << (total_integers / (total_time / 1000.0)) << " integers/second" << std::endl;
         std::cout << "Output file: " << output_file << " (" << final_result.size() << " integers)" << std::endl;
 
+        // Export CSV if requested
+        if (export_csv) {
+            export_timing_results(total_integers, chunks_count, total_gpu_time, merge_time, total_time, total_stages);
+        }
+
         // Final validation
         if (validate) {
             std::cout << "Performing final validation..." << std::endl;
@@ -473,6 +494,40 @@ private:
             }
         }
         std::cout << "Final validation PASSED: " << data.size() << " elements properly sorted" << std::endl;
+    }
+
+    void export_timing_results(size_t total_integers, size_t chunks_count, double total_gpu_time,
+                              double merge_time, double total_time, int total_stages) {
+        // Get GPU name
+        cudaDeviceProp prop;
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+
+        // Get timestamp
+        auto now = std::chrono::system_clock::now();
+        auto time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream timestamp_ss;
+        timestamp_ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
+
+        TimingResults results = {
+            timestamp_ss.str(),
+            input_file,
+            output_file,
+            total_integers,
+            chunk_size,
+            chunks_count,
+            ascending,
+            validate,
+            std::string(prop.name),
+            total_gpu_time,
+            merge_time,
+            total_time,
+            total_integers / (total_time / 1000.0),
+            total_stages > 0 ? total_gpu_time / total_stages : 0.0,
+            total_stages
+        };
+
+        std::string filename = csv_file.empty() ? generate_csv_filename() : csv_file;
+        export_timing_to_csv(results, filename);
     }
 };
 
