@@ -125,8 +125,8 @@ async function main() {
   const outDir = path.join(process.cwd(), `out-${label}`);
   fs.mkdirSync(outDir, { recursive: true });
 
-  // 1) Start task
-  const startPayload = {
+  // 1) Create task
+  const createPayload = {
     strategyId: 'exe-ecm-stage1',
     label,
     input: {
@@ -147,15 +147,23 @@ async function main() {
     }
   };
 
-  const started = await api(baseURL, '/tasks', { method: 'POST', json: startPayload });
-  if (!started || !started.id) {
-    console.error('Failed to start task:', started);
+  const created = await api(baseURL, '/tasks', { method: 'POST', json: createPayload });
+  if (!created || !created.id) {
+    console.error('Failed to create task:', created);
     process.exit(1);
   }
-  const taskId = started.id;
+  const taskId = created.id;
+  console.log(`Task created: ${taskId}`);
+
+  // 2) Start the task (THIS IS THE FIX!)
+  const startResult = await api(baseURL, `/tasks/${taskId}/start`, { method: 'POST' });
+  if (!startResult || !startResult.ok) {
+    console.error('Failed to start task:', startResult);
+    process.exit(1);
+  }
   console.log(`Task started: ${taskId}`);
 
-  // 2) Poll until completion
+  // 3) Poll until completion
   let status;
   while (true) {
     await new Promise(r => setTimeout(r, 800));
@@ -176,7 +184,7 @@ async function main() {
   }
   console.log('Task completed.\n');
 
-  // 3) Try to fetch summary first
+  // 4) Try to fetch summary first
   let summary;
   try {
     summary = await api(baseURL, `/tasks/${taskId}/output?name=output.summary.json`);
@@ -192,7 +200,7 @@ async function main() {
     }
   }
 
-  // 4) Ensure binary buffer is downloaded (the full IO buffer)
+  // 5) Ensure binary buffer is downloaded (the full IO buffer)
   let binBuf;
   try {
     const abuf = await api(baseURL, `/tasks/${taskId}/output?name=output.bin`, { responseType: 'arraybuffer' });
@@ -208,7 +216,6 @@ async function main() {
     }
   }
 
-  // 5) Print a compact summary
   if (summary) {
     console.log('Summary (truncated):');
     const keys = Object.keys(summary);
