@@ -68,41 +68,35 @@ export function buildChunker(args) {
   console.log('DEBUG exe-ecm-stage1 inputArgs:', JSON.stringify(inputArgs, null, 2));
   const webChunker = buildChunkerWeb({ taskId, taskDir, K, config, inputArgs, inputFiles });
 
-  function* generator() {
-    for (const chunk of webChunker) {
-      // `chunk.payload.data` is the full IO ArrayBuffer produced by the web ECM strategy.
-      const ioBuffer = chunk?.payload?.data;
-      if (!ioBuffer || !(ioBuffer instanceof ArrayBuffer)) {
-        throw new Error(`[${id}] Expected web ECM chunk to have payload.data as ArrayBuffer`);
-      }
-
-      // For exe: write entire IO buffer to stdin, expect same-sized stdout.
-      const outSize = ioBuffer.byteLength;
-
-      yield {
-        id: chunk.id,
-        payload: {
-          action: 'exec',
-          // TaskManager will base64-encode ArrayBuffers for native clients automatically.
-          buffers: [ioBuffer],          // stdin
-          outputs: [outSize],           // expected stdout size
-          meta: {
-            program: (args?.config?.program) || defaultPrograms[(args?.config?.backend || 'cuda').toLowerCase()] || 'ecm_stage1_cuda',
-            backend: (args?.config?.backend || 'cuda').toLowerCase(),
-            framework: 'exe',
-            // Carry through any useful metadata for logging/diagnostics
-            ...chunk.meta,
-          },
-        },
-        meta: chunk.meta,              // keep the original meta (useful in assembler)
-      };
-    }
-  }
-
   return {
     async *stream() {
-      for (const chunk of generator()) {
-        yield chunk;
+      for await (const chunk of webChunker.stream()) {
+        // `chunk.payload.data` is the full IO ArrayBuffer produced by the web ECM strategy.
+        const ioBuffer = chunk?.payload?.data;
+        if (!ioBuffer || !(ioBuffer instanceof ArrayBuffer)) {
+          throw new Error(`[${id}] Expected web ECM chunk to have payload.data as ArrayBuffer`);
+        }
+
+        // For exe: write entire IO buffer to stdin, expect same-sized stdout.
+        const outSize = ioBuffer.byteLength;
+
+        yield {
+          id: chunk.id,
+          payload: {
+            action: 'exec',
+            // TaskManager will base64-encode ArrayBuffers for native clients automatically.
+            buffers: [ioBuffer],          // stdin
+            outputs: [outSize],           // expected stdout size
+            meta: {
+              program: (config?.program) || defaultPrograms[(config?.backend || 'cuda').toLowerCase()] || 'ecm_stage1_cuda',
+              backend: (config?.backend || 'cuda').toLowerCase(),
+              framework: 'exe',
+              // Carry through any useful metadata for logging/diagnostics
+              ...chunk.meta,
+            },
+          },
+          meta: chunk.meta,              // keep the original meta (useful in assembler)
+        };
       }
     }
   };
