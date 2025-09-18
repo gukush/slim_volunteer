@@ -124,8 +124,19 @@ async function measureGpuTime(device, timingCtx, queryStart, queryEnd) {
 }
 
 export function createExecutor({ kernels, config }){
-  const kernel = kernels.find(k => k.name.endsWith('block_matmul.wgsl'));
-  if(!kernel) throw new Error('Kernel source missing');
+  // Find the correct kernel based on datatype
+  const datatype = config?.datatype || 'f32';
+  let kernelName;
+  if (datatype === 'f16') {
+    kernelName = 'block_matmul_fp16.wgsl';
+  } else if (datatype === 'int8') {
+    kernelName = 'block_matmul_int8.wgsl';
+  } else {
+    kernelName = 'block_matmul.wgsl';
+  }
+
+  const kernel = kernels.find(k => k.name.endsWith(kernelName));
+  if(!kernel) throw new Error(`Kernel source missing for datatype ${datatype}: ${kernelName}`);
 
   async function getDevice(){
     if(__WGPU_MATMUL_CACHE__.device) return __WGPU_MATMUL_CACHE__.device;
@@ -134,13 +145,21 @@ export function createExecutor({ kernels, config }){
     const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) throw new Error('No WebGPU adapter');
 
-    // Request device with timestamp-query feature
+    // Request device with required features
     const requiredFeatures = [];
     if (adapter.features.has('timestamp-query')) {
       requiredFeatures.push('timestamp-query');
       console.log('[Matmul] Requesting timestamp-query feature');
     } else {
       console.warn('[Matmul] timestamp-query feature not available');
+    }
+
+    // Request shader-f16 feature for FP16 support
+    if (datatype === 'f16' && adapter.features.has('shader-f16')) {
+      requiredFeatures.push('shader-f16');
+      console.log('[Matmul] Requesting shader-f16 feature for FP16 support');
+    } else if (datatype === 'f16') {
+      console.warn('[Matmul] shader-f16 feature not available - FP16 may not work');
     }
 
     const device = await adapter.requestDevice({
@@ -211,10 +230,18 @@ export function createExecutor({ kernels, config }){
     const layout = __WGPU_MATMUL_CACHE__.layout;
     const timingCtx = __WGPU_MATMUL_CACHE__.timingContext;
 
-    const { a, b, dims } = payload;
+    const { a, b, dims, datatype, isPacked, packFactor } = payload;
     const { rows, K, cols } = dims;
 
-    console.log(`[Matmul] Processing ${rows}×${K} × ${K}×${cols} with device ${__WGPU_MATMUL_CACHE__.deviceId}`);
+    console.log(`[Matmul] Processing ${rows}×${K} × ${K}×${cols} with device ${__WGPU_MATMUL_CACHE__.deviceId} (${datatype})`);
+
+    // Calculate element size based on datatype
+    let elementSize = 4; // default f32
+    if (datatype === 'f16') {
+      elementSize = 2;
+    } else if (datatype === 'int8') {
+      elementSize = 1;
+    }
 
     // Create input buffers
     const aBuf = dev.createBuffer({
@@ -231,16 +258,24 @@ export function createExecutor({ kernels, config }){
     });
     dev.queue.writeBuffer(bBuf, 0, b);
 
-    // Create output buffer
-    const outSize = rows * cols * 4;
+    // Create output buffer with correct element size
+    const outSize = rows * cols * elementSize;
     const cBuf = dev.createBuffer({
       label: 'matmul-buffer-C',
       size: outSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
     });
 
-    // Create uniform buffer for dimensions
-    const dimsData = new Uint32Array([rows, K, cols, 0]); // pad to 16B
+    // Create uniform buffer for dimensions - handle different datatypes
+    let dimsData;
+    if (datatype === 'int8' && dims.groupsK) {
+      // For int8, we need groupsK parameter
+      dimsData = new Uint32Array([rows, K, cols, dims.groupsK]);
+    } else {
+      // For f32/f16, standard 3 parameters + padding
+      dimsData = new Uint32Array([rows, K, cols, 0]);
+    }
+
     const dimsBuf = dev.createBuffer({
       label: 'matmul-buffer-dims',
       size: 16,

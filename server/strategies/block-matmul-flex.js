@@ -54,15 +54,64 @@ function getDataTypeInfo(datatype) {
   }
 }
 
+// Convert FP32 to FP16 (IEEE 754 format)
+function f32ToF16(f32) {
+  const f32View = new Float32Array([f32]);
+  const f32Bytes = new Uint8Array(f32View.buffer);
+  const f32Bits = (f32Bytes[3] << 24) | (f32Bytes[2] << 16) | (f32Bytes[1] << 8) | f32Bytes[0];
+
+  // Extract FP32 components
+  const sign = (f32Bits >>> 31) & 1;
+  const exp = (f32Bits >>> 23) & 0xFF;
+  const mantissa = f32Bits & 0x7FFFFF;
+
+  // Convert to FP16
+  let f16Exp, f16Mantissa;
+
+  if (exp === 0) {
+    // Zero or denormalized
+    f16Exp = 0;
+    f16Mantissa = mantissa >>> 13;
+  } else if (exp === 0xFF) {
+    // Infinity or NaN
+    f16Exp = 0x1F;
+    f16Mantissa = mantissa >>> 13;
+  } else {
+    // Normalized number
+    const newExp = exp - 127 + 15; // Adjust bias
+    if (newExp <= 0) {
+      // Underflow to zero
+      f16Exp = 0;
+      f16Mantissa = 0;
+    } else if (newExp >= 0x1F) {
+      // Overflow to infinity
+      f16Exp = 0x1F;
+      f16Mantissa = 0;
+    } else {
+      f16Exp = newExp;
+      f16Mantissa = mantissa >>> 13;
+    }
+  }
+
+  return (sign << 15) | (f16Exp << 10) | f16Mantissa;
+}
+
 function packData(buffer, datatype) {
   const typeInfo = getDataTypeInfo(datatype);
   if (!typeInfo.isPacked) return buffer;
 
-  const view = new Uint8Array(buffer);
+  if (typeInfo.elementSize === 2) { // fp16 -> convert FP32 to FP16
+    const f32View = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
+    const f16Buffer = new ArrayBuffer(f32View.length * 2);
+    const f16View = new Uint16Array(f16Buffer);
 
-  if (typeInfo.elementSize === 2) { // fp16 -> no packing needed, kernels use native fp16
-    return buffer;
+    for (let i = 0; i < f32View.length; i++) {
+      f16View[i] = f32ToF16(f32View[i]);
+    }
+
+    return f16Buffer;
   } else if (typeInfo.elementSize === 1) { // int8 -> pack 4 values per 32-bit word
+    const view = new Uint8Array(buffer);
     const packedSize = Math.ceil(view.length / 4) * 4; // Always pack into 32-bit words
     const packed = new Uint8Array(packedSize);
     const output = new Uint32Array(packed.buffer, packed.byteOffset, packedSize / 4);
@@ -214,9 +263,10 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             actualChunkCount++;
 
             // A slice: rows x kNow from (rowStart=ib*baseRows, colStart=kb)
-            const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK, typeInfo.elementSize);
+            // Always read as FP32 (4 bytes) since input files are in FP32 format
+            const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK, 4);
             // B slice: kNow x cols from (rowStart=kb, colStart=jb*baseCols)
-            const Bblock = readWindow(fdB, kb, kNow, jb*baseCols, cNow, M, typeInfo.elementSize);
+            const Bblock = readWindow(fdB, kb, kNow, jb*baseCols, cNow, M, 4);
 
             // Pack data if needed for non-32bit types
             const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
