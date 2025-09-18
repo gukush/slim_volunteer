@@ -568,6 +568,16 @@ int main(){
         std::memcpy(&h, buf.data(), sizeof(Header32));
     }
 
+    // --- sanity checks right after memcpy(h, ...) ---
+    if (h.version == 0u) die("bad header: version=0");
+    if (h.n_curves == 0u) die("bad header: n_curves=0");
+    if (h.pp_count == 0u) die("bad header: pp_count=0");
+
+    // Print header info for debugging
+    std::fprintf(stderr,
+     "hdr v=%u pp_count=%u n_curves=%u pp_start=%u pp_len=%u bytes_in=%zu\n",
+     h.version, h.pp_count, h.n_curves, h.pp_start, h.pp_len, buf.size());
+
     const uint32_t outputOffset = outOffset(h);
     const uint32_t stateOff     = stateOffset(h);
     const uint64_t totalWords   = (uint64_t)stateOff + (uint64_t)h.n_curves * STATE_WORDS_PER;
@@ -590,6 +600,7 @@ int main(){
     // Infer grid (WG size 64)
     const uint32_t WG = 64;
     uint32_t blocks = (h.n_curves + WG - 1)/WG;
+    if (blocks == 0u) die("bad header: zero grid (n_curves too small)");
     dim3 grid(blocks,1,1), block(WG,1,1);
 
     while(pp_start < h.pp_count){

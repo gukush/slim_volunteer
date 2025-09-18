@@ -93,7 +93,7 @@ export function getClientExecutorInfo(config = {}, inputArgs = {}) {
     schema: {
       order: ['stdin', 'stdout'],
       inputs: [{ name: 'io', type: 'u32', note: 'Full ECM Stage 1 IO buffer (header + consts + pp + output + state)' }],
-      outputs: [{ name: 'io', type: 'u32', size: '== input size' }],
+      outputs: [{ name: 'io', type: 'u32', size: 'header + consts + pp + outputs only (no state)' }],
     },
   };
 }
@@ -128,8 +128,8 @@ export function buildChunker(args) {
           payload: {
             action: 'exec',
             framework: 'exe',
-            // Convert ArrayBuffer to base64 for efficient transmission
-            buffers: [Buffer.from(ioBuffer).toString('base64')],
+            // Send raw binary data as Uint8Array for proper binary handling
+            buffers: [new Uint8Array(ioBuffer)],
             outputs: [{ byteLength: outSize }],
             meta: {
               program: programName,
