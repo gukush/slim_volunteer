@@ -99,7 +99,13 @@ export function buildChunker(args) {
     }
   }
 
-  return generator();
+  return {
+    async *stream() {
+      for (const chunk of generator()) {
+        yield chunk;
+      }
+    }
+  };
 }
 
 
