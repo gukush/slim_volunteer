@@ -527,9 +527,15 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
     // Prevent reassignment of chunks that are already assigned and in progress
     // This fixes the race condition where chunks get reassigned while being processed
+    // BUT allow assignment to different clients if we haven't reached K replicas yet
     if(entry.assignedTo.size > 0 && !entry.completed) {
-      logger.debug(`🚫 Skipping reassignment of chunk ${chunkId} - already assigned to [${Array.from(entry.assignedTo).join(',')}]`);
-      return false; // Chunk is already assigned to someone, don't reassign
+      // If we've already reached K replicas, don't assign more
+      if(entry.replicas >= task.K) {
+        logger.debug(`🚫 Skipping reassignment of chunk ${chunkId} - already assigned to [${Array.from(entry.assignedTo).join(',')}] and reached K=${task.K}`);
+        return false;
+      }
+      // If we haven't reached K replicas yet, we can still assign to different clients
+      // The loop below will check if the client is already assigned to this chunk
     }
 
     // Check if we allow same client multiple replicas (for research/testing)
