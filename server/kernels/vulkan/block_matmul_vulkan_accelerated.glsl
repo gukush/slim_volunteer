@@ -36,12 +36,12 @@ void main()
     const uint startCol = tileCol * COLS;
     
     // Declare cooperative matrices
-    coopmat<float16_t, gl_ScopeSubgroup, ROWS, K_SIZE, gl_MatrixUseA> matA;
-    coopmat<float16_t, gl_ScopeSubgroup, K_SIZE, COLS, gl_MatrixUseB> matB;
-    coopmat<float16_t, gl_ScopeSubgroup, ROWS, COLS, gl_MatrixUseAccumulator> matC;
+    fcoopmatKHR<16, gl_ScopeSubgroup, ROWS, K_SIZE> matA;
+    fcoopmatKHR<16, gl_ScopeSubgroup, K_SIZE, COLS> matB;
+    fcoopmatKHR<16, gl_ScopeSubgroup, ROWS, COLS> matC;
     
     // Initialize accumulator to zero
-    matC = coopmat<float16_t, gl_ScopeSubgroup, ROWS, COLS, gl_MatrixUseAccumulator>(0.0hf);
+    matC = fcoopmatKHR<16, gl_ScopeSubgroup, ROWS, COLS>(0.0);
     
     // Process K dimension in chunks
     const uint numKTiles = (u.K + K_SIZE - 1u) / K_SIZE;
@@ -50,15 +50,15 @@ void main()
         const uint kStart = kTile * K_SIZE;
         
         // Load matrix A tile (ROWS x K_SIZE)
-        coopMatLoad(matA, A, startRow * u.K + kStart, u.K, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoadKHR(matA, A, startRow * u.K + kStart, u.K, gl_CooperativeMatrixLayoutRowMajor);
         
         // Load matrix B tile (K_SIZE x COLS)  
-        coopMatLoad(matB, B, kStart * u.cols + startCol, u.cols, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoadKHR(matB, B, kStart * u.cols + startCol, u.cols, gl_CooperativeMatrixLayoutRowMajor);
         
         // Perform matrix multiplication: C += A * B
-        matC = coopMatMulAdd(matA, matB, matC);
+        matC = coopMatMulAddKHR(matA, matB, matC);
     }
     
     // Store result
-    coopMatStore(matC, C, startRow * u.cols + startCol, u.cols, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStoreKHR(matC, C, startRow * u.cols + startCol, u.cols, gl_CooperativeMatrixLayoutRowMajor);
 }
