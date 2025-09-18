@@ -250,6 +250,13 @@ function compile_and_run(chunk)
     outputSizes = ensure_array(outputSizes),
     global      = global,
   }
+  
+  -- Set framework-specific source field
+  if is_vulkan_framework(fw) then
+    task.source_glsl = source
+  else
+    task.source = source
+  end
   -- due to local being reserved keyword in lua
   task["local"] = local_
 
@@ -273,6 +280,16 @@ function compile_and_run(chunk)
     print("[lua] CUDA launch dims - grid: {" .. table.concat(task.grid, ", ") .. "}, block: {" .. table.concat(task.block, ", ") .. "}")
   else
     print("[lua] CUDA launch dims not set - fw: " .. tostring(fw) .. ", is_cuda: " .. tostring(is_cuda_framework(fw)) .. ", has_grid: " .. tostring(task.grid ~= nil) .. ", has_block: " .. tostring(task.block ~= nil))
+  end
+
+  -- For Vulkan, set dispatch groups
+  if is_vulkan_framework(fw) and not task.groups then
+    local TILE = (payload.tileSize or cfg.tileSize or 16)
+    local r = rows or 1
+    local c = cols or 1
+    task.groups = { math.max(1, math.ceil(c / TILE)),
+                    math.max(1, math.ceil(r / TILE)), 1 }
+    print("[lua] Vulkan dispatch groups: {" .. table.concat(task.groups, ", ") .. "}")
   end
 
   if payload.buildOptions then task.buildOptions = payload.buildOptions end
