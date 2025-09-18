@@ -7,40 +7,78 @@
 
 import path from 'path';
 import fs from 'fs';
+import { logger } from '../lib/logger.js';
 
-// Reuse the webgpu ECM strategy’s chunker/assembler so buffer layout stays identical.
+// Reuse the webgpu ECM strategy's chunker/assembler so buffer layout stays identical.
 import {
   buildChunker as buildChunkerWeb,
   buildAssembler as buildAssemblerWeb,
-  // you may also reuse any helpers exported by your webgpu ECM strategy if needed
 } from './ecm-stage1.js';
 
 export const id = 'exe-ecm-stage1';
 export const name = 'ECM Stage 1 (exe/CUDA)';
 export const framework = 'exe';
 
-// Default program names per backend (override via config.program)
-const defaultPrograms = {
-  cuda: 'ecm_stage1_cuda',   // look up in PATH on the native client unless provided via artifact
-  // opencl: 'ecm_stage1_opencl', // (optional) if you later add a CL exe
+// Default binary paths per backend
+const defaultBinaries = {
+  cuda: '/app/binaries/exe_cuda_ecm_stage1',
+  opencl: '/app/binaries/exe_opencl_ecm_stage1', // Future support
 };
 
-export function getClientExecutorInfo({ config = {}, inputArgs = {} } = {}) {
-  const backend = (config.backend || 'cuda').toLowerCase();
-  const program = config.program || defaultPrograms[backend] || 'ecm_stage1_cuda';
-
-  // If the caller provides a compiled binary path, ship it as an artifact to the native client.
-  // Otherwise, the native client will resolve `program` in PATH.
+export function getArtifacts(config) {
+  const backend = (config?.backend || 'cuda').toLowerCase();
   const artifacts = [];
-  if (config.binary) {
-    const binPath = path.resolve(config.binary);
-    const bytes = fs.readFileSync(binPath);
+
+  // Determine binary path - prioritize config.binary, then defaults
+  const binaryPath = config.binary || defaultBinaries[backend];
+  if (!binaryPath) {
+    logger.warn(`[${id}] No binary configured for backend: ${backend}`);
+    return [];
+  }
+
+  try {
+    // Handle both absolute and relative paths
+    const abs = path.isAbsolute(binaryPath) ? binaryPath : path.resolve(binaryPath);
+
+    if (!fs.existsSync(abs)) {
+      throw new Error(`Binary not found: ${abs}`);
+    }
+
+    const bytes = fs.readFileSync(abs);
+    const artifactName = config.program || path.basename(binaryPath);
+
     artifacts.push({
-      name: program,          // BinaryExecutor will cache by this program name
       type: 'binary',
-      exec: true,
+      name: artifactName,
+      program: artifactName,
+      backend,
       bytes: bytes.toString('base64'),
+      exec: true
     });
+
+    logger.info(`[${id}] Added binary artifact: ${abs} as ${artifactName} (${bytes.length} bytes)`);
+  } catch (error) {
+    logger.error(`[${id}] Failed to read binary ${binaryPath}:`, error.message);
+    throw new Error(`Binary not found for ${backend}: ${binaryPath}`);
+  }
+
+  return artifacts;
+}
+
+export function getClientExecutorInfo(config = {}, inputArgs = {}) {
+  const backend = (config.backend || 'cuda').toLowerCase();
+
+  if (!['cuda', 'opencl'].includes(backend)) {
+    throw new Error(`Unsupported backend: ${backend}. Must be 'cuda' or 'opencl'`);
+  }
+
+  // Get artifacts with proper error handling
+  let artifacts = [];
+  try {
+    artifacts = getArtifacts(config);
+  } catch (error) {
+    logger.error(`[${id}] Failed to get artifacts:`, error.message);
+    // Don't throw here - let the task fail later if the binary is actually needed
   }
 
   return {
@@ -48,10 +86,10 @@ export function getClientExecutorInfo({ config = {}, inputArgs = {} } = {}) {
     name,
     framework,
     backend,
-    program,
+    program: config.program || path.basename(defaultBinaries[backend] || 'exe_cuda_ecm_stage1'),
     artifacts,
 
-    // (Optional) schematic; helpful for debugging
+    // Schema for debugging
     schema: {
       order: ['stdin', 'stdout'],
       inputs: [{ name: 'io', type: 'u32', note: 'Full ECM Stage 1 IO buffer (header + consts + pp + output + state)' }],
@@ -60,49 +98,67 @@ export function getClientExecutorInfo({ config = {}, inputArgs = {} } = {}) {
   };
 }
 
-// Build chunks using the *same* IO buffer the WebGPU path expects,
-// but convert each chunk to the exe transport using common protocol.
 export function buildChunker(args) {
   const { taskId, taskDir, K, config, inputArgs, inputFiles } = args;
-  console.log('DEBUG exe-ecm-stage1 buildChunker args:', JSON.stringify(args, null, 2));
-  console.log('DEBUG exe-ecm-stage1 inputArgs:', JSON.stringify(inputArgs, null, 2));
+
+  logger.info(`[${id}] buildChunker called with config:`, JSON.stringify(config, null, 2));
+  logger.info(`[${id}] buildChunker inputArgs:`, JSON.stringify(inputArgs, null, 2));
+
   const webChunker = buildChunkerWeb({ taskId, taskDir, K, config, inputArgs, inputFiles });
+
+  // Get the binary name for program reference
+  const backend = (config?.backend || 'cuda').toLowerCase();
+  const binaryPath = config.binary || defaultBinaries[backend];
+  const programName = config.program || path.basename(binaryPath || 'exe_cuda_ecm_stage1');
 
   return {
     async *stream() {
       for await (const chunk of webChunker.stream()) {
-        // `chunk.payload.data` is the full IO ArrayBuffer produced by the web ECM strategy.
+        // Extract the IO buffer from the web ECM chunk
         const ioBuffer = chunk?.payload?.data;
         if (!ioBuffer || !(ioBuffer instanceof ArrayBuffer)) {
           throw new Error(`[${id}] Expected web ECM chunk to have payload.data as ArrayBuffer`);
         }
 
-        // For exe: write entire IO buffer to stdin, expect same-sized stdout.
+        // For exe: write entire IO buffer to stdin, expect same-sized stdout
         const outSize = ioBuffer.byteLength;
 
         yield {
           id: chunk.id,
           payload: {
             action: 'exec',
-            // TaskManager will base64-encode ArrayBuffers for native clients automatically.
-            buffers: [ioBuffer],          // stdin
-            outputs: [outSize],           // expected stdout size
+            framework: 'exe',
+            // Convert ArrayBuffer to base64 for efficient transmission
+            buffers: [Buffer.from(ioBuffer).toString('base64')],
+            outputs: [{ byteLength: outSize }],
             meta: {
-              program: (config?.program) || defaultPrograms[(config?.backend || 'cuda').toLowerCase()] || 'ecm_stage1_cuda',
-              backend: (config?.backend || 'cuda').toLowerCase(),
+              program: programName,
+              backend: backend,
               framework: 'exe',
               // Carry through any useful metadata for logging/diagnostics
               ...chunk.meta,
             },
           },
-          meta: chunk.meta,              // keep the original meta (useful in assembler)
+          meta: {
+            ...chunk.meta,
+            program: programName,
+            backend: backend,
+          },
         };
       }
     }
   };
 }
 
-
-// Reuse the exact same assembler the web strategy uses;
-// it already knows how to parse the returned IO buffer and produce summary + artifacts.
+// Reuse the exact same assembler the web strategy uses
 export const buildAssembler = buildAssemblerWeb;
+
+// Helper function to get total chunks (for kill-switch)
+export function getTotalChunks(config, inputArgs) {
+  const totalCurves = inputArgs?.total_curves || 0;
+  const chunkSize = inputArgs?.chunk_size || 1;
+  if (totalCurves && chunkSize) {
+    return Math.ceil(totalCurves / chunkSize);
+  }
+  return null;
+}
