@@ -16,7 +16,7 @@ export function getClientExecutorInfo(config) {
     return {
       framework: 'webgpu',
       path: 'executors/webgpu-multi-head-attention.client.js',
-      kernels: ['kernels/multi_head_attention.wgsl']
+      kernels: ['kernels/webgpu/multi_head_attention.wgsl']
     };
   }
 
