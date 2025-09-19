@@ -167,22 +167,29 @@ async function main() {
   let status;
   while (true) {
     await new Promise(r => setTimeout(r, 800));
-    status = await api(baseURL, `/tasks/${taskId}/status`);
+    status = await api(baseURL, `/tasks/${taskId}`);
     if (!status) continue;
 
-    const { state, progress } = status;
-    process.stdout.write(`\rState: ${state}   ${progress != null ? `${Math.floor(progress * 100)}%` : ''}    `);
-    if (state === 'completed' || state === 'failed' || state === 'cancelled') {
+    const { status: state, completedChunks, totalChunks } = status;
+    const chunksInfo = totalChunks ? `${completedChunks || 0}/${totalChunks}` : '?';
+    const progress = totalChunks ? Math.floor(((completedChunks || 0) / totalChunks) * 100) : 0;
+
+    process.stdout.write(`\rState: ${state}   Chunks: ${chunksInfo}   Progress: ${progress}%    `);
+    if (state === 'completed' || state === 'error' || state === 'canceled') {
       console.log('');
       break;
     }
   }
 
-  if (status.state !== 'completed') {
+  if (status.status !== 'completed') {
     console.error('Task did not complete successfully:', status);
     process.exit(2);
   }
-  console.log('Task completed.\n');
+
+  // Show final completion summary
+  const finalChunks = status.completedChunks || 0;
+  const finalTotal = status.totalChunks || '?';
+  console.log(`Task completed successfully! Final status: ${finalChunks}/${finalTotal} chunks processed.\n`);
 
   // 4) Try to fetch summary first
   let summary;
