@@ -188,7 +188,7 @@ function testProtocolParsing() {
   console.log(`  Outputs: ${attentionPayload.readUInt32LE(20)}`);
   console.log(`  Metadata size: ${attentionPayload.readUInt32LE(24)}`);
 
-  console.log('\n✅ All protocol tests passed!');
+  console.log('\n All protocol tests passed!');
   console.log('\nThe common protocol is working correctly and can be used by all exe strategies.');
 }
 

@@ -185,10 +185,10 @@ function verifyFactors(records, N) {
 }
 
 async function runECMStage1() {
-  console.log(`🚀 Running ECM Stage1 with ${framework.toUpperCase()}...`);
+  console.log(`Running ECM Stage1 with ${framework.toUpperCase()}...`);
   console.log(`⚙️  N=${N}, B1=${B1}, curves=${curves}, chunkSize=${chunkSize}`);
   if (framework === 'exe-cuda') {
-    console.log(`🎯 Backend: ${backend}, threads: ${threads}, seed: ${seed}`);
+    console.log(`Backend: ${backend}, threads: ${threads}, seed: ${seed}`);
   }
 
   // Get strategy and config based on framework
@@ -201,12 +201,12 @@ async function runECMStage1() {
     config.cleanupOutputFiles = true;
   }
 
-  console.log(`🎯 Using strategy: ${strategyId}`);
+  console.log(`Using strategy: ${strategyId}`);
   console.log(`⚙️  Config:`, JSON.stringify(config, null, 2));
   if (cleanupOutput) {
     console.log(`🧹 Output files will be cleaned up after task completion`);
   }
-  console.log(`📊 Input args:`, JSON.stringify(inputArgs, null, 2));
+  console.log(`Input args:`, JSON.stringify(inputArgs, null, 2));
 
   // Create task
   const taskPayload = {

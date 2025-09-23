@@ -261,44 +261,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         if (Array.isArray(execInfo.artifacts) && execInfo.artifacts.length) {
             artifacts.push(...execInfo.artifacts);
         }
-        /*
-        // Add binary as artifact if specified in config
-        if (task.descriptor.config.binary) {
-          const binaryPath = task.descriptor.config.binary;
-          try {
-            const binaryData = fs.readFileSync(binaryPath);
-            // Use the program name from config if available, otherwise use the binary filename
-            const artifactName = task.descriptor.config.program || path.basename(binaryPath);
-            artifacts.push({
-              name: artifactName,
-              type: 'binary',
-              bytes: binaryData.toString('base64'),
-              exec: true
-            });
-            logger.info(`Added binary artifact: ${binaryPath} as ${artifactName} (${binaryData.length} bytes)`);
-          } catch (error) {
-            logger.error(`Failed to read binary ${binaryPath}:`, error);
-          }
-        }
-        */
-        // Dont add files as part of artifacts, data is read via chunks
-        /*
-        if (task.descriptor.inputFiles && task.descriptor.inputFiles.length > 0) {
-          for (const file of task.descriptor.inputFiles) {
-            try {
-              const fileData = fs.readFileSync(file.path);
-              artifacts.push({
-                name: file.originalName,
-                type: 'input',
-                bytes: fileData.toString('base64')
-              });
-              logger.info(`Added input file artifact: ${file.originalName} (${fileData.length} bytes)`);
-            } catch (error) {
-              logger.error(`Failed to read input file ${file.path}:`, error);
-            }
-          }
-        }
-        */
+        // Artifacts are handled separately, data is read via chunks
         this._sendToNativeClient(client.socket, 'workload:new', {
           id: id,
           strategyId: task.strategy.id,
@@ -411,7 +374,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
         try {
           task.queue.push(chunk.id);
-          logger.debug(`🔧 Created chunk ${chunk.id} - queue size: ${task.queue.length}, assignments: ${task.assignments.size}`);
+          logger.debug(`Created chunk ${chunk.id} - queue size: ${task.queue.length}, assignments: ${task.assignments.size}`);
         } finally {
           task.queueLock = false;
         }
@@ -494,7 +457,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     const entry = task.assignments.get(chunkId);
     if(!entry || entry.completed) {
       if(entry && entry.completed) {
-        logger.debug(`🚫 Skipping assignment of completed chunk ${chunkId}`);
+        logger.debug(`Skipping assignment of completed chunk ${chunkId}`);
       }
       return false;
     }
@@ -507,7 +470,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     if(entry.replicas >= task.K && !entry.completed) {
       const timeSinceAssignment = now - (entry.tCreate || now);
       if(timeSinceAssignment > stuckTimeout) {
-        logger.debug(`🔄 Resetting stuck chunk ${chunkId} after ${timeSinceAssignment}ms`);
+        logger.debug(`Resetting stuck chunk ${chunkId} after ${timeSinceAssignment}ms`);
         // Reset client inFlight counts first
         for(const clientId of entry.assignedTo) {
           const client = this.clients.get(clientId);
@@ -531,7 +494,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     if(entry.assignedTo.size > 0 && !entry.completed) {
       // If we've already reached K replicas, don't assign more
       if(entry.replicas >= task.K) {
-        logger.debug(`🚫 Skipping reassignment of chunk ${chunkId} - already assigned to [${Array.from(entry.assignedTo).join(',')}] and reached K=${task.K}`);
+        logger.debug(`Skipping reassignment of chunk ${chunkId} - already assigned to [${Array.from(entry.assignedTo).join(',')}] and reached K=${task.K}`);
         return false;
       }
       // If we haven't reached K replicas yet, we can still assign to different clients
@@ -616,7 +579,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       }
 
       // Emit chunk assignment with replica ID
-      logger.debug(`📤 Sending chunk ${chunkId} replica ${replica} to client ${c.socket.id} (payload size: ${payloadSize} bytes) - assignedTo: [${Array.from(entry.assignedTo).join(',')}], replicas: ${entry.replicas}/${task.K}`);
+      logger.debug(`Sending chunk ${chunkId} replica ${replica} to client ${c.socket.id} (payload size: ${payloadSize} bytes) - assignedTo: [${Array.from(entry.assignedTo).join(',')}], replicas: ${entry.replicas}/${task.K}`);
       c.socket.emit('chunk:assign', {
         taskId: task.id,
         chunkId,
@@ -713,7 +676,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
             const queueIndex = task.queue.indexOf(chunkId);
             if (queueIndex !== -1) {
               task.queue.splice(queueIndex, 1);
-              logger.debug(`🗑️ Atomically removed completed chunk ${chunkId} from queue (index ${queueIndex})`);
+              logger.debug(`Atomically removed completed chunk ${chunkId} from queue (index ${queueIndex})`);
             }
 
             // Clear assignment tracking to ensure no further assignments
@@ -726,7 +689,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, queue removed, assignments cleared`);
           // KILL-SWITCH: evaluate immediately after counting a completion
           if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
-            logger.warn(`🚨 KILL-SWITCH: Task ${task.id} reached ${task.completedChunks}/${task.completionThreshold}`);
+            logger.warn(`KILL-SWITCH: Task ${task.id} reached ${task.completedChunks}/${task.completionThreshold}`);
             this._finishByKillSwitch(task);   // helper below
             return;
           }
@@ -741,43 +704,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
     // KILL-SWITCH: Check if we've reached the completion threshold (moved outside replica check)
     // Debug logging for kill-switch
-    logger.debug(`🔍 Kill-switch check: completedChunks=${task.completedChunks}, threshold=${task.completionThreshold}`);
+    logger.debug(`Kill-switch check: completedChunks=${task.completedChunks}, threshold=${task.completionThreshold}`);
 
-    /*
-    if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
-      logger.warn(`🚨 KILL-SWITCH ACTIVATED: Task ${task.id} reached completion threshold (${task.completedChunks}/${task.completionThreshold}) - forcing completion`);
-
-      // Force task completion immediately
-      task.status = 'completed';
-      task.endTime = now();
-      task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
-
-      // Clean up resources
-      try {
-        if(task.assembler && typeof task.assembler.cleanup === 'function') {
-          task.assembler.cleanup();
-          logger.info(`Task ${task.id}: Assembler cleanup completed (kill-switch)`);
-        }
-      } catch(e) {
-        logger.warn(`Task ${task.id}: Assembler cleanup failed (kill-switch):`, e.message);
-      }
-
-      // OSUsageTracker
-      try { task.osTracker?.stop('completed'); } catch {}
-
-      // Send metrics:stop message
-      this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true });
-      logger.info(`Task ${task.id}: Sent metrics:stop to listener (kill-switch activated)`);
-
-      // Clean up output files if requested
-      if (task.descriptor.config?.cleanupOutputFiles === true) {
-        this._cleanupOutputFiles(task, { killSwitch: true });
-      }
-
-      logger.warn(`🚨 Task ${task.id} COMPLETED BY KILL-SWITCH - no more chunks will be processed`);
-      return; // Exit early, don't process any more chunks
-    }
-    */
   }
 
   _maybeFinish(taskId){
@@ -926,14 +854,14 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       task.queue = task.queue.filter(chunkId => {
         const entry = task.assignments.get(chunkId);
         if (!entry || entry.completed) {
-          logger.debug(`🧹 Removing completed/missing chunk ${chunkId} from queue`);
+          logger.debug(` Removing completed/missing chunk ${chunkId} from queue`);
           return false;
         }
         return true;
       });
 
       if (task.queue.length !== originalQueueLength) {
-        logger.debug(`🧹 Queue cleanup: removed ${originalQueueLength - task.queue.length} completed chunks, ${task.queue.length} remaining`);
+        logger.debug(`Queue cleanup: removed ${originalQueueLength - task.queue.length} completed chunks, ${task.queue.length} remaining`);
       }
 
       // Check for stuck chunks
@@ -948,7 +876,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           const last = entry.lastAssignedAt || entry.tCreate || now;
           const timeSinceAssignment = now - last;
           if(timeSinceAssignment > stuckTimeout) {
-            logger.debug(`🔄 Resetting stuck chunk ${chunkId} in drainQueue after ${timeSinceAssignment}ms`);
+            logger.debug(`Resetting stuck chunk ${chunkId} in drainQueue after ${timeSinceAssignment}ms`);
             // Reset client inFlight counts first
             for(const clientId of entry.assignedTo) {
               const client = this.clients.get(clientId);
@@ -970,7 +898,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         const entry = task.assignments.get(chunkId);
         if(!entry || entry.completed) {
           // This should not happen after cleanup, but just in case
-          logger.debug(`🚫 Skipping chunk ${chunkId} - missing or completed after cleanup`);
+          logger.debug(`Skipping chunk ${chunkId} - missing or completed after cleanup`);
           continue;
         }
         // Try to assign as many replicas as needed (up to K)

@@ -300,13 +300,13 @@ async function main() {
 
   // Check length
   if (resultData.length !== inputData.length) {
-    console.error(`⚠️ Length mismatch: expected ${inputData.length}, got ${resultData.length}`);
+    console.error(`️ Length mismatch: expected ${inputData.length}, got ${resultData.length}`);
     process.exit(4);
   }
 
   // Check if sorted
   if (!isSorted(resultData, ascending)) {
-    console.error('❌ Output is not properly sorted!');
+    console.error(' Output is not properly sorted!');
 
     // Find first unsorted position for debugging
     for (let i = 1; i < resultData.length; i++) {
@@ -329,19 +329,19 @@ async function main() {
   let elementsMismatch = false;
   for (let i = 0; i < count; i++) {
     if (reference[i] !== resultData[i]) {
-      console.error(`❌ Element mismatch at position ${i}: expected ${reference[i]}, got ${resultData[i]}`);
+      console.error(` Element mismatch at position ${i}: expected ${reference[i]}, got ${resultData[i]}`);
       elementsMismatch = true;
       break;
     }
   }
 
   if (elementsMismatch) {
-    console.log('❌ VALIDATION FAILED - Elements do not match reference');
+    console.log(' VALIDATION FAILED - Elements do not match reference');
     process.exit(6);
   } else {
     const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
     const throughput = Math.round(count / parseFloat(totalTime));
-    console.log(`✅ VALIDATION PASSED`);
+    console.log(` VALIDATION PASSED`);
     console.log(`Successfully sorted ${count} integers in ${totalTime}s (${throughput} int/s)`);
     console.log(`Backend: ${backend}, Chunks: ${chunkSize}, Direction: ${ascending ? 'ascending' : 'descending'}`);
 
@@ -395,7 +395,7 @@ Example:
 }
 
 main().catch(e => {
-  console.error('❌ Test failed with error:', e.message);
+  console.error(' Test failed with error:', e.message);
   if (args.verbose) {
     console.error(e.stack);
   }

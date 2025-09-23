@@ -139,7 +139,7 @@ function getStrategyAndConfig(framework, backend, chunkSize, ascending, maxEleme
 
 // Find suitable input file for sorting
 function findSortInputFile(uploadsDir, preferredFile, useMatrixData) {
-  console.log(`🔍 Looking for sort input file...`);
+  console.log(`Looking for sort input file...`);
   console.log(`   Preferred: ${preferredFile}`);
   console.log(`   Use matrix data: ${useMatrixData}`);
 
@@ -148,7 +148,7 @@ function findSortInputFile(uploadsDir, preferredFile, useMatrixData) {
   }
 
   const files = fs.readdirSync(uploadsDir);
-  console.log(`📁 Available files in uploads: ${files.length} files`);
+  console.log(`Available files in uploads: ${files.length} files`);
 
   // List all .bin files with sizes
   const binFiles = files.filter(f => f.endsWith('.bin')).map(f => {
@@ -162,7 +162,7 @@ function findSortInputFile(uploadsDir, preferredFile, useMatrixData) {
     };
   }).sort((a, b) => b.size - a.size); // Sort by size, largest first
 
-  console.log('📊 .bin files found:');
+  console.log('.bin files found:');
   binFiles.forEach(f => {
     console.log(`   - ${f.name} (${f.sizeMB} MB)`);
   });
@@ -206,11 +206,11 @@ function findSortInputFile(uploadsDir, preferredFile, useMatrixData) {
 }
 
 async function runDistributedSort() {
-  console.log(`🚀 Running Distributed Sort with ${framework.toUpperCase()}...`);
-  console.log(`⚙️  Chunk size: ${chunkSize}, Ascending: ${ascending}`);
-  if (maxElements) console.log(`🔢 Max elements: ${maxElements}`);
+  console.log(`Running Distributed Sort with ${framework.toUpperCase()}...`);
+  console.log(`Chunk size: ${chunkSize}, Ascending: ${ascending}`);
+  if (maxElements) console.log(`Max elements: ${maxElements}`);
   if (['cuda', 'exe', 'native'].includes(framework.toLowerCase())) {
-    console.log(`🎯 Backend: ${backend}`);
+    console.log(`Backend: ${backend}`);
   }
 
   // Find input file
@@ -222,11 +222,11 @@ async function runDistributedSort() {
   if (validate) {
     const filePath = path.join(uploadsDir, inputFile);
 
-    console.log('🔍 Loading input file for validation...');
+    console.log('Loading input file for validation...');
     const fileBuffer = fs.readFileSync(filePath);
     originalData = new Uint32Array(fileBuffer.buffer, fileBuffer.byteOffset, fileBuffer.byteLength / 4);
 
-    console.log(`📊 Loaded ${originalData.length} integers (${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    console.log(`Loaded ${originalData.length} integers (${(fileBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
 
     // Generate reference sorted array
     console.log('🧮 Computing reference sorted array...');
@@ -243,8 +243,8 @@ async function runDistributedSort() {
     config.cleanupOutputFiles = true;
   }
 
-  console.log(`🎯 Using strategy: ${strategyId}`);
-  console.log(`📁 Input file: ${inputFile}`);
+  console.log(`Using strategy: ${strategyId}`);
+  console.log(`Input file: ${inputFile}`);
   console.log(`⚙️  Config:`, JSON.stringify(config, null, 2));
   if (cleanupOutput) {
     console.log(`🧹 Output files will be cleaned up after task completion`);
@@ -295,7 +295,7 @@ async function runDistributedSort() {
     const total = j.totalChunks || '?';
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    process.stdout.write(`\r📊 [${elapsed}s] status=${status} ${chunks}/${total} chunks   `);
+    process.stdout.write(`\r[${elapsed}s] status=${status} ${chunks}/${total} chunks   `);
 
     if (status === 'completed' || status === 'error' || status === 'canceled') break;
   }
@@ -307,7 +307,7 @@ async function runDistributedSort() {
   }
 
   // Download results
-  console.log('📥 Downloading results...');
+  console.log('Downloading results...');
   const out = await fetchWithAgent(`${host}/tasks/${taskId}/output`);
   if (!out.ok) {
     console.error('❌ Download failed:', await resp.text());
@@ -325,7 +325,7 @@ async function runDistributedSort() {
 
   // Validate results if requested
   if (validate && reference && originalData) {
-    console.log('🔍 Validating results...');
+    console.log('Validating results...');
 
     if (resultData.length !== originalData.length) {
       console.error(`❌ Length mismatch: expected ${originalData.length}, got ${resultData.length}`);
@@ -360,7 +360,7 @@ async function runDistributedSort() {
 }
 
 async function main() {
-  console.log('🎯 Enhanced Cached Distributed Sort Test');
+  console.log('Enhanced Cached Distributed Sort Test');
   console.log('=========================================');
   console.log(`Framework: ${framework.toUpperCase()}`);
   if (['cuda', 'exe', 'native'].includes(framework.toLowerCase())) {
@@ -373,9 +373,9 @@ async function main() {
 
   try {
     await runDistributedSort();
-    console.log('\n🎉 Distributed sort test completed successfully!');
+    console.log('\nDistributed sort test completed successfully!');
   } catch (error) {
-    console.error('💥 Error:', error);
+    console.error('Error:', error);
     process.exit(99);
   }
 }

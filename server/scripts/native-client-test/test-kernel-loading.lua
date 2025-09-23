@@ -64,7 +64,7 @@ for _, framework in ipairs(frameworks) do
     if success then
         print("✓ " .. framework .. " test passed")
     else
-        print("❌ " .. framework .. " test failed:", result)
+        print(" " .. framework .. " test failed:", result)
     end
 end
 

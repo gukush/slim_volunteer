@@ -255,14 +255,14 @@ async function main() {
     }
 
     if (maxDiff < 0.1 && accuracy > 80) {
-      console.log('✅ PASS - Output matches CPU reference');
+      console.log(' PASS - Output matches CPU reference');
     } else {
-      console.log('❌ FAIL - Output differs significantly from CPU reference');
+      console.log(' FAIL - Output differs significantly from CPU reference');
       process.exit(1);
     }
 
     if (allHeadsMeanNormalized) {
-      console.log('✅ All heads have reasonable statistics');
+      console.log(' All heads have reasonable statistics');
     }
 
   } catch (error) {
@@ -280,7 +280,7 @@ async function main() {
     // Ignore cleanup errors
   }
 
-  console.log('✅ Multi-head attention test completed successfully!');
+  console.log(' Multi-head attention test completed successfully!');
 }
 
 main().catch(error => {

@@ -279,8 +279,8 @@ async function main() {
   const finalThroughput = Math.round(count / parseFloat(totalTime));
   const memoryEfficiencyActual = memoryLimitMB / (count * 4 / 1024 / 1024);
 
-  console.log('\n✅ SUCCESS - External distributed sort completed');
-  console.log(`📊 Performance Summary:`);
+  console.log('\n SUCCESS - External distributed sort completed');
+  console.log(` Performance Summary:`);
   console.log(`   Dataset: ${count.toLocaleString()} integers (${dataSize})`);
   console.log(`   Total time: ${totalTime}s`);
   console.log(`   Throughput: ${finalThroughput.toLocaleString()} integers/sec`);

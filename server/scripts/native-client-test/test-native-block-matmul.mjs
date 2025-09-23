@@ -164,7 +164,7 @@ async function main(){
   }
 
   if(status.status === 'failed'){
-    console.error('❌ Task failed:', status.error);
+    console.error(' Task failed:', status.error);
     process.exit(1);
   }
 
@@ -202,9 +202,9 @@ async function main(){
   console.log(`  Relative error: ${(relError*100).toFixed(6)}%`);
 
   if(relError < 1e-4){
-    console.log('✅ Result verification passed!');
+    console.log(' Result verification passed!');
   } else {
-    console.log('❌ Result verification failed - errors too large');
+    console.log(' Result verification failed - errors too large');
     process.exit(1);
   }
 
@@ -225,7 +225,7 @@ async function main(){
     // ignore cleanup errors
   }
 
-  console.log('\n✅ Test completed successfully!');
+  console.log('\n Test completed successfully!');
 }
 
 main().catch(err => {

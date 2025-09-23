@@ -253,10 +253,10 @@ async function main(){
     console.log(`    Absolute error: ${worst.abs.toExponential(3)}`);
     console.log(`    Relative error: ${worst.rel.toExponential(3)}`);
     console.log(`  Total errors: ${numErrors}/${Cgpu.length} elements`);
-    console.log('\n❌ VALIDATION FAILED');
+    console.log('\n VALIDATION FAILED');
     process.exit(4);
   } else {
-    console.log('\n✅ VALIDATION PASSED');
+    console.log('\n VALIDATION PASSED');
     console.log(`All ${Cgpu.length} elements within tolerance!`);
 
     // Performance estimate (rough)
@@ -275,7 +275,7 @@ async function main(){
 }
 
 main().catch(e=>{
-  console.error('\n❌ Fatal error:', e.message);
+  console.error('\n Fatal error:', e.message);
   if (args.verbose) {
     console.error(e.stack);
   }

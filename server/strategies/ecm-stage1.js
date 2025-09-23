@@ -400,7 +400,7 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }){
       }
 
       if (factorsFoundInChunk > 0) {
-        logger.info(`🎯 Found ${factorsFoundInChunk} factor(s) in chunk ${chunkId}`);
+        logger.info(` Found ${factorsFoundInChunk} factor(s) in chunk ${chunkId}`);
       }
 
       results.push({

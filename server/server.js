@@ -82,11 +82,11 @@ const wss = new WebSocketServer({
 
 // Add debugging for WebSocket server events
 wss.on('listening', () => {
-  logger.info('🚀 WebSocket server is listening on port', PORT + 1);
+  logger.info(' WebSocket server is listening on port', PORT + 1);
 });
 
 wss.on('error', (error) => {
-  logger.error('❌ WebSocket server error:', error);
+  logger.error(' WebSocket server error:', error);
 });
 
 logger.info(`Socket.IO will be available on port ${PORT}`);
@@ -106,7 +106,7 @@ io.on('connection', (socket)=>{
     // Log GPU information if available
     if (info.gpuInfo) {
       const gpuInfo = info.gpuInfo;
-      logger.info('🖥️  GPU Information from browser client:', {
+      logger.info('️  GPU Information from browser client:', {
         clientId: socket.id,
         vendor: gpuInfo.vendor,
         architecture: gpuInfo.architecture,
@@ -117,12 +117,12 @@ io.on('connection', (socket)=>{
 
       // Special warning for SwiftShader
       if (gpuInfo.isSwiftShader) {
-        logger.warn('⚠️  WARNING: Client is using SwiftShader (software renderer) - performance will be significantly reduced');
+        logger.warn('️  WARNING: Client is using SwiftShader (software renderer) - performance will be significantly reduced');
       } else {
-        logger.info('✅ Client is using hardware GPU acceleration');
+        logger.info(' Client is using hardware GPU acceleration');
       }
     } else {
-      logger.info('ℹ️  No GPU information available from client:', socket.id);
+      logger.info('️  No GPU information available from client:', socket.id);
     }
 
     tm.registerClient(socket, info||{}, 'socketio');
@@ -212,7 +212,7 @@ wss.on('connection', (ws, req) => {
 
   // SINGLE message handler - clean and simple
   ws.on('message', (data) => {
-    logger.debug(`🔔 Message handler triggered for ${ws.id}, data length: ${data.length}`);
+    logger.debug(` Message handler triggered for ${ws.id}, data length: ${data.length}`);
     try {
       // Handle both string and Buffer data
       let messageStr;
@@ -222,12 +222,12 @@ wss.on('connection', (ws, req) => {
         messageStr = data.toString();
       }
 
-      logger.info(`📨 ${ws.kind} ${ws.id} message:`, messageStr.substring(0, 100) + '...');
+      logger.info(` ${ws.kind} ${ws.id} message:`, messageStr.substring(0, 100) + '...');
 
       const message = JSON.parse(messageStr);
       const { type, data: eventData } = message;
 
-      logger.info(`🔍 Parsed message - type: ${type}, data keys:`, Object.keys(eventData || {}));
+      logger.info(` Parsed message - type: ${type}, data keys:`, Object.keys(eventData || {}));
       logger.debug(`Processing message type: ${type}`);
 
       // Handle listener connections differently

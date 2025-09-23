@@ -87,7 +87,7 @@ async function main() {
 
   // clean
   try { fs.unlinkSync(qPath); fs.unlinkSync(kPath); fs.unlinkSync(vPath); fs.rmdirSync(tmpDir); } catch {}
-  console.log('✅ Native MHA (CUDA Lua host) test finished.');
+  console.log(' Native MHA (CUDA Lua host) test finished.');
 }
 
 main().catch(e=>{ console.error(e); process.exit(99); });

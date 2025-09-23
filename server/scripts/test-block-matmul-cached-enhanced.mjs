@@ -140,12 +140,12 @@ function getStrategyAndConfig(framework, backend, N, K, M, TS, datatype, chunkSi
 }
 
 async function runBlockMatmul() {
-  console.log(`🚀 Running Block Matmul with ${framework.toUpperCase()}...`);
+  console.log(`Running Block Matmul with ${framework.toUpperCase()}...`);
   if (['native', 'exe'].includes(framework.toLowerCase())) {
-    console.log(`🎯 Backend: ${backend.toUpperCase()}`);
+    console.log(`Backend: ${backend.toUpperCase()}`);
   }
-  console.log(`📊 Dimensions: A(${N}x${K}) × B(${K}x${M}) = C(${N}x${M})`);
-  console.log(`📁 Cached files: ${fileA}, ${fileB}`);
+  console.log(`Dimensions: A(${N}x${K}) × B(${K}x${M}) = C(${N}x${M})`);
+  console.log(`Cached files: ${fileA}, ${fileB}`);
 
   // Load cached files for validation if needed
   let referenceA, referenceB, referenceC;
@@ -172,20 +172,20 @@ async function runBlockMatmul() {
       process.exit(1);
     }
 
-    console.log('🔍 Loading cached files for validation...');
+    console.log('Loading cached files for validation...');
     const fileABuffer = fs.readFileSync(fileAPath);
     const fileBBuffer = fs.readFileSync(fileBPath);
 
     referenceA = new Float32Array(fileABuffer.buffer, fileABuffer.byteOffset, fileABuffer.byteLength / 4);
     referenceB = new Float32Array(fileBBuffer.buffer, fileBBuffer.byteOffset, fileBBuffer.byteLength / 4);
 
-    console.log(`📊 Loaded A: ${referenceA.length} elements (${(fileABuffer.length / 1024 / 1024).toFixed(2)} MB)`);
-    console.log(`📊 Loaded B: ${referenceB.length} elements (${(fileBBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    console.log(`Loaded A: ${referenceA.length} elements (${(fileABuffer.length / 1024 / 1024).toFixed(2)} MB)`);
+    console.log(`Loaded B: ${referenceB.length} elements (${(fileBBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
 
     // Generate reference result
-    console.log('🧮 Computing reference result...');
+    console.log('Computing reference result...');
     referenceC = matmulCPUf32(referenceA, referenceB, N, K, M);
-    console.log('✅ Reference computation complete');
+    console.log('Reference computation complete');
   }
 
   // Get strategy and config based on framework
@@ -196,10 +196,10 @@ async function runBlockMatmul() {
     config.cleanupOutputFiles = true;
   }
 
-  console.log(`🎯 Using strategy: ${strategyId}`);
-  console.log(`⚙️  Config:`, JSON.stringify(config, null, 2));
+  console.log(`Using strategy: ${strategyId}`);
+  console.log(`Config:`, JSON.stringify(config, null, 2));
   if (cleanupOutput) {
-    console.log(`🧹 Output files will be cleaned up after task completion`);
+    console.log(`Output files will be cleaned up after task completion`);
   }
 
   // Create task using cached file paths
@@ -247,40 +247,40 @@ async function runBlockMatmul() {
     const total = j.totalChunks || '?';
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    process.stdout.write(`\r📊 [${elapsed}s] status=${status} ${chunks}/${total} chunks   `);
+    process.stdout.write(`\r[${elapsed}s] status=${status} ${chunks}/${total} chunks   `);
 
     if (status === 'completed' || status === 'error' || status === 'canceled') break;
   }
   console.log();
 
   if (status !== 'completed') {
-    console.error(`❌ Task did not complete: ${status}`);
+    console.error(`Task did not complete: ${status}`);
     process.exit(2);
   }
 
   // Download results
-  console.log('📥 Downloading results...');
+  console.log('Downloading results...');
   const out = await fetchWithAgent(`${host}/tasks/${taskId}/output`);
   if (!out.ok) {
-    console.error('❌ Download failed:', await resp.text());
+    console.error('Download failed:', await resp.text());
     process.exit(3);
   }
 
   const resultBuffer = new Uint8Array(await out.arrayBuffer());
   const resultData = new Float32Array(resultBuffer.buffer, resultBuffer.byteOffset, resultBuffer.byteLength / 4);
 
-  console.log(`✅ Successfully computed ${resultData.length} elements`);
+  console.log(`Successfully computed ${resultData.length} elements`);
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
   const gflops = (2 * N * K * M) / (parseFloat(totalTime) * 1e9);
-  console.log(`⏱️  Time: ${totalTime}s, Performance: ${gflops.toFixed(2)} GFLOPS`);
+  console.log(`Time: ${totalTime}s, Performance: ${gflops.toFixed(2)} GFLOPS`);
 
   // Validate results if requested
   if (validate && referenceC) {
-    console.log('🔍 Validating results...');
+    console.log('Validating results...');
 
     if (resultData.length !== referenceC.length) {
-      console.error(`❌ Length mismatch: expected ${referenceC.length}, got ${resultData.length}`);
+      console.error(`Length mismatch: expected ${referenceC.length}, got ${resultData.length}`);
       process.exit(4);
     }
 
@@ -292,14 +292,14 @@ async function runBlockMatmul() {
       maxError = Math.max(maxError, error);
     }
 
-    console.log(`📊 Validation: ${errorCount}/${resultData.length} elements differ`);
-    console.log(`📊 Max error: ${maxError.toExponential(3)}`);
+    console.log(`Validation: ${errorCount}/${resultData.length} elements differ`);
+    console.log(`Max error: ${maxError.toExponential(3)}`);
 
     if (maxError > 1e-3) {
-      console.error('❌ FAIL - Results differ significantly from reference');
+      console.error('FAIL - Results differ significantly from reference');
       process.exit(5);
     } else {
-      console.log('✅ PASS - Results match reference within tolerance');
+      console.log('PASS - Results match reference within tolerance');
     }
   }
 
@@ -307,7 +307,7 @@ async function runBlockMatmul() {
 }
 
 async function main() {
-  console.log('🎯 Enhanced Cached Block Matmul Test');
+  console.log('Enhanced Cached Block Matmul Test');
   console.log('=====================================');
   console.log(`Framework: ${framework.toUpperCase()}`);
   if (['native', 'exe'].includes(framework.toLowerCase())) {
@@ -320,9 +320,9 @@ async function main() {
 
   try {
     await runBlockMatmul();
-    console.log('\n🎉 Block matmul test completed successfully!');
+    console.log('\nBlock matmul test completed successfully!');
   } catch (error) {
-    console.error('💥 Error:', error);
+    console.error('Error:', error);
     process.exit(99);
   }
 }

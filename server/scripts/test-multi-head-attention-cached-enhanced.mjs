@@ -126,7 +126,7 @@ function getStrategyAndConfig(framework, backend, seqLen, dModel, numHeads) {
 
 // Find suitable input files for multi-head attention
 function findMHAInputFiles(uploadsDir, fileQ, fileK, fileV) {
-  console.log(`🔍 Looking for MHA input files...`);
+  console.log(`Looking for MHA input files...`);
   console.log(`   Q: ${fileQ}`);
   console.log(`   K: ${fileK}`);
   console.log(`   V: ${fileV}`);
@@ -136,7 +136,7 @@ function findMHAInputFiles(uploadsDir, fileQ, fileK, fileV) {
   }
 
   const files = fs.readdirSync(uploadsDir);
-  console.log(`📁 Available files in uploads: ${files.length} files`);
+  console.log(`Available files in uploads: ${files.length} files`);
 
   // List all .bin files with sizes
   const binFiles = files.filter(f => f.endsWith('.bin')).map(f => {
@@ -150,7 +150,7 @@ function findMHAInputFiles(uploadsDir, fileQ, fileK, fileV) {
     };
   }).sort((a, b) => b.size - a.size); // Sort by size, largest first
 
-  console.log('📊 .bin files found:');
+  console.log('.bin files found:');
   binFiles.forEach(f => {
     console.log(`   - ${f.name} (${f.sizeMB} MB)`);
   });
@@ -172,7 +172,7 @@ function findMHAInputFiles(uploadsDir, fileQ, fileK, fileV) {
   }
 
   if (missingFiles.length > 0) {
-    console.log(`\n💡 To generate missing files, run:`);
+    console.log(`\nTo generate missing files, run:`);
     console.log(`node generate-mha-data.mjs --seqLen=${seqLen} --dModel=${dModel} --numHeads=${numHeads}`);
     throw new Error(`Missing required files: ${missingFiles.join(', ')}`);
   }

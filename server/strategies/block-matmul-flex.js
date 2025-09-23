@@ -294,7 +294,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             const meta = { ib, jb, kb, kSpan: kNow, rows: rNow, cols: cNow, baseRows, baseCols, datatype, elementSize: typeInfo.elementSize };
 
             const chunkId = uuidv4();
-            logger.debug(`🔧 Generated chunk ${chunkId} for tile (${ib},${jb}) K[${kb}-${kb+kNow}) dims: ${rNow}x${kNow}x${cNow}`);
+            logger.debug(` Generated chunk ${chunkId} for tile (${ib},${jb}) K[${kb}-${kb+kNow}) dims: ${rNow}x${kNow}x${cNow}`);
             yield { id: chunkId, payload, meta, tCreate: Date.now() };
           }
         }

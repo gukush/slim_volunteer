@@ -183,10 +183,10 @@ async function main(){
   console.log(`Validation: maxAbs= ${maxAbs.toExponential(3)} maxRel= ${maxRel.toExponential(3)}`);
   if (!ok) {
     console.log(`Worst @${worst.i}: gpu=${worst.a} ref=${worst.b} abs=${worst.abs} rel=${worst.rel}`);
-    console.log('❌ FAIL');
+    console.log(' FAIL');
     process.exit(4);
   } else {
-    console.log('✅ PASS');
+    console.log(' PASS');
     process.exit(0);
   }
 }

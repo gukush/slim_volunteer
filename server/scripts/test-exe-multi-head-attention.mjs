@@ -178,9 +178,9 @@ async function main() {
   }
   console.log(`Max |diff| = ${maxAbs.toExponential(2)}  Agree ${(agree/O.length*100).toFixed(1)}%`);
   if (maxAbs < 1e-1 && agree/O.length > 0.8) {
-    console.log('✅ PASS');
+    console.log(' PASS');
   } else {
-    console.log('❌ FAIL');
+    console.log(' FAIL');
     process.exit(2);
   }
 

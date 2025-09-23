@@ -210,7 +210,7 @@ async function main(){
   }
 
   if (!isSorted) {
-    console.log(`\n❌ SORT VALIDATION FAILED`);
+    console.log(`\n SORT VALIDATION FAILED`);
     console.log(`  Found ${errors} errors (showing first ${maxErrors})`);
     process.exit(4);
   }
@@ -251,10 +251,10 @@ async function main(){
     console.log(`    Absolute error: ${worst.abs.toExponential(3)}`);
     console.log(`    Relative error: ${worst.rel.toExponential(3)}`);
     console.log(`  Total errors: ${numErrors}/${compareLength} elements`);
-    console.log('\n❌ VALIDATION FAILED');
+    console.log('\n VALIDATION FAILED');
     process.exit(4);
   } else {
-    console.log('\n✅ VALIDATION PASSED');
+    console.log('\n VALIDATION PASSED');
     console.log(`All ${compareLength} elements match reference!`);
 
     // Performance estimate
@@ -272,7 +272,7 @@ async function main(){
 }
 
 main().catch(e=>{
-  console.error('\n❌ Fatal error:', e.message);
+  console.error('\n Fatal error:', e.message);
   if (args.verbose) {
     console.error(e.stack);
   }

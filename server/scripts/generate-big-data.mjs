@@ -45,7 +45,7 @@ async function randMat(r, c, outputPath) {
   }
 
   fs.closeSync(fd);
-  console.log(`\r  ✅ Matrix generated: ${(totalElements * 4 / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`\r   Matrix generated: ${(totalElements * 4 / 1024 / 1024).toFixed(2)} MB`);
 }
 
 // Generate random integers for sorting with streaming for large datasets
@@ -75,11 +75,11 @@ async function generateRandomIntegers(count, outputPath) {
   }
 
   fs.closeSync(fd);
-  console.log(`\r  ✅ Sort data generated: ${(count * 4 / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`\r   Sort data generated: ${(count * 4 / 1024 / 1024).toFixed(2)} MB`);
 }
 
 async function main() {
-  console.log('🏗️  Generating large data files...');
+  console.log('️  Generating large data files...');
   console.log(`Matrix dimensions: A(${N}x${K}), B(${K}x${M})`);
   console.log(`Sort data: ${sortCount} integers`);
   console.log(`Output directory: ${uploadsDir}`);
@@ -87,10 +87,10 @@ async function main() {
   // Calculate total memory requirements
   const totalElements = N * K + K * M + sortCount;
   const totalMemoryGB = (totalElements * 4 / 1024 / 1024 / 1024).toFixed(2);
-  console.log(`📊 Total memory requirement: ~${totalMemoryGB} GB`);
+  console.log(` Total memory requirement: ~${totalMemoryGB} GB`);
 
   if (totalElements > 100000000) { // > 100M elements
-    console.log('⚠️  Large dataset detected - using streaming generation');
+    console.log('️  Large dataset detected - using streaming generation');
   }
 
   // Ensure uploads directory exists
@@ -106,23 +106,23 @@ async function main() {
   const fileBPath = path.join(uploadsDir, fileB);
   const fileSortPath = path.join(uploadsDir, fileSort);
 
-  console.log('🔄 Generating matrix A...');
+  console.log(' Generating matrix A...');
   await randMat(N, K, fileAPath);
 
-  console.log('🔄 Generating matrix B...');
+  console.log(' Generating matrix B...');
   await randMat(K, M, fileBPath);
 
   // Generate sort data
-  console.log('🔄 Generating sort data...');
+  console.log(' Generating sort data...');
   await generateRandomIntegers(sortCount, fileSortPath);
 
   console.log('');
-  console.log('✅ Files generated:');
+  console.log(' Files generated:');
   console.log(`  A.bin: ${fileA} (${(N * K * 4 / 1024 / 1024).toFixed(2)} MB)`);
   console.log(`  B.bin: ${fileB} (${(K * M * 4 / 1024 / 1024).toFixed(2)} MB)`);
   console.log(`  Sort: ${fileSort} (${(sortCount * 4 / 1024 / 1024).toFixed(2)} MB)`);
   console.log('');
-  console.log('🚀 Ready to run with cached scripts!');
+  console.log(' Ready to run with cached scripts!');
   console.log('');
   console.log('Block matmul command:');
   console.log(`node test-block-matmul-cached.mjs --N=${N} --K=${K} --M=${M} --validate=true`);

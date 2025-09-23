@@ -23,7 +23,7 @@ const dK = Math.floor(dModel / numHeads);
 const dV = dK; // Typically d_v = d_k
 
 if (dK * numHeads !== dModel) {
-  console.error(`❌ Error: d_model (${dModel}) must be divisible by num_heads (${numHeads})`);
+  console.error(` Error: d_model (${dModel}) must be divisible by num_heads (${numHeads})`);
   console.error(`   Current: d_model=${dModel}, num_heads=${numHeads}, d_k=${dK}`);
   console.error(`   Suggestion: Use num_heads that divides ${dModel} evenly`);
   process.exit(1);
@@ -64,22 +64,22 @@ async function generateMHAMatrix(rows, cols, outputPath, matrixName) {
   }
 
   fs.closeSync(fd);
-  console.log(`\r  ✅ ${matrixName} matrix generated: ${(totalElements * 4 / 1024 / 1024).toFixed(2)} MB`);
+  console.log(`\r   ${matrixName} matrix generated: ${(totalElements * 4 / 1024 / 1024).toFixed(2)} MB`);
 }
 
 async function main() {
-  console.log('🏗️  Generating Multi-Head Attention data files...');
-  console.log(`📊 Dimensions: seq_len=${seqLen}, d_model=${dModel}, num_heads=${numHeads}`);
-  console.log(`📐 Derived: d_k=${dK}, d_v=${dV}`);
-  console.log(`📁 Output directory: ${uploadsDir}`);
+  console.log('️  Generating Multi-Head Attention data files...');
+  console.log(` Dimensions: seq_len=${seqLen}, d_model=${dModel}, num_heads=${numHeads}`);
+  console.log(` Derived: d_k=${dK}, d_v=${dV}`);
+  console.log(` Output directory: ${uploadsDir}`);
 
   // Calculate total memory requirements
   const totalElements = 3 * seqLen * dModel; // Q, K, V matrices
   const totalMemoryGB = (totalElements * 4 / 1024 / 1024 / 1024).toFixed(2);
-  console.log(`📊 Total memory requirement: ~${totalMemoryGB} GB`);
+  console.log(` Total memory requirement: ~${totalMemoryGB} GB`);
 
   if (totalElements > 100000000) { // > 100M elements
-    console.log('⚠️  Large dataset detected - using streaming generation');
+    console.log('️  Large dataset detected - using streaming generation');
   }
 
   // Ensure uploads directory exists
@@ -95,31 +95,31 @@ async function main() {
   const fileKPath = path.join(uploadsDir, fileK);
   const fileVPath = path.join(uploadsDir, fileV);
 
-  console.log('🔄 Generating Q matrix...');
+  console.log(' Generating Q matrix...');
   await generateMHAMatrix(seqLen, dModel, fileQPath, 'Q');
 
-  console.log('🔄 Generating K matrix...');
+  console.log(' Generating K matrix...');
   await generateMHAMatrix(seqLen, dModel, fileKPath, 'K');
 
-  console.log('🔄 Generating V matrix...');
+  console.log(' Generating V matrix...');
   await generateMHAMatrix(seqLen, dModel, fileVPath, 'V');
 
   console.log('');
-  console.log('✅ Files generated:');
+  console.log(' Files generated:');
   console.log(`  Q.bin: ${fileQ} (${(seqLen * dModel * 4 / 1024 / 1024).toFixed(2)} MB)`);
   console.log(`  K.bin: ${fileK} (${(seqLen * dModel * 4 / 1024 / 1024).toFixed(2)} MB)`);
   console.log(`  V.bin: ${fileV} (${(seqLen * dModel * 4 / 1024 / 1024).toFixed(2)} MB)`);
   console.log('');
-  console.log('🚀 Ready to run with cached scripts!');
+  console.log(' Ready to run with cached scripts!');
   console.log('');
   console.log('Multi-head attention commands:');
   console.log(`node test-multi-head-attention-cached-enhanced.mjs --framework=webgpu --seqLen=${seqLen} --dModel=${dModel} --numHeads=${numHeads}`);
   console.log(`node test-multi-head-attention-cached-enhanced.mjs --framework=native --seqLen=${seqLen} --dModel=${dModel} --numHeads=${numHeads}`);
   console.log(`node test-multi-head-attention-cached-enhanced.mjs --framework=exe --seqLen=${seqLen} --dModel=${dModel} --numHeads=${numHeads}`);
   console.log('');
-  console.log('📝 Note: All matrices are stored in row-major format [seq_len, d_model]');
-  console.log(`📝 Each matrix contains ${seqLen} sequences of ${dModel} features`);
-  console.log(`📝 Attention heads: ${numHeads} heads, each with d_k=${dK} dimensions`);
+  console.log(' Note: All matrices are stored in row-major format [seq_len, d_model]');
+  console.log(` Each matrix contains ${seqLen} sequences of ${dModel} features`);
+  console.log(` Attention heads: ${numHeads} heads, each with d_k=${dK} dimensions`);
 }
 
 main().catch(console.error);

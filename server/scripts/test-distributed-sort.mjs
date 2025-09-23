@@ -152,12 +152,12 @@ async function main() {
     }
   }
   if (elementsMismatch) {
-    console.log('❌ FAIL - Elements do not match reference');
+    console.log(' FAIL - Elements do not match reference');
     process.exit(6);
   } else {
     const totalTime = ((Date.now() - startTime) / 1000).toFixed(2);
     const throughput = Math.round(count / parseFloat(totalTime));
-    console.log(`✅ PASS - Successfully sorted ${count} integers in ${totalTime}s (${throughput} int/s)`);
+    console.log(` PASS - Successfully sorted ${count} integers in ${totalTime}s (${throughput} int/s)`);
     process.exit(0);
   }
 }
