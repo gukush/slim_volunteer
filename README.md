@@ -1,6 +1,6 @@
 # Volunteer Compute
 
-Minimal, readable volunteer computing system: Node.js server + browser clients (WebGPU).
+Minimal volunteer computing system: Node.js server + browser clients (WebGPU).
 
 ## Quickstart
 
