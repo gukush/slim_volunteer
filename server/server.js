@@ -350,6 +350,36 @@ wss.on('connection', (ws, req) => {
   }, 100);
 });
 
+// ── HTTP Data Plane endpoints ─────────────────────────────────────────
+// Serve packed binary payload for a chunk (browser clients fetch this)
+app.get('/chunks/:taskId/:chunkId/payload', (req, res) => {
+  const packed = tm.getChunkPayload(req.params.taskId, req.params.chunkId);
+  if (!packed) return res.status(404).json({ error: 'chunk not found or payload already freed' });
+  res.setHeader('Content-Type', 'application/octet-stream');
+  res.setHeader('Content-Length', packed.length);
+  res.send(packed);
+});
+
+// Accept binary result from browser clients (metadata in headers)
+app.post('/chunks/:taskId/:chunkId/result', express.raw({ type: 'application/octet-stream', limit: '100mb' }), (req, res) => {
+  const { taskId, chunkId } = req.params;
+  const socketId = req.headers['x-socket-id'];
+  const replica  = req.headers['x-replica'];
+  const status   = req.headers['x-status'];
+  const checksum = req.headers['x-checksum'];
+  const timings  = req.headers['x-timings'];
+
+  if (!socketId) return res.status(400).json({ error: 'X-Socket-Id header required' });
+
+  tm.receiveResultHTTP({
+    taskId, chunkId, socketId,
+    replica, status, checksum, timings,
+    resultBuffer: req.body,
+  });
+
+  res.json({ ok: true });
+});
+
 // REST API endpoints (unchanged)
 app.get('/tasks/:id', (req, res)=>{
   const s = tm.statusTask(req.params.id);

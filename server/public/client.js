@@ -93,6 +93,52 @@ function notifyListenerChunkComplete(chunkId, status) {
   }, 0);
 }
 
+// ── HTTP Data Plane helpers ──────────────────────────────────────────
+
+// Fetch packed binary payload via HTTP and unpack into a payload object
+async function fetchPayload(taskId, chunkId) {
+  const resp = await fetch(`/chunks/${taskId}/${chunkId}/payload`);
+  if (!resp.ok) throw new Error(`Payload fetch failed: ${resp.status}`);
+  const ab = await resp.arrayBuffer();
+  const view = new DataView(ab);
+  const headerLen = view.getUint32(0, true); // little-endian
+  const headerBytes = new Uint8Array(ab, 4, headerLen);
+  const header = JSON.parse(new TextDecoder().decode(headerBytes));
+
+  const buffers = [];
+  let offset = 4 + headerLen;
+  if (header.bufferSizes) {
+    for (const size of header.bufferSizes) {
+      buffers.push(ab.slice(offset, offset + size));
+      offset += size;
+    }
+  }
+
+  // Reconstruct the payload object (remove packing metadata)
+  const payload = { ...header, buffers };
+  delete payload.bufferSizes;
+  delete payload.bufferCount;
+  return payload;
+}
+
+// Upload binary result via HTTP POST (metadata in headers)
+async function uploadResult(taskId, chunkId, { replica, status, checksum, result, timings }) {
+  const resp = await fetch(`/chunks/${taskId}/${chunkId}/result`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'X-Socket-Id': socket.id,
+      'X-Replica': String(replica),
+      'X-Status': status,
+      'X-Checksum': checksum,
+      'X-Timings': JSON.stringify(timings || {}),
+    },
+    body: result,
+  });
+  if (!resp.ok) throw new Error(`Result upload failed: ${resp.status}`);
+  return resp.json();
+}
+
 // notifyListenerMetrics function removed - metrics are now sent directly from server to listener
 
 socket.on('connect', async ()=>{
@@ -185,7 +231,7 @@ socket.on('task:init', (msg)=>{
 });
 
 socket.on('chunk:assign', async (job)=>{
-  const { taskId, chunkId, replica, payload, meta, tCreate } = job;
+  const { taskId, chunkId, replica, payload, payloadDescriptor, meta, tCreate } = job;
 
   // Notify listener of chunk arrival
   notifyListenerChunkArrival(chunkId, taskId);
@@ -217,16 +263,48 @@ socket.on('chunk:assign', async (job)=>{
     }
   }
 
+  // Resolve the actual payload: HTTP fetch if descriptor-only, else inline (backward compat)
+  let actualPayload = payload;
+  if (!actualPayload && payloadDescriptor) {
+    try {
+      log('debug', 'Fetching payload via HTTP for chunk', chunkId);
+      actualPayload = await fetchPayload(taskId, chunkId);
+      log('debug', 'HTTP payload fetched for chunk', chunkId);
+    } catch (e) {
+      log('error', 'HTTP payload fetch failed for chunk', chunkId, e.message);
+      socket.emit('chunk:result', { taskId, chunkId, replica, status: 'error', error: 'payload-fetch-failed: ' + e.message });
+      notifyListenerChunkComplete(chunkId, 'error');
+      return;
+    }
+  }
+
   try{
     log('debug', 'Starting chunk execution for', chunkId);
-    const res = await exec.runChunk({ payload, meta });
+    const res = await exec.runChunk({ payload: actualPayload, meta });
     log('debug', 'Chunk execution completed, result:', res);
     const checksum = await checksumHex(res.result);
-    socket.emit('chunk:result', {
-      taskId, chunkId, replica, status: res.status, checksum,
-      result: res.result, timings: res.timings
-    });
-    log('debug', 'chunk done', chunkId, 'cs', checksum.slice(0,8));
+
+    // Try HTTP POST first (avoids blocking Socket.IO event loop with large binary)
+    let httpOk = false;
+    try {
+      await uploadResult(taskId, chunkId, {
+        replica, status: res.status, checksum,
+        result: res.result, timings: res.timings,
+      });
+      httpOk = true;
+      log('debug', 'chunk done (HTTP)', chunkId, 'cs', checksum.slice(0,8));
+    } catch (httpErr) {
+      log('warn', 'HTTP result upload failed, falling back to Socket.IO', httpErr.message);
+    }
+
+    // Fallback: send result via Socket.IO if HTTP failed
+    if (!httpOk) {
+      socket.emit('chunk:result', {
+        taskId, chunkId, replica, status: res.status, checksum,
+        result: res.result, timings: res.timings
+      });
+      log('debug', 'chunk done (Socket.IO fallback)', chunkId, 'cs', checksum.slice(0,8));
+    }
 
     // Notify listener of successful completion
     log('debug', 'Chunk completed successfully, status:', res.status);

@@ -10,6 +10,32 @@ import { OSUsageTracker } from './osMetrics.js';
 const OS_METRICS_INTERVAL_MS = Number(process.env.OS_METRICS_INTERVAL_MS || 1000);
 const OS_METRICS_MOUNT      = process.env.OS_METRICS_MOUNT || '/';
 
+// Promise-based mutex (no npm deps — avoids Docker rebuild)
+class Mutex {
+  constructor() {
+    this._queue = [];
+    this._locked = false;
+  }
+  acquire() {
+    return new Promise(resolve => {
+      if (!this._locked) {
+        this._locked = true;
+        resolve();
+      } else {
+        this._queue.push(resolve);
+      }
+    });
+  }
+  release() {
+    if (this._queue.length > 0) {
+      const next = this._queue.shift();
+      next();
+    } else {
+      this._locked = false;
+    }
+  }
+}
+
 export class TaskManager{
   constructor({io, wss, storageDir, timingDir}){
     this.io = io;
@@ -169,13 +195,13 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   const task = {
     id, descriptor, strategy, chunker, assembler, timers,
     status: 'created', startTime: null, endTime: null, K,
-    queue: [], assignments: new Map(),
+    pendingQueue: new Set(), assignments: new Map(),
     totalChunks: null, completedChunks: 0,
     completionThreshold: null, // Kill-switch threshold for deterministic completion
     cancelRequested: false, chunkerFinished: false,
     framework: null,
     osTracker: null,
-    queueLock: false, // Simple mutex to prevent concurrent queue modifications
+    queueMutex: new Mutex(),
   };
   this.tasks.set(id, task);
   logger.info('Task created', id, strategyId, 'K=', K);
@@ -347,9 +373,8 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         // Throttle check BEFORE processing the chunk
         const pending = task.assignments.size - task.completedChunks;
         while ((task.assignments.size - task.completedChunks) > MAX_PENDING && !task.cancelRequested) {
-          logger.debug(`Task ${task.id}: Throttling chunk generation (${pending} pending, ${task.queue.length} in queue)`);
-          // Use setImmediate to yield control to other operations (like result processing)
-          await new Promise(r => setTimeout(r, 5)); // Skip this iteration
+          logger.debug(`Task ${task.id}: Throttling chunk generation (${pending} pending, ${task.pendingQueue.size} in queue)`);
+          await new Promise(r => setTimeout(r, 5));
         }
 
         const entry = {
@@ -366,17 +391,12 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
         task.assignments.set(chunk.id, entry);
 
-        // Acquire queue lock to safely add to queue
-        while (task.queueLock) {
-          await new Promise(resolve => setImmediate(resolve)); // Yield to event loop
-        }
-        task.queueLock = true;
-
+        await task.queueMutex.acquire();
         try {
-          task.queue.push(chunk.id);
-          logger.debug(`Created chunk ${chunk.id} - queue size: ${task.queue.length}, assignments: ${task.assignments.size}`);
+          task.pendingQueue.add(chunk.id);
+          logger.debug(`Created chunk ${chunk.id} - queue size: ${task.pendingQueue.size}, assignments: ${task.assignments.size}`);
         } finally {
-          task.queueLock = false;
+          task.queueMutex.release();
         }
 
         task.timers.chunkRow({
@@ -580,14 +600,27 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
       // Emit chunk assignment with replica ID
       logger.debug(`Sending chunk ${chunkId} replica ${replica} to client ${c.socket.id} (payload size: ${payloadSize} bytes) - assignedTo: [${Array.from(entry.assignedTo).join(',')}], replicas: ${entry.replicas}/${task.K}`);
-      c.socket.emit('chunk:assign', {
-        taskId: task.id,
-        chunkId,
-        replica,
-        payload: serializedPayload,
-        meta: entry.meta,
-        tCreate: entry.tCreate,
-      });
+      if (c.clientType === 'native') {
+        // Native clients: send full payload inline (existing behavior)
+        c.socket.emit('chunk:assign', {
+          taskId: task.id,
+          chunkId,
+          replica,
+          payload: serializedPayload,
+          meta: entry.meta,
+          tCreate: entry.tCreate,
+        });
+      } else {
+        // Browser clients: send metadata only, client fetches payload via HTTP
+        c.socket.emit('chunk:assign', {
+          taskId: task.id,
+          chunkId,
+          replica,
+          payloadDescriptor: this._describePayload(entry.payload),
+          meta: entry.meta,
+          tCreate: entry.tCreate,
+        });
+      }
 
       const tSent = Date.now();
       task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tSent });
@@ -661,29 +694,18 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           task.assembler.integrate({ chunkId, result: resultData, meta: entry.meta });
           const tAssembled = now();
           task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled, cpuTimeMs, gpuTimeMs });
-          // Atomically mark as completed and remove from queue to prevent race conditions
-          // Use simple mutex to prevent concurrent queue modifications
-          while (task.queueLock) {
-            await new Promise(resolve => setImmediate(resolve)); // Yield to event loop
-          }
-          task.queueLock = true;
 
+          await task.queueMutex.acquire();
           try {
             entry.completed = true;
-            task.completedChunks += 1
+            task.completedChunks += 1;
             entry.results.clear();
-            // Immediately remove from queue to prevent any further assignment attempts
-            const queueIndex = task.queue.indexOf(chunkId);
-            if (queueIndex !== -1) {
-              task.queue.splice(queueIndex, 1);
-              logger.debug(`Atomically removed completed chunk ${chunkId} from queue (index ${queueIndex})`);
-            }
-
-            // Clear assignment tracking to ensure no further assignments
+            task.pendingQueue.delete(chunkId);
             entry.assignedTo.clear();
             entry.replicas = 0;
+            entry.payload = null; // free memory
           } finally {
-            task.queueLock = false;
+            task.queueMutex.release();
           }
 
           logger.debug(`Chunk accepted ${task.id} ${chunkId} checksum ${cs} - completed: ${entry.completed}, queue removed, assignments cleared`);
@@ -694,7 +716,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
             return;
           }
           this._maybeFinish(task.id);
-          this._drainTaskQueue(task);
+          this._assignNextToClient(task, socketId);
         }catch(e){
           logger.error('Assembler integrate error', e);
         }
@@ -837,78 +859,162 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     }
   }
 
-  _drainTaskQueue(task){
-    if(!task || task.status!=='running') return;
+  // ── HTTP Data Plane helpers ──────────────────────────────────────────
 
-    // Acquire queue lock to prevent concurrent modifications
-    if (task.queueLock) {
-      // If queue is locked, skip this iteration to avoid race conditions
+  // Returns metadata-only description of a payload (no binary)
+  _describePayload(payload) {
+    if (!payload) return null;
+    const desc = {};
+    if (payload.buffers) {
+      desc.bufferCount = payload.buffers.length;
+      desc.bufferSizes = payload.buffers.map(buf => {
+        if (buf instanceof ArrayBuffer) return buf.byteLength;
+        if (Array.isArray(buf)) return buf.length;
+        if (buf?.byteLength !== undefined) return buf.byteLength;
+        return 0;
+      });
+      // Copy all non-buffer scalar properties
+      for (const [key, val] of Object.entries(payload)) {
+        if (key !== 'buffers') desc[key] = val;
+      }
+    } else {
+      Object.assign(desc, payload);
+    }
+    return desc;
+  }
+
+  // Pack a mixed payload into binary: [4-byte header len LE][JSON header][buf0][buf1]...
+  packPayload(payload) {
+    if (!payload) return null;
+
+    const headerObj = {};
+    const rawBuffers = [];
+
+    if (payload.buffers) {
+      for (const [key, val] of Object.entries(payload)) {
+        if (key !== 'buffers') headerObj[key] = val;
+      }
+      headerObj.bufferSizes = [];
+      for (const buf of payload.buffers) {
+        let nodeBuf;
+        if (buf instanceof ArrayBuffer) {
+          nodeBuf = Buffer.from(buf);
+        } else if (Array.isArray(buf)) {
+          nodeBuf = Buffer.from(new Uint8Array(buf));
+        } else if (buf?.buffer) {
+          nodeBuf = Buffer.from(buf.buffer, buf.byteOffset || 0, buf.byteLength);
+        } else {
+          nodeBuf = Buffer.from(buf);
+        }
+        headerObj.bufferSizes.push(nodeBuf.length);
+        rawBuffers.push(nodeBuf);
+      }
+    } else {
+      Object.assign(headerObj, payload);
+    }
+
+    const headerJson = Buffer.from(JSON.stringify(headerObj));
+    const headerLen = Buffer.alloc(4);
+    headerLen.writeUInt32LE(headerJson.length, 0);
+    return Buffer.concat([headerLen, headerJson, ...rawBuffers]);
+  }
+
+  // Return packed binary for a specific chunk (used by HTTP GET endpoint)
+  getChunkPayload(taskId, chunkId) {
+    const task = this.tasks.get(taskId);
+    if (!task) return null;
+    const entry = task.assignments.get(chunkId);
+    if (!entry || !entry.payload) return null;
+    return this.packPayload(entry.payload);
+  }
+
+  // Accept a result submitted via HTTP POST (delegates to receiveResult)
+  receiveResultHTTP({ taskId, chunkId, socketId, replica, status, checksum, timings, resultBuffer }) {
+    return this.receiveResult(socketId, {
+      taskId,
+      chunkId,
+      replica: Number(replica),
+      status,
+      checksum,
+      result: resultBuffer,
+      timings: timings ? JSON.parse(timings) : {},
+    });
+  }
+
+  // O(1) assignment: picks the first pending chunk from the Set and assigns it
+  // directly to the client that just freed capacity (completed a chunk).
+  _assignNextToClient(task, socketId) {
+    if (!task || task.status !== 'running' || task.cancelRequested) return;
+    const client = this.clients.get(socketId);
+    if (!client || (client.inFlight || 0) >= (client.capacity || 1)) return;
+
+    for (const chunkId of task.pendingQueue) {
+      const entry = task.assignments.get(chunkId);
+      if (!entry || entry.completed) continue;
+      if (entry.replicas >= task.K) continue;
+
+      const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
+      if (!allowSameClient && entry.assignedTo.has(socketId)) continue;
+
+      // Found a pending chunk — assign it
+      this._assignChunkReplica(task, chunkId);
       return;
     }
-    task.queueLock = true;
+  }
 
+  async _drainTaskQueue(task){
+    if(!task || task.status!=='running') return;
+
+    await task.queueMutex.acquire();
     try {
-      // First, clean up the queue by removing completed chunks
-      // This is critical to prevent processing of already completed chunks
-      const originalQueueLength = task.queue.length;
-      task.queue = task.queue.filter(chunkId => {
+      const toRemove = [];
+
+      // Clean up completed chunks and handle stuck chunks
+      const nowMs = Date.now();
+      const stuckTimeout = 10000; // 10 seconds
+
+      for (const chunkId of task.pendingQueue) {
         const entry = task.assignments.get(chunkId);
         if (!entry || entry.completed) {
-          logger.debug(` Removing completed/missing chunk ${chunkId} from queue`);
-          return false;
+          toRemove.push(chunkId);
+          continue;
         }
-        return true;
-      });
 
-      if (task.queue.length !== originalQueueLength) {
-        logger.debug(`Queue cleanup: removed ${originalQueueLength - task.queue.length} completed chunks, ${task.queue.length} remaining`);
-      }
-
-      // Check for stuck chunks
-      const now = Date.now();
-      const stuckTimeout = 10000; // 10 seconds
-      for(const chunkId of task.queue){
-        const entry = task.assignments.get(chunkId);
-        if(!entry || entry.completed) continue;
-
-        // Check if chunk is stuck (assigned but not completed for too long)
-        if(entry.replicas >= task.K && !entry.completed) {
-          const last = entry.lastAssignedAt || entry.tCreate || now;
-          const timeSinceAssignment = now - last;
-          if(timeSinceAssignment > stuckTimeout) {
+        // Check for stuck chunks (assigned but not completed for too long)
+        if (entry.replicas >= task.K && !entry.completed) {
+          const last = entry.lastAssignedAt || entry.tCreate || nowMs;
+          const timeSinceAssignment = nowMs - last;
+          if (timeSinceAssignment > stuckTimeout) {
             logger.debug(`Resetting stuck chunk ${chunkId} in drainQueue after ${timeSinceAssignment}ms`);
-            // Reset client inFlight counts first
-            for(const clientId of entry.assignedTo) {
+            for (const clientId of entry.assignedTo) {
               const client = this.clients.get(clientId);
-              if(client) {
+              if (client) {
                 client.inFlight = Math.max(0, (client.inFlight || 0) - 1);
               }
             }
-            // Reset the chunk assignment
             entry.replicas = 0;
             entry.assignedTo.clear();
           }
         }
       }
 
-      // Iterate over queued chunks and try to assign replicas
-      // Make a copy of the queue to avoid issues if queue is modified during iteration
-      const queueCopy = [...task.queue];
-      for(const chunkId of queueCopy){
+      // Deferred deletion — safe after iteration
+      for (const id of toRemove) task.pendingQueue.delete(id);
+      if (toRemove.length) {
+        logger.debug(`Queue cleanup: removed ${toRemove.length} completed chunks, ${task.pendingQueue.size} remaining`);
+      }
+
+      // Assign replicas for pending chunks
+      for (const chunkId of task.pendingQueue) {
         const entry = task.assignments.get(chunkId);
-        if(!entry || entry.completed) {
-          // This should not happen after cleanup, but just in case
-          logger.debug(`Skipping chunk ${chunkId} - missing or completed after cleanup`);
-          continue;
-        }
-        // Try to assign as many replicas as needed (up to K)
-        while(entry.replicas < task.K){
+        if (!entry || entry.completed) continue;
+        while (entry.replicas < task.K) {
           const assigned = this._assignChunkReplica(task, chunkId);
-          if(!assigned) break; // No capacity right now
+          if (!assigned) break; // No capacity right now
         }
       }
     } finally {
-      task.queueLock = false;
+      task.queueMutex.release();
     }
   }
 }
