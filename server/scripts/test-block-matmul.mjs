@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 // Verification test for block-matmul-flex strategy.
-// Uses native FormData API - no form-data package needed!
 
 import fs from 'fs';
 import path from 'path';
@@ -14,7 +13,7 @@ const args = Object.fromEntries(process.argv.slice(2).map(s=>{
 }));
 
 const host = args.host || 'https://localhost:3000';
-const framework = args.framework || 'webgpu'; // 'webgpu' | 'webgl2' | 'cpp-wasm'
+const framework = args.framework || 'webgpu';
 const N = parseInt(args.N||'64',10), K = parseInt(args.K||'64',10), M = parseInt(args.M||'64',10);
 const TS = parseInt(args.tileSize||'32',10);
 const Krep = parseInt(args.Krep||'1',10);
@@ -35,13 +34,12 @@ function matmulCPUf32(A,B,rows,kk,cols){
   return C;
 }
 
-// Helper to ignore self-signed certificates for localhost
 import { Agent } from 'https';
 const httpsAgent = new Agent({ rejectUnauthorized: false });
 
 async function fetchWithAgent(url, options = {}) {
   if (url.startsWith('https://localhost')) {
-    // For self-signed certificates, we need to use a custom agent
+    // self-signed certs -> custom agent (trap)
     const https = await import('https');
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
@@ -72,7 +70,6 @@ async function fetchWithAgent(url, options = {}) {
       req.on('error', reject);
       if (options.body) {
         if (options.body instanceof FormData) {
-          // FormData not supported in this simple implementation
           reject(new Error('Use regular fetch for FormData'));
         } else {
           req.write(options.body);
@@ -81,12 +78,10 @@ async function fetchWithAgent(url, options = {}) {
       req.end();
     });
   }
-  // For non-localhost HTTPS or HTTP, use regular fetch
   return fetch(url, options);
 }
 
 async function main(){
-  // 1) build A.bin, B.bin
   const A = randMat(N,K);
   const B = randMat(K,M);
   const tmpDir = '/tmp';
@@ -97,20 +92,17 @@ async function main(){
 
   const Cref = matmulCPUf32(A,B,N,K,M);
 
-  // 2) POST /tasks using native FormData (available in Node.js 18+)
   const fd = new FormData();
   fd.append('strategyId', 'block-matmul-flex');
   fd.append('K', String(Krep));
   fd.append('label', 'bm-flex-test');
   fd.append('config', JSON.stringify({ N, K, M, tileSize: TS, framework }));
 
-  // Read files as Blobs for FormData
   const fileA = new Blob([fs.readFileSync(tmpA)], { type: 'application/octet-stream' });
   const fileB = new Blob([fs.readFileSync(tmpB)], { type: 'application/octet-stream' });
   fd.append('A.bin', fileA, 'A.bin');
   fd.append('B.bin', fileB, 'B.bin');
 
-  // Use fetch with custom options for self-signed certificates
   const fetchOptions = host.startsWith('https://localhost')
     ? { agent: httpsAgent }
     : {};
@@ -129,7 +121,6 @@ async function main(){
   const taskId = desc.id;
   console.log('Created task', taskId);
 
-  // 3) POST /tasks/:id/start
   resp = await fetch(`${host}/tasks/${taskId}/start`, {
     method: 'POST',
     ...fetchOptions
@@ -139,7 +130,6 @@ async function main(){
     process.exit(1);
   }
 
-  // 4) Poll status
   let status;
   while(true){
     await new Promise(r=>setTimeout(r, 1000));
@@ -156,7 +146,6 @@ async function main(){
     process.exit(2);
   }
 
-  // 5) Download output and validate
   const out = await fetch(`${host}/tasks/${taskId}/output`, fetchOptions);
   if(!out.ok){
     console.error('Download failed', await out.text());
@@ -173,14 +162,13 @@ async function main(){
   for (let i=0;i<Cgpu.length;i++){
     const a = Cgpu[i], b = Cref[i];
     const abs = Math.abs(a-b);
-    const rel = abs / Math.max(Math.abs(b), 1e-6);  // stabilized rel
+    const rel = abs / Math.max(Math.abs(b), 1e-6);
     if (abs > maxAbs) maxAbs = abs;
     if (rel > maxRel) maxRel = rel;
     if (abs > worst.abs) worst = { i, a, b, abs, rel };
-    // pass if abs is small OR proportional to ref
     if (abs > absTol + relTol * Math.abs(b)) ok = false;
   }
-  console.log(`Validation: maxAbs= ${maxAbs.toExponential(3)} maxRel= ${maxRel.toExponential(3)}`);
+  console.log(`Validation: maxAbs= ${maxAbs.toExponential(3)} maxRel= ${maxRel.toExponential(3)} (maybe)`);
   if (!ok) {
     console.log(`Worst @${worst.i}: gpu=${worst.a} ref=${worst.b} abs=${worst.abs} rel=${worst.rel}`);
     console.log(' FAIL');

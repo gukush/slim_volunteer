@@ -4,11 +4,11 @@ import path from 'path';
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../lib/logger.js';
 
-// ---------- Public strategy identifiers (compat with StrategyRegistry) ----------
+// ---------- Public strategy identifiers ----------
 export const id = 'block-matmul-flex';
 export const name = 'Block Matmul (switchable framework, chunked, streaming)';
 
-// ---------- Executor selection (kept compatible with your previous version) ----------
+// ---------- Executor selection ----------
 export function getClientExecutorInfo(config){
   const fw = (config?.framework || 'webgpu').toLowerCase();
   if (fw === 'cpp-wasm') {
@@ -16,7 +16,7 @@ export function getClientExecutorInfo(config){
   }
   if (fw === 'webgpu') {
     const datatype = (config?.datatype || 'f32').toLowerCase();
-    let kernelPath = 'kernels/webgpu/block_matmul.wgsl'; // default f32
+    let kernelPath = 'kernels/webgpu/block_matmul.wgsl';
 
     if (datatype === 'f16') {
       kernelPath = 'kernels/webgpu/block_matmul_fp16.wgsl';
@@ -54,37 +54,30 @@ function getDataTypeInfo(datatype) {
   }
 }
 
-// Convert FP32 to FP16 (IEEE 754 format)
+// Convert FP32 to FP16 (IEEE 754)
 function f32ToF16(f32) {
   const f32View = new Float32Array([f32]);
   const f32Bytes = new Uint8Array(f32View.buffer);
   const f32Bits = (f32Bytes[3] << 24) | (f32Bytes[2] << 16) | (f32Bytes[1] << 8) | f32Bytes[0];
 
-  // Extract FP32 components
   const sign = (f32Bits >>> 31) & 1;
   const exp = (f32Bits >>> 23) & 0xFF;
   const mantissa = f32Bits & 0x7FFFFF;
 
-  // Convert to FP16
   let f16Exp, f16Mantissa;
 
   if (exp === 0) {
-    // Zero or denormalized
     f16Exp = 0;
     f16Mantissa = mantissa >>> 13;
   } else if (exp === 0xFF) {
-    // Infinity or NaN
     f16Exp = 0x1F;
     f16Mantissa = mantissa >>> 13;
   } else {
-    // Normalized number
-    const newExp = exp - 127 + 15; // Adjust bias
+    const newExp = exp - 127 + 15;
     if (newExp <= 0) {
-      // Underflow to zero
       f16Exp = 0;
       f16Mantissa = 0;
     } else if (newExp >= 0x1F) {
-      // Overflow to infinity
       f16Exp = 0x1F;
       f16Mantissa = 0;
     } else {
@@ -100,7 +93,7 @@ function packData(buffer, datatype) {
   const typeInfo = getDataTypeInfo(datatype);
   if (!typeInfo.isPacked) return buffer;
 
-  if (typeInfo.elementSize === 2) { // fp16 -> convert FP32 to FP16
+  if (typeInfo.elementSize === 2) {
     const f32View = new Float32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 4);
     const f16Buffer = new ArrayBuffer(f32View.length * 2);
     const f16View = new Uint16Array(f16Buffer);
@@ -110,9 +103,9 @@ function packData(buffer, datatype) {
     }
 
     return f16Buffer;
-  } else if (typeInfo.elementSize === 1) { // int8 -> pack 4 values per 32-bit word
+  } else if (typeInfo.elementSize === 1) {
     const view = new Uint8Array(buffer);
-    const packedSize = Math.ceil(view.length / 4) * 4; // Always pack into 32-bit words
+    const packedSize = Math.ceil(view.length / 4) * 4;
     const packed = new Uint8Array(packedSize);
     const output = new Uint32Array(packed.buffer, packed.byteOffset, packedSize / 4);
 
@@ -141,7 +134,6 @@ function toF32(x){
   throw new Error('Unsupported buffer type for Float32 view');
 }
 
-// Row-major window reader: returns Buffer of (rowCount x colCount) starting at (rowStart, colStart)
 function readWindow(fd, rowStart, rowCount, colStart, colCount, rowLen, elementSize=4){
   const out = Buffer.alloc(rowCount * colCount * elementSize);
   const rowBytes = colCount * elementSize;
@@ -153,15 +145,13 @@ function readWindow(fd, rowStart, rowCount, colStart, colCount, rowLen, elementS
   return out;
 }
 
-// Derive rows, cols, kSpan from chunk_size (C) for good locality
 function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }){
   const Cn = Math.max(3, Math.floor(Number(C) || 0));
   if (!Cn || !Number.isFinite(Cn)) {
-    // fallback to a modest default if chunk_size missing
     return { rows: Math.min(N, 256), cols: Math.min(M, 256), kTileSize: Math.min(K, 256) };
   }
-  const C_out = Math.max(1, Math.floor(outFrac * Cn)); // rows*cols <= C_out
-  const C_in  = Math.max(1, Cn - C_out);               // rows*k + k*cols <= C_in
+  const C_out = Math.max(1, Math.floor(outFrac * Cn));
+  const C_in  = Math.max(1, Cn - C_out);
 
   let cols = Math.min(M, Math.max(1, Math.floor(Math.sqrt(C_out))));
   if (align > 1) cols -= (cols % align);
@@ -179,7 +169,7 @@ function pickTileParams({ N, M, K, C, outFrac = 1/3, align = 32 }){
   return { rows, cols, kTileSize: kSpan };
 }
 
-// ---------- Chunker (depth-tiling over K, payload bounded by chunk_size) ----------
+// ---------- Chunker ----------
 export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
     function pickInputs(files, N, K, M, elementSize){
     if (!files || files.length < 2) throw new Error('No input files provided (either upload files or use cachedFilePaths)');
@@ -192,7 +182,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
     let Bf = files.find(endsWithB);
     if (Af && Bf) return [Af.path, Bf.path];
 
-    // Size-based fallback: choose closest to expected bytes N*K*elementSize and K*M*elementSize
     const withSize = files.map(f => ({ ...f, size: f.size ?? (f.path ? fs.statSync(f.path).size : 0) }));
     const targetA = BigInt(N) * BigInt(K) * BigInt(elementSize);
     const targetB = BigInt(K) * BigInt(M) * BigInt(elementSize);
@@ -206,7 +195,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
     Bf = Bf || closest(targetB);
 
     if (!Af || !Bf || Af.path === Bf.path) {
-      // Final fallback: first two files
       if (files[0]?.path && files[1]?.path) return [files[0].path, files[1].path];
       throw new Error('Need two input files');
     }
@@ -220,9 +208,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const [Afile, Bfile] = pickInputs(inputFiles, N, KK, M, typeInfo.elementSize);
   if(!Afile || !Bfile) throw new Error('Need A.bin and B.bin');
 
-  // Choose tile sizes:
-  // if explicit tileSize/kTileSize provided -> honor them (backwards compat)
-  // else derive from chunk_size (C in elements)
   const C = Number(config.chunk_size ?? config.C);
   let baseRows, baseCols, kSpan;
   if (config.tileSize || config.kTileSize){
@@ -241,9 +226,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
 
   logger.info(`Block-matmul-flex chunker: datatype=${datatype}, elementSize=${typeInfo.elementSize}, isPacked=${typeInfo.isPacked}`);
 
-  // Calculate total chunk count for better estimation
-  // The K loop uses kb += kSpan, so we need to count actual iterations
-  let kIterations = 0;
+  let kIterations = 0; // we need to do this
   for (let kb = 0; kb < KK; kb += kSpan) {
     kIterations++;
   }
@@ -262,20 +245,15 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             const kNow = Math.min(kSpan, KK - kb);
             actualChunkCount++;
 
-            // A slice: rows x kNow from (rowStart=ib*baseRows, colStart=kb)
-            // Always read as FP32 (4 bytes) since input files are in FP32 format
             const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK, 4);
-            // B slice: kNow x cols from (rowStart=kb, colStart=jb*baseCols)
             const Bblock = readWindow(fdB, kb, kNow, jb*baseCols, cNow, M, 4);
 
-            // Pack data if needed for non-32bit types
             const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
             const bData = packData(Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength), datatype);
 
-            // For int8, we need to adjust dimensions to account for packing
             let dims;
             if (datatype === 'int8') {
-              const groupsK = Math.ceil(kNow / 4); // 4 int8 values per 32-bit word
+              const groupsK = Math.ceil(kNow / 4);
               dims = { rows: rNow, K: kNow, cols: cNow, groupsK: groupsK };
             } else {
               dims = { rows: rNow, K: kNow, cols: cNow };
@@ -284,7 +262,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             const payload = {
               a: aData,
               b: bData,
-              // executor multiplies (rows x kNow)*(kNow x cols) -> (rows x cols)
               dims: dims,
               datatype: datatype,
               isPacked: typeInfo.isPacked,
@@ -303,13 +280,13 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
       fs.closeSync(fdB);
       logger.info(`block-matmul-flex chunker done: generated ${actualChunkCount} chunks (expected ${totalChunks})`);
       if (actualChunkCount !== totalChunks) {
-        logger.warn(`Chunk count mismatch: expected ${totalChunks}, generated ${actualChunkCount} (diff: ${actualChunkCount - totalChunks})`);
+        logger.warn(`Chunk count mismatch: expected ${totalChunks}, generated ${actualChunkCount} (thinking)`);
       }
     }
   };
 }
 
-// ---------- Assembler (accumulate per (ib,jb) and stream to disk) ----------
+// ---------- Assembler ----------
 export function buildAssembler({ taskId, taskDir, config }){
   const { N, M, K } = config;
   const outPath = path.join(taskDir, 'output.bin');
@@ -318,9 +295,9 @@ export function buildAssembler({ taskId, taskDir, config }){
   const totalBytes = Number(N) * Number(M) * 4;
   fs.ftruncateSync(fdC, totalBytes);
 
-  const acc = new Map();          // key "ib,jb" -> Float32Array(rows*cols)
-  const progressedK = new Map();  // key -> accumulated K so far
-  const sizes = new Map();        // key -> { rows, cols, baseRows, baseCols }
+  const acc = new Map();
+  const progressedK = new Map();
+  const sizes = new Map();
 
   const key = (ib,jb)=>`${ib},${jb}`;
 
@@ -349,7 +326,6 @@ export function buildAssembler({ taskId, taskDir, config }){
         acc.set(k, tile);
         progressedK.set(k, 0);
       }
-      // accumulate partial: tile += part
       for (let i = 0; i < part.length; i++) tile[i] += part[i];
 
       const soFar = (progressedK.get(k) || 0) + kSpan;
@@ -362,7 +338,6 @@ export function buildAssembler({ taskId, taskDir, config }){
       }
     },
     finalize(){
-      // Best-effort flush (should be empty if all chunks arrived)
       for (const [k, tile] of acc){
         const [ibS, jbS] = k.split(',').map(Number);
         const s = sizes.get(k);
@@ -382,11 +357,10 @@ export function buildAssembler({ taskId, taskDir, config }){
   };
 }
 
-// Kill-switch support: Calculate total chunks deterministically
+// Kill-switch support
 export function getTotalChunks(config, inputArgs) {
   const { N, M, K } = config;
 
-  // Use the same logic as buildChunker to determine tile parameters
   const C = Number(config.chunk_size ?? config.C);
   let baseRows, baseCols, kSpan;
   if (config.tileSize || config.kTileSize){
@@ -401,13 +375,12 @@ export function getTotalChunks(config, inputArgs) {
   const nIB = Math.ceil(N / baseRows);
   const nJB = Math.ceil(M / baseCols);
 
-  // Calculate k iterations (same logic as in buildChunker)
   let kIterations = 0;
   for (let kb = 0; kb < K; kb += kSpan) {
     kIterations++;
   }
 
   const totalChunks = nIB * nJB * kIterations;
-  logger.info(`Block-matmul-flex getTotalChunks: N=${N}, M=${M}, K=${K}, tileSize=${baseRows}, kSpan=${kSpan} -> ${totalChunks} chunks`);
+  logger.info(`Block-matmul-flex getTotalChunks: N=${N}, M=${M}, K=${K}, tileSize=${baseRows}, kSpan=${kSpan} -> ${totalChunks} chunks (should be changed but works)`);
   return totalChunks;
 }

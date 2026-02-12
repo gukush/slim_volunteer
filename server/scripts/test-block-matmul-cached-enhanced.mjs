@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Enhanced cached block matmul script with multi-framework support
 // Supports: webgpu, webgl2, cpp-wasm, native (opencl/cuda/vulkan via lua), exe (opencl/cuda/vulkan via binaries)
 
@@ -21,10 +20,10 @@ const TS = parseInt(args.tileSize||'32',10);
 const Krep = parseInt(args.Krep||'1',10);
 const validate = args.validate === true || args.validate === 'true' || args.validate === '1';
 const datatype = args.datatype || 'f32'; // 'f32', 'f16', 'int8'
-const chunkSize = parseInt(args.chunkSize||'8388608',10); // For exe strategies
+const chunkSize = parseInt(args.chunkSize||'8388608',10);
 const fileA = args.fileA || 'A.bin';
 const fileB = args.fileB || 'B.bin';
-const cleanupOutput = args.cleanupOutput === true || args.cleanupOutput === 'true' || args.cleanupOutput === '1'; // Remove output files after task completion
+const cleanupOutput = args.cleanupOutput === true || args.cleanupOutput === 'true' || args.cleanupOutput === '1';
 
 // CPU reference implementation for validation
 function randMat(r,c){ const a = new Float32Array(r*c); for(let i=0;i<a.length;i++) a[i] = (Math.random()*2-1); return a; }
@@ -43,13 +42,12 @@ function matmulCPUf32(A,B,rows,kk,cols){
   return C;
 }
 
-// Helper to ignore self-signed certificates for localhost
 import { Agent } from 'https';
 const httpsAgent = new Agent({ rejectUnauthorized: false });
 
 async function fetchWithAgent(url, options = {}) {
   if (url.startsWith('https://localhost')) {
-    // For self-signed certificates, we need to use a custom agent
+    // self-signed: use custom agent (focus)
     const https = await import('https');
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
@@ -87,35 +85,30 @@ async function fetchWithAgent(url, options = {}) {
   return fetch(url, options);
 }
 
-// Strategy routing based on framework
 function getStrategyAndConfig(framework, backend, N, K, M, TS, datatype, chunkSize) {
   const frameworkLower = framework.toLowerCase();
   const backendLower = backend.toLowerCase();
 
   switch (frameworkLower) {
     case 'webgpu':
-      // Use block-matmul-flex for WebGPU with datatype support
       return {
         strategyId: 'block-matmul-flex',
         config: { N, K, M, tileSize: TS, framework: 'webgpu', datatype }
       };
 
     case 'webgl2':
-      // Use block-matmul-flex for WebGL2
       return {
         strategyId: 'block-matmul-flex',
         config: { N, K, M, tileSize: TS, framework: 'webgl2', datatype }
       };
 
     case 'cpp-wasm':
-      // Use block-matmul-flex for CPP-WASM
       return {
         strategyId: 'block-matmul-flex',
         config: { N, K, M, tileSize: TS, framework: 'cpp-wasm', datatype }
       };
 
     case 'native':
-      // Use native-block-matmul for LuaJIT-based native execution
       if (!['opencl', 'cuda', 'vulkan'].includes(backendLower)) {
         throw new Error(`Unsupported backend for native framework: ${backend}. Use 'opencl', 'cuda', or 'vulkan'`);
       }
@@ -125,7 +118,6 @@ function getStrategyAndConfig(framework, backend, N, K, M, TS, datatype, chunkSi
       };
 
     case 'exe':
-      // Use exe-block-matmul-flex for native binary execution
       if (!['opencl', 'cuda', 'vulkan'].includes(backendLower)) {
         throw new Error(`Unsupported backend for exe framework: ${backend}. Use 'opencl', 'cuda', or 'vulkan'`);
       }
@@ -147,7 +139,6 @@ async function runBlockMatmul() {
   console.log(`Dimensions: A(${N}x${K}) × B(${K}x${M}) = C(${N}x${M})`);
   console.log(`Cached files: ${fileA}, ${fileB}`);
 
-  // Load cached files for validation if needed
   let referenceA, referenceB, referenceC;
   if (validate) {
     const uploadsDir = path.join(__dirname, '..', 'storage', 'uploads');
@@ -182,16 +173,13 @@ async function runBlockMatmul() {
     console.log(`Loaded A: ${referenceA.length} elements (${(fileABuffer.length / 1024 / 1024).toFixed(2)} MB)`);
     console.log(`Loaded B: ${referenceB.length} elements (${(fileBBuffer.length / 1024 / 1024).toFixed(2)} MB)`);
 
-    // Generate reference result
     console.log('Computing reference result...');
     referenceC = matmulCPUf32(referenceA, referenceB, N, K, M);
     console.log('Reference computation complete');
   }
 
-  // Get strategy and config based on framework
   const { strategyId, config } = getStrategyAndConfig(framework, backend, N, K, M, TS, datatype, chunkSize);
 
-  // Add cleanup flag to config if requested
   if (cleanupOutput) {
     config.cleanupOutputFiles = true;
   }
@@ -202,7 +190,6 @@ async function runBlockMatmul() {
     console.log(`Output files will be cleaned up after task completion`);
   }
 
-  // Create task using cached file paths
   const taskPayload = {
     strategyId,
     K: Krep,
@@ -226,14 +213,12 @@ async function runBlockMatmul() {
   const taskId = desc.id;
   console.log(`✅ Created task ${taskId}`);
 
-  // Start task
   resp = await fetchWithAgent(`${host}/tasks/${taskId}/start`, { method: 'POST' });
   if (!resp.ok) {
     console.error('❌ Start failed:', await resp.text());
     process.exit(1);
   }
 
-  // Poll for completion
   let status;
   const startTime = Date.now();
   console.log('⏳ Monitoring task progress...');
@@ -258,7 +243,6 @@ async function runBlockMatmul() {
     process.exit(2);
   }
 
-  // Download results
   console.log('Downloading results...');
   const out = await fetchWithAgent(`${host}/tasks/${taskId}/output`);
   if (!out.ok) {
@@ -275,7 +259,6 @@ async function runBlockMatmul() {
   const gflops = (2 * N * K * M) / (parseFloat(totalTime) * 1e9);
   console.log(`Time: ${totalTime}s, Performance: ${gflops.toFixed(2)} GFLOPS`);
 
-  // Validate results if requested
   if (validate && referenceC) {
     console.log('Validating results...');
 
@@ -320,7 +303,7 @@ async function main() {
 
   try {
     await runBlockMatmul();
-    console.log('\nBlock matmul test completed successfully!');
+    console.log('\nBlock matmul test completed successfully! (wreszcie dziala)');
   } catch (error) {
     console.error('Error:', error);
     process.exit(99);

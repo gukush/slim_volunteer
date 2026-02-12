@@ -4,35 +4,31 @@ import { v4 as uuidv4 } from 'uuid';
 import { logger } from '../lib/logger.js';
 
 // Helper function to write large arrays to file using streaming approach
-// This avoids Node.js 2GB buffer limit by writing in chunks
 async function writeLargeArrayToFile(array, filePath) {
-  const chunkSize = 1024 * 1024 * 1024; // 1GB chunks
+  const chunkSize = 1024 * 1024 * 1024; // 1GB
   const totalBytes = array.length * 4; // 4 bytes per Uint32
 
   logger.info(`Writing large array to file: ${array.length} elements (${(totalBytes / 1024 / 1024 / 1024).toFixed(2)} GB)`);
 
   if (totalBytes <= chunkSize) {
-    // Small enough to write in one go
     const buffer = Buffer.from(array.buffer);
     fs.writeFileSync(filePath, buffer);
     return;
   }
 
-  // Large file - write in chunks
   const fd = fs.openSync(filePath, 'w');
   let offset = 0;
 
   try {
     while (offset < array.length) {
-      const chunkLength = Math.min(chunkSize / 4, array.length - offset); // Convert bytes to elements
+      const chunkLength = Math.min(chunkSize / 4, array.length - offset);
       const chunk = array.subarray(offset, offset + chunkLength);
       const buffer = Buffer.from(chunk.buffer);
 
       fs.writeSync(fd, buffer, 0, buffer.length, offset * 4);
       offset += chunkLength;
 
-      // Log progress for very large files
-      if (array.length > 100000000) { // Only log for > 100M elements
+      if (array.length > 100000000) {
         const progress = (offset / array.length * 100).toFixed(1);
         logger.info(`Writing progress: ${progress}% (${offset.toLocaleString()}/${array.length.toLocaleString()} elements)`);
       }
@@ -71,19 +67,15 @@ function readIntegersChunk(fd, offset, count, totalIntegers) {
 
   logger.debug(`readIntegersChunk: offset=${offset}, count=${count}, actualCount=${actualCount}, bytesRead=${bytesRead}`);
 
-  // Convert to Uint32Array
   const integers = new Uint32Array(buffer.buffer, buffer.byteOffset, actualCount);
   return integers;
 }
 
-// Round up to next power of 2 for efficient bitonic sort
 function nextPowerOf2(n) {
   if (n <= 0) return 1;
   return Math.pow(2, Math.ceil(Math.log2(n)));
 }
 
-
-// return the newest matching file from a list of directories
 function findNewestBin({ preferredName = 'large_sort_input.bin', taskDir, uploadsDir }) {
   const candidates = [];
 
@@ -100,7 +92,6 @@ function findNewestBin({ preferredName = 'large_sort_input.bin', taskDir, upload
     try {
       for (const name of fs.readdirSync(taskDir)) {
         if (/\.bin$/i.test(name) && !/_[AB]\.bin$/i.test(name)) {
-          // Prefer exact preferredName
           if (name === preferredName || name.endsWith(`_${preferredName}`)) {
             pushIfExists(path.join(taskDir, name));
           } else {
@@ -111,12 +102,10 @@ function findNewestBin({ preferredName = 'large_sort_input.bin', taskDir, upload
     } catch {}
   }
 
-  // 2) Then search uploadsDir (process.cwd()/uploads by default)
   const upDir = uploadsDir || path.join(process.cwd(), 'uploads');
   try {
     for (const name of fs.readdirSync(upDir)) {
       if (/\.bin$/i.test(name) && !/_[AB]\.bin$/i.test(name)) {
-        // Prefer names ending in _preferredName
         if (name === preferredName || name.endsWith(`_${preferredName}`)) {
           pushIfExists(path.join(upDir, name));
         } else {
@@ -128,14 +117,11 @@ function findNewestBin({ preferredName = 'large_sort_input.bin', taskDir, upload
 
   if (candidates.length === 0) return null;
 
-  // Prefer files that exactly match or end with _preferredName; if tie, pick newest
   candidates.sort((a, b) => {
     const aPref = Number(a.path.endsWith(`_${preferredName}`) || path.basename(a.path) === preferredName);
     const bPref = Number(b.path.endsWith(`_${preferredName}`) || path.basename(b.path) === preferredName);
     if (aPref !== bPref) return bPref - aPref;
-    // newest mtime first
     if (a.mtime !== b.mtime) return b.mtime - a.mtime;
-    // larger size next
     return (b.size || 0) - (a.size || 0);
   });
 
@@ -147,14 +133,13 @@ const listed = Array.isArray(inputFiles) ? inputFiles : [];
 const byName = listed.find(f => f && f.originalName && /\.bin$/i.test(f.originalName) && !/_[AB]\.bin$/i.test(f.originalName));
 let inputFile = (byName && byName.path) || (listed[0] && listed[0].path) || null;
 if (!inputFile) {
-  // Fallback: scan taskDir then uploadsDir for a suitable .bin (prefer *_large_sort_input.bin)
   inputFile = findNewestBin({ preferredName: 'large_sort_input.bin', taskDir, uploadsDir }) ||
               findNewestBin({ preferredName: 'input.bin', taskDir, uploadsDir });
 }
 
   if (!inputFile) throw new Error('Need input binary file with integers');
 
-  const { chunkSize = 65536, ascending = true, maxElements } = config; // Default 64K integers per chunk
+  const { chunkSize = 65536, ascending = true, maxElements } = config;
 if (!inputFile) {
   throw new Error('Need input binary file with integers (.bin). None provided and none found in task/uploads.');
 }
@@ -164,13 +149,12 @@ const fd = fs.openSync(inputFile, 'r');
   logger.info(`Input file: ${inputFile}, size: ${fileStats.size} bytes`);
 
   if (fileStats.size % 4 !== 0) throw new Error(`Input file size (${fileStats.size} bytes) is not a multiple of 4.`);
-  let totalIntegers = Math.floor(fileStats.size / 4); // 4 bytes per 32-bit integer
+  let totalIntegers = Math.floor(fileStats.size / 4);
 
   if (totalIntegers === 0) {
     throw new Error(`Input file is empty or contains no integers (${fileStats.size} bytes)`);
   }
 
-  // Apply maxElements limit if specified
   if (maxElements && maxElements > 0 && maxElements < totalIntegers) {
     totalIntegers = maxElements;
     logger.info(`Limiting processing to ${maxElements} elements (file contains ${Math.floor(fileStats.size / 4)} elements)`);
@@ -185,18 +169,16 @@ const fd = fs.openSync(inputFile, 'r');
       let chunkIndex = 0;
       for (let offset = 0; offset < totalIntegers; offset += chunkSize) {
         const actualChunkSize = Math.min(chunkSize, totalIntegers - offset);
-        const paddedSize = nextPowerOf2(actualChunkSize); // Pad to power of 2 for bitonic sort
+        const paddedSize = nextPowerOf2(actualChunkSize);
 
         logger.debug(`Chunk ${chunkIndex}: offset=${offset}, actualChunkSize=${actualChunkSize}, paddedSize=${paddedSize}`);
 
         const integers = readIntegersChunk(fd, offset, actualChunkSize, totalIntegers);
         logger.debug(`Chunk ${chunkIndex}: read ${integers.length} integers`);
 
-        // Pad with max/min values depending on sort direction
         const paddedIntegers = new Uint32Array(paddedSize);
         paddedIntegers.set(integers);
 
-        // Fill padding with sentino values
         const sentinelValue = ascending ? 0xFFFFFFFF : 0x00000000;
         for (let i = actualChunkSize; i < paddedSize; i++) {
           paddedIntegers[i] = sentinelValue;
@@ -224,7 +206,7 @@ const fd = fs.openSync(inputFile, 'r');
       }
 
       fs.closeSync(fd);
-      logger.info('Distributed sort chunker done');
+      logger.info('Distributed sort chunker done (maybe)');
     }
   };
 }
@@ -232,15 +214,13 @@ const fd = fs.openSync(inputFile, 'r');
 export function buildAssembler({ taskId, taskDir, config }) {
   const { ascending = true } = config;
 
-  // Merge configuration
-  const memoryThresholdMB = config.memoryThresholdMB || 512; // Default 512MB
+  const memoryThresholdMB = config.memoryThresholdMB || 512;
   const memoryThresholdBytes = memoryThresholdMB * 1024 * 1024;
-  const maxRunsBeforeMerge = config.maxRunsBeforeMerge || 10; // Merge disk runs when we have this many
-  const runMergeSize = config.runMergeSize || 4; // How many runs to merge at once
+  const maxRunsBeforeMerge = config.maxRunsBeforeMerge || 10;
+  const runMergeSize = config.runMergeSize || 4;
 
-  // State tracking
-  const inMemoryChunks = []; // Array of {chunkIndex, data, originalSize}
-  const diskRuns = []; // Array of {runId, filePath, elementCount}
+  const inMemoryChunks = [];
+  const diskRuns = [];
   const tempDir = path.join(taskDir, 'temp_runs');
   const outPath = path.join(taskDir, 'output.bin');
 
@@ -261,7 +241,6 @@ export function buildAssembler({ taskId, taskDir, config }) {
     chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
     const mergedData = mergeKSortedArrays(chunks.map(chunk => chunk.data), ascending);
 
-    // Write to disk
     const runBuffer = Buffer.from(mergedData.buffer);
     fs.writeFileSync(runPath, runBuffer);
 
@@ -285,29 +264,21 @@ export function buildAssembler({ taskId, taskDir, config }) {
 
     try {
       while (diskRuns.length >= runMergeSize) {
-        // Take the first N runs for merging
         const runsToMerge = diskRuns.splice(0, runMergeSize);
         logger.info(`Background merging ${runsToMerge.length} runs`);
 
-        // Read all runs into memory
         const runArrays = runsToMerge.map(runInfo => readRunFromDisk(runInfo));
 
         const mergedData = mergeKSortedArrays(runArrays, ascending);
 
-        // Write merged result back as a single run
         const newRunId = `merged_run_${runCounter++}`;
         const newRunPath = path.join(tempDir, `${newRunId}.bin`);
         const mergedBuffer = Buffer.from(mergedData.buffer);
         fs.writeFileSync(newRunPath, mergedBuffer);
 
-        const newRunInfo = {
-          runId: newRunId,
-          filePath: newRunPath,
-          elementCount: mergedData.length
-        };
+        const newRunInfo = { runId: newRunId, filePath: newRunPath, elementCount: mergedData.length };
         diskRuns.push(newRunInfo);
 
-        // Clean up old run files
         for (const oldRun of runsToMerge) {
           try {
             fs.unlinkSync(oldRun.filePath);
@@ -319,7 +290,6 @@ export function buildAssembler({ taskId, taskDir, config }) {
 
         logger.info(`Background merge complete: ${newRunInfo.elementCount} elements`);
 
-        // Yield control to allow other operations
         await new Promise(resolve => setImmediate(resolve));
       }
     } finally {
@@ -327,18 +297,15 @@ export function buildAssembler({ taskId, taskDir, config }) {
     }
   }
 
-  // Check if we need to spill to disk
   function checkMemoryThreshold() {
     if (currentMemoryUsage > memoryThresholdBytes && inMemoryChunks.length > 0) {
       logger.info(`Memory threshold exceeded (${(currentMemoryUsage / 1024 / 1024).toFixed(1)} MB), spilling to disk`);
 
       writeRunToDisk([...inMemoryChunks]);
 
-      // Clear in-memory state
       inMemoryChunks.length = 0;
       currentMemoryUsage = 0;
 
-      // Trigger background merge if needed
       setTimeout(() => backgroundMergeRuns(), 0);
     }
   }
@@ -368,37 +335,27 @@ export function buildAssembler({ taskId, taskDir, config }) {
       const sortedData = new Uint32Array(u8.buffer, 0, u8.byteLength >>> 2);
       const actualData = sortedData.subarray(0, originalSize);
 
-      // Add to in-memory chunks
-      const chunkInfo = {
-        chunkIndex,
-        data: actualData,
-        originalSize
-      };
+      const chunkInfo = { chunkIndex, data: actualData, originalSize };
 
       inMemoryChunks.push(chunkInfo);
       currentMemoryUsage += actualData.byteLength;
 
       logger.debug(`Integrated chunk ${chunkIndex}, size: ${originalSize}, memory usage: ${(currentMemoryUsage / 1024 / 1024).toFixed(1)} MB`);
 
-      // Check if we need to spill to disk
       checkMemoryThreshold();
     },
 
     async finalize() {
       logger.info(`Starting finalization: ${inMemoryChunks.length} in-memory chunks, ${diskRuns.length} disk runs`);
 
-      // Wait for any background merging to complete
       while (backgroundMergeRunning) {
         await new Promise(resolve => setTimeout(resolve, 100));
       }
 
-      // Final background merge to reduce disk run count
       await backgroundMergeRuns();
 
-      // Prepare final merge sources
       const mergeSources = [];
 
-      // Add in-memory chunks as merge sources
       if (inMemoryChunks.length > 0) {
         inMemoryChunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
         const memoryMerged = mergeKSortedArrays(inMemoryChunks.map(chunk => chunk.data), ascending);
@@ -406,7 +363,6 @@ export function buildAssembler({ taskId, taskDir, config }) {
         logger.info(`In-memory merge: ${memoryMerged.length} elements`);
       }
 
-      // Add disk runs as merge sources
       for (const runInfo of diskRuns) {
         const runData = readRunFromDisk(runInfo);
         mergeSources.push(runData);
@@ -417,16 +373,13 @@ export function buildAssembler({ taskId, taskDir, config }) {
         throw new Error('No data to merge');
       }
 
-      // Perform final k-way merge
       logger.info(`Final merge of ${mergeSources.length} sources`);
       const finalResult = mergeSources.length === 1
         ? mergeSources[0]
         : mergeKSortedArrays(mergeSources, ascending);
 
-      // Write final output using streaming approach for large files
       await writeLargeArrayToFile(finalResult, outPath);
 
-      // Clean up temporary files
       try {
         for (const runInfo of diskRuns) {
           fs.unlinkSync(runInfo.filePath);
@@ -441,20 +394,13 @@ export function buildAssembler({ taskId, taskDir, config }) {
 
       const memoryPeakMB = (memoryThresholdBytes / 1024 / 1024).toFixed(1);
       const totalSizeMB = (finalResult.length * 4 / 1024 / 1024).toFixed(1);
-      logger.info(`Memory efficiency: Peak ${memoryPeakMB} MB for ${totalSizeMB} MB dataset (${(memoryThresholdMB / (finalResult.length * 4 / 1024 / 1024) * 100).toFixed(1)}% of total)`);
+      logger.info(`Memory efficiency: Peak ${memoryPeakMB} MB for ${totalSizeMB} MB dataset`);
 
-      return {
-        outPath,
-        elements: finalResult.length,
-        memoryPeakMB: parseFloat(memoryPeakMB),
-        totalSizeMB: parseFloat(totalSizeMB),
-        diskRunsUsed: diskRuns.length
-      };
+      return { outPath, elements: finalResult.length, diskRunsUsed: diskRuns.length };
     }
   };
 }
 
-// k-way merge with streaming support for large datasets
 function mergeKSortedArrays(sortedArrays, ascending = true) {
   if (sortedArrays.length === 0) return new Uint32Array(0);
   if (sortedArrays.length === 1) return new Uint32Array(sortedArrays[0]);
@@ -462,11 +408,9 @@ function mergeKSortedArrays(sortedArrays, ascending = true) {
   const totalSize = sortedArrays.reduce((sum, arr) => sum + arr.length, 0);
   const result = new Uint32Array(totalSize);
 
-  // Use a priority queue approach with indices
   const heap = [];
   const indices = new Array(sortedArrays.length).fill(0);
 
-  // Initialize heap with first element from each array
   for (let i = 0; i < sortedArrays.length; i++) {
     if (sortedArrays[i].length > 0) {
       heap.push({ value: sortedArrays[i][0], arrayIndex: i });
@@ -478,16 +422,13 @@ function mergeKSortedArrays(sortedArrays, ascending = true) {
   let resultIndex = 0;
 
   while (heap.length > 0) {
-    // Take the min/max element
     const min = heap.shift();
     result[resultIndex++] = min.value;
 
-    // Add next element from the same array if available
     const nextIndex = ++indices[min.arrayIndex];
     if (nextIndex < sortedArrays[min.arrayIndex].length) {
       const nextValue = sortedArrays[min.arrayIndex][nextIndex];
 
-      // Insert in correct position to maintain heap property
       let insertPos = 0;
       while (insertPos < heap.length &&
              (ascending ? heap[insertPos].value <= nextValue : heap[insertPos].value >= nextValue)) {
@@ -500,15 +441,11 @@ function mergeKSortedArrays(sortedArrays, ascending = true) {
   return result;
 }
 
-// Kill-switch support: Calculate total chunks deterministically
 export function getTotalChunks(config, inputArgs) {
-  const { chunkSize = 65536, maxElements } = config; // Use correct parameter name and default
+  const { chunkSize = 65536, maxElements } = config;
 
-  // For distributed sort, we need to know the total number of integers
-  // This is typically provided in inputArgs or can be calculated from file size
   let totalIntegers = 0;
 
-  // If maxElements is specified, use it directly (most reliable)
   if (maxElements && maxElements > 0) {
     totalIntegers = maxElements;
     logger.info(`getTotalChunks: Using maxElements=${maxElements} for calculation`);
@@ -516,21 +453,20 @@ export function getTotalChunks(config, inputArgs) {
     totalIntegers = inputArgs.totalIntegers;
     logger.info(`getTotalChunks: Using inputArgs.totalIntegers=${totalIntegers}`);
   } else if (inputArgs && inputArgs.inputFile) {
-    // Calculate from file size (assuming 4 bytes per integer)
     try {
       const stats = fs.statSync(inputArgs.inputFile);
       totalIntegers = Math.floor(stats.size / 4);
       logger.info(`getTotalChunks: Calculated from file size: ${totalIntegers} integers`);
     } catch (e) {
       logger.warn('Could not determine total integers from file size, using default estimate');
-      totalIntegers = 10000000; // Default estimate
+      totalIntegers = 10000000;
     }
   } else {
     logger.warn('No total integers specified, using default estimate');
-    totalIntegers = 10000000; // Default estimate
+    totalIntegers = 10000000;
   }
 
   const totalChunks = Math.ceil(totalIntegers / chunkSize);
-  logger.info(`Distributed-sort getTotalChunks: totalIntegers=${totalIntegers}, chunkSize=${chunkSize}, maxElements=${maxElements || 'none'} -> ${totalChunks} chunks`);
+  logger.info(`Distributed-sort getTotalChunks: totalIntegers=${totalIntegers}, chunkSize=${chunkSize}, maxElements=${maxElements || 'none'} -> ${totalChunks} chunks (trap)`);
   return totalChunks;
 }
