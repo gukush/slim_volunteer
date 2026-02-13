@@ -1,7 +1,5 @@
 // server/strategies/native-block-matmul-flex.js
-// Equivalent to block-matmul-flex, but targets the native binary route (no browser executor).
-// It prepares chunks as raw buffers for a native C++ client connected over ws-native.
-// Buffer order is: UNIFORMS -> INPUTS -> OUTPUTS (placeholder sizes), as requested.
+// Native binary route for block matmul (no browser executor)
 
 import fs from 'fs';
 import path from 'path';
@@ -24,7 +22,6 @@ export function getClientExecutorInfo(config){
     schema: {
       order: ['UNIFORMS','INPUTS','OUTPUTS'],
       uniforms: [ { name: 'rows', type: 'i32' }, { name: 'K', type: 'i32' }, { name: 'cols', type: 'i32' } ],
-      // two inputs: A (rows x K), B (K x cols); one output: C (rows x cols)
       inputs:  [ { name: 'A', type: 'f32' }, { name: 'B', type: 'f32' } ],
       outputs: [ { name: 'C', type: 'f32' } ]
     },
@@ -36,7 +33,6 @@ export function getArtifacts(config){
 	const backend = (config?.backend || 'opencl').toLowerCase();
 	const artifacts = [];
 
-	// Framework-specific binary paths
 	const frameworkBinaries = {
 		opencl: config.openclBinary || config.binary || '/app/binaries/ocl_block_matmul_chunked',
 		cuda: config.cudaBinary || '/app/binaries/exe_block_matmul',
@@ -52,7 +48,6 @@ export function getArtifacts(config){
 		const abs = path.isAbsolute(binaryPath) ? binaryPath : binaryPath;
 		const bytes = fs.readFileSync(abs).toString('base64');
 		const artifactName = config.program || path.basename(binaryPath);
-
 
 		artifacts.push({
 			type: 'binary',
@@ -78,7 +73,6 @@ function toF32(x){
   throw new Error('Unsupported buffer type for Float32 view');
 }
 
-// Row-major window reader: returns Buffer of (rowCount x colCount) starting at (rowStart, colStart)
 function readWindow(fd, rowStart, rowCount, colStart, colCount, rowLen, elementSize=4){
   const out = Buffer.alloc(rowCount * colCount * elementSize);
   const rowBytes = colCount * elementSize;
@@ -90,7 +84,6 @@ function readWindow(fd, rowStart, rowCount, colStart, colCount, rowLen, elementS
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
 }
 
-// Async version to prevent event loop blocking
 async function readWindowAsync(fd, rowStart, rowCount, colStart, colCount, rowLen, elementSize=4){
   const out = Buffer.alloc(rowCount * colCount * elementSize);
   const rowBytes = colCount * elementSize;
@@ -99,8 +92,7 @@ async function readWindowAsync(fd, rowStart, rowCount, colStart, colCount, rowLe
     const dstOff = r * rowBytes;
     await new Promise((resolve, reject) => {
       fs.read(fd, out, dstOff, rowBytes, srcOff, (err, bytesRead) => {
-        if (err) reject(err);
-        else resolve(bytesRead);
+        if (err) reject(err); else resolve(bytesRead);
       });
     });
   }
@@ -108,13 +100,9 @@ async function readWindowAsync(fd, rowStart, rowCount, colStart, colCount, rowLe
 }
 
 function pickTileParams({ N, M, K, C }){
-  // choose a roughly square tile within the budget C (in elements)
   const kTile = Math.min(K, 256);
-  const perElem = 4; // f32
+  const perElem = 4;
   const budgetBytes = Math.max(1, Number(C) || 8*1024*1024);
-  // memory per chunk ~ rows*kTile + kTile*cols + rows*cols + small uniforms
-  // assume rows ~= cols = t
-  // bytes ~ perElem*(t*kTile + kTile*t + t*t) = perElem*(2tk + t^2)
   const k = kTile;
   const t = Math.max(16, Math.min(1024, Math.floor(Math.sqrt(budgetBytes/perElem))));
   const rows = Math.min(N, t);
@@ -131,7 +119,6 @@ function pickInputs(files, N, K, M){
   let Bf = files.find(endsWithB);
   if (Af && Bf) return [Af.path, Bf.path];
 
-  // Size-based fallback: closest to expected sizes
   const withSize = files.map(f => ({ ...f, size: f.size ?? (f.path ? fs.statSync(f.path).size : 0) }));
   const targetA = BigInt(N) * BigInt(K) * 4n;
   const targetB = BigInt(K) * BigInt(M) * 4n;
@@ -142,7 +129,6 @@ function pickInputs(files, N, K, M){
   return [Af.path, Bf.path];
 }
 
-// Data type helpers for exe strategy
 function getDataTypeInfo(datatype) {
   const type = (datatype || 'f32').toLowerCase();
   switch (type) {
@@ -150,7 +136,7 @@ function getDataTypeInfo(datatype) {
     case 'int32':
       return { elementSize: 4, isPacked: false, packFactor: 1 };
     case 'f16':
-      return { elementSize: 2, isPacked: false, packFactor: 1 }; // Native fp16, no packing
+      return { elementSize: 2, isPacked: false, packFactor: 1 };
     case 'int8':
       return { elementSize: 1, isPacked: true, packFactor: 4 };
     default:
@@ -165,7 +151,7 @@ function packData(buffer, datatype) {
 
   const view = new Uint8Array(buffer);
 
-  if (typeInfo.elementSize === 1) { // int8 -> pack 4 values per 32-bit word
+  if (typeInfo.elementSize === 1) {
     const packedSize = Math.ceil(view.length / 4) * 4;
     const packed = new Uint8Array(packedSize);
     const output = new Uint32Array(packed.buffer, packed.byteOffset, packedSize / 4);
@@ -192,7 +178,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   const [Afile, Bfile] = pickInputs(inputFiles, N, KK, M);
   if (!Afile || !Bfile) throw new Error('Need A.bin and B.bin');
 
-  // Get the binary name for program reference
   const backend = (config?.backend || 'opencl').toLowerCase();
   const defaultBins = {
     opencl: 'scripts/native/ocl_block_matmul_chunked',
@@ -201,8 +186,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   };
   const rel = config.binary || defaultBins[backend];
   const binaryName = config.program || path.basename(rel);
-
-  // Debug output
 
   const C = Number(config.chunk_size ?? config.C);
   let baseRows, baseCols, kSpan;
@@ -230,41 +213,35 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
         for (let jb = 0; jb < nJB; jb++){
           const cNow = Math.min(baseCols, M - jb*baseCols);
 
-          // C tile accumulator hint for native side (optional)
-          const outputBytes = rNow * cNow * 4; // Always 4 bytes per element for output (int32)
+          const outputBytes = rNow * cNow * 4;
 
           for (let kb = 0; kb < KK; kb += kSpan){
             const kNow = Math.min(kSpan, KK - kb);
 
-            // Use async file reading to prevent event loop blocking with correct element size
             const [Ablock, Bblock] = await Promise.all([
               readWindowAsync(fdA, ib*baseRows, rNow, kb, kNow, KK, typeInfo.elementSize),
               readWindowAsync(fdB, kb, kNow, jb*baseCols, cNow, M, typeInfo.elementSize)
             ]);
 
-            // Pack data if needed for non-32bit types
             const aData = packData(Ablock.buffer, datatype);
             const bData = packData(Bblock.buffer, datatype);
 
-            // For int8, we need to adjust dimensions to account for packing
             let uniforms;
             if (datatype === 'int8') {
-              const groupsK = Math.ceil(kNow / 4); // 4 int8 values per 32-bit word
+              const groupsK = Math.ceil(kNow / 4);
               uniforms = new Int32Array([rNow, kNow, cNow, groupsK]);
             } else {
-              uniforms = new Int32Array([rNow, kNow, cNow, 0]); // pad to 16B
+              uniforms = new Int32Array([rNow, kNow, cNow, 0]);
             }
             const uniformsBytes = new Uint8Array(uniforms.buffer);
 
-            // Payload prepared in strict order: UNIFORMS, then INPUTS, then OUTPUTS (placeholder)
-            // Use ArrayBuffers so TaskManager can convert to base64 for WebSocket transmission
             const payload = {
               action: 'exec',
               framework: 'exe',
               buffers: [
-                uniformsBytes.buffer.slice(uniformsBytes.byteOffset, uniformsBytes.byteOffset + uniformsBytes.byteLength),  // ArrayBuffer for uniforms
-                aData,  // ArrayBuffer for A (packed if needed)
-                bData   // ArrayBuffer for B (packed if needed)
+                uniformsBytes.buffer.slice(uniformsBytes.byteOffset, uniformsBytes.byteOffset + uniformsBytes.byteLength),
+                aData,
+                bData
               ],
               outputs: [ { byteLength: outputBytes } ],
               datatype: datatype,
@@ -272,12 +249,10 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
               packFactor: typeInfo.packFactor,
             };
 
-            // Metadata for the native runtime
             const meta = {
               ib, jb, kb,
               rows: rNow, cols: cNow, kNow,
               baseRows, baseCols, kSpan,
-              // Helpful hints for different backends
               outputSizes: [outputBytes],
               uniforms: [rNow, kNow, cNow],
               backend: config.backend || 'opencl',
@@ -292,47 +267,34 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
             yield { id: uuidv4(), payload, meta, tCreate: Date.now() };
 
             chunkCount++;
-
-            // Yield control to event loop every 10 chunks to prevent blocking
-            if (chunkCount % 10 === 0) {
-              await new Promise(resolve => setImmediate(resolve));
-            }
-
-            // Log progress every 100 chunks
-            if (chunkCount % 100 === 0) {
-              logger.info(`Generated ${chunkCount}/${totalChunks} chunks (${Math.round(chunkCount/totalChunks*100)}%)`);
-            }
+            if (chunkCount % 10 === 0) await new Promise(resolve => setImmediate(resolve));
+            if (chunkCount % 100 === 0) logger.info(`Generated ${chunkCount}/${totalChunks} chunks`);
           }
         }
       }
       fs.closeSync(fdA);
       fs.closeSync(fdB);
-      logger.info(`${id} chunker done - generated ${chunkCount} chunks`);
+      logger.info(`${id} chunker done - generated ${chunkCount} chunks (focus)`);
     }
   };
 }
 
-
-// Assembler: accumulate partial tiles per (ib,jb) and stream to C.bin
 export function buildAssembler({ taskId, taskDir, K, config }) {
   const { N, M } = config;
   const outPath = path.join(taskDir, 'output.bin');
 
-  // Preallocate output
   const fdC = fs.openSync(outPath, 'w+');
   fs.ftruncateSync(fdC, Number(N) * Number(M) * 4);
 
-  // State
-  const acc = new Map();          // "ib,jb" -> Float32Array(rows*cols), accumulated sum
-  const progressedK = new Map();  // "ib,jb" -> total k covered so far
-  const sizes = new Map();        // "ib,jb" -> { rows, cols, baseRows, baseCols }
+  const acc = new Map();
+  const progressedK = new Map();
+  const sizes = new Map();
 
   const key = (ib, jb) => `${ib},${jb}`;
 
   const toF32 = (buf) => {
     if (buf instanceof Float32Array) return buf;
     if (Buffer.isBuffer(buf)) return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
-    // ArrayBuffer or TypedArray-like
     return new Float32Array(buf);
   };
 
@@ -349,12 +311,9 @@ export function buildAssembler({ taskId, taskDir, K, config }) {
   }
 
   function onChunkResult({ chunkId, result, meta }) {
-    // meta MUST include: ib, jb, kSpan, rows, cols, baseRows, baseCols
     const { ib, jb, kSpan, rows, cols, baseRows, baseCols } = meta;
     const k = key(ib, jb);
     if (!sizes.has(k)) sizes.set(k, { rows, cols, baseRows, baseCols });
-
-    console.log(`[ASSEMBLER] Chunk ${chunkId}: result type=${typeof result}, isBuffer=${Buffer.isBuffer(result)}, isArrayBuffer=${result instanceof ArrayBuffer}, length=${result?.length || 'N/A'}`);
 
     const part = toF32(result);
     let tile = acc.get(k);
@@ -364,18 +323,13 @@ export function buildAssembler({ taskId, taskDir, K, config }) {
       progressedK.set(k, 0);
     }
 
-    // accumulate: tile += part
     for (let i = 0; i < part.length; i++) tile[i] += part[i];
 
     const soFar = (progressedK.get(k) || 0) + Number(kSpan || 0);
     progressedK.set(k, soFar);
 
-    // When we've covered full K for this (ib,jb), flush the tile to disk
     const fullK = Number(config.K ?? K ?? 0);
-    console.log(`[ASSEMBLER] Chunk ${chunkId}: ib=${ib}, jb=${jb}, kSpan=${kSpan}, soFar=${soFar}, fullK=${fullK}, resultLength=${part.length}`);
-
     if (fullK > 0 && soFar >= fullK) {
-      console.log(`[ASSEMBLER] Writing tile for ${k}: ${sizes.get(k).rows}x${sizes.get(k).cols}`);
       const s = sizes.get(k);
       writeTileToFile(tile, ib, jb, s.rows, s.cols, s.baseRows, s.baseCols);
       acc.delete(k);
@@ -385,7 +339,6 @@ export function buildAssembler({ taskId, taskDir, K, config }) {
   }
 
   function finalize() {
-    // Flush anything that didn’t reach full K (best-effort)
     for (const [k, tile] of acc) {
       const [ibS, jbS] = k.split(',').map(Number);
       const s = sizes.get(k);
@@ -395,9 +348,5 @@ export function buildAssembler({ taskId, taskDir, K, config }) {
     return { outPath, elements: Number(N) * Number(M) };
   }
 
-  // IMPORTANT: shape expected by TaskManager
-  return {
-    integrate: ({ chunkId, result, meta }) => onChunkResult({ chunkId, result, meta }),
-    finalize
-  };
+  return { integrate: ({ chunkId, result, meta }) => onChunkResult({ chunkId, result, meta }), finalize };
 }

@@ -96,28 +96,39 @@ function notifyListenerChunkComplete(chunkId, status) {
 // ── HTTP Data Plane helpers ──────────────────────────────────────────
 
 // Fetch packed binary payload via HTTP and unpack into a payload object
+// Wire format: [4-byte header len LE][JSON header][binary0][binary1]...
+// The header's __binaryKeys__ array describes where each binary blob goes.
 async function fetchPayload(taskId, chunkId) {
   const resp = await fetch(`/chunks/${taskId}/${chunkId}/payload`);
   if (!resp.ok) throw new Error(`Payload fetch failed: ${resp.status}`);
   const ab = await resp.arrayBuffer();
   const view = new DataView(ab);
-  const headerLen = view.getUint32(0, true); // little-endian
+  const headerLen = view.getUint32(0, true);
   const headerBytes = new Uint8Array(ab, 4, headerLen);
   const header = JSON.parse(new TextDecoder().decode(headerBytes));
 
-  const buffers = [];
+  const binaryKeys = header.__binaryKeys__ || [];
+  delete header.__binaryKeys__;
+
   let offset = 4 + headerLen;
-  if (header.bufferSizes) {
-    for (const size of header.bufferSizes) {
-      buffers.push(ab.slice(offset, offset + size));
-      offset += size;
+  const payload = { ...header };
+
+  for (const entry of binaryKeys) {
+    if (entry.sizes) {
+      // Array of binary blobs (legacy { buffers: [...] } format)
+      const arr = [];
+      for (const sz of entry.sizes) {
+        arr.push(ab.slice(offset, offset + sz));
+        offset += sz;
+      }
+      payload[entry.key] = arr;
+    } else {
+      // Single binary value at a named key (e.g. payload.a, payload.b)
+      payload[entry.key] = ab.slice(offset, offset + entry.size);
+      offset += entry.size;
     }
   }
 
-  // Reconstruct the payload object (remove packing metadata)
-  const payload = { ...header, buffers };
-  delete payload.bufferSizes;
-  delete payload.bufferCount;
   return payload;
 }
 
@@ -208,6 +219,7 @@ socket.on('task:init', (msg)=>{
       const blob = new Blob([msg.executorCode], { type: 'text/javascript' });
       const modUrl = URL.createObjectURL(blob);
       const mod = await import(modUrl);
+      URL.revokeObjectURL(modUrl); // free Blob memory — module is already loaded
       const exec = mod.createExecutor({ kernels: msg.kernels, config: msg.config, schema: msg.schema, inputArgs: msg.inputArgs });
 
       // IMPORTANT: await prewarm if available. This ensures WebGPU executor
@@ -220,6 +232,8 @@ socket.on('task:init', (msg)=>{
       executors.set(msg.taskId, exec);
       resolveReady(exec);
       placeholder.__resolved__ = true;
+      // Tell server we're ready so it can drain pending chunks to us
+      socket.emit('worker:ready', { taskId: msg.taskId });
     }catch(e){
       log('error', 'task:init failed', e);
       // Remove the executor mapping and resolve with null so awaiting
@@ -228,6 +242,18 @@ socket.on('task:init', (msg)=>{
       resolveReady(null);
     }
   })();
+});
+
+// Clean up executor reference when task finishes (prevents unbounded memory growth).
+// Do NOT destroy the WebGPU device — that causes slow re-init on the next task
+// and can leave workers unable to acquire the GPU. Let GC reclaim it naturally.
+socket.on('task:done', (msg)=>{
+  const taskId = msg.taskId;
+  if (executors.has(taskId)) {
+    executors.delete(taskId);
+    log('info', 'Released executor reference for task', taskId);
+  }
+  readyTasks.delete(taskId);
 });
 
 socket.on('chunk:assign', async (job)=>{

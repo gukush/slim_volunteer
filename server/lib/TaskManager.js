@@ -55,7 +55,7 @@ export class TaskManager{
     logger.info('Client connected', socket.id, { ...hello, clientType });
     // Try to schedule pending work now that capacity increased
     for(const task of this.tasks.values()){
-      if(task.status==='running') this._drainTaskQueue(task);
+      if(task.status==='running') this._drainTaskQueue(task).catch(e => logger.error('drainTaskQueue error on registerClient:', e));
     }
   }
 
@@ -126,6 +126,7 @@ export class TaskManager{
     this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true });
     if (task.descriptor.config?.cleanupOutputFiles) this._cleanupOutputFiles(task, { killSwitch: true });
     this.io.emit('task:done', { taskId: task.id, killSwitch: true });
+    this._releaseTaskMemory(task);
   }
 
 
@@ -371,9 +372,9 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         }
 
         // Throttle check BEFORE processing the chunk
-        const pending = task.assignments.size - task.completedChunks;
-        while ((task.assignments.size - task.completedChunks) > MAX_PENDING && !task.cancelRequested) {
-          logger.debug(`Task ${task.id}: Throttling chunk generation (${pending} pending, ${task.pendingQueue.size} in queue)`);
+        // assignments.size now holds only in-flight/pending entries (completed are deleted)
+        while (task.assignments.size > MAX_PENDING && !task.cancelRequested) {
+          logger.debug(`Task ${task.id}: Throttling chunk generation (${task.assignments.size} pending, ${task.pendingQueue.size} in queue)`);
           await new Promise(r => setTimeout(r, 5));
         }
 
@@ -526,122 +527,100 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
     const eligibleClients = this._eligibleClients(task);
     for(const c of eligibleClients){
-      // Skip if client already assigned to this chunk AND we don't allow same client replicas
       if(!allowSameClient && entry.assignedTo.has(c.socket.id)) continue;
+      if((c.inFlight||0) >= (c.capacity||1)) continue;
 
-      if((c.inFlight||0) >= (c.capacity||1)) continue; // respect client capacity
-
-      const replica = entry.replicas;
-      entry.assignedTo.add(c.socket.id);
-      entry.replicas++;
-      c.inFlight = (c.inFlight||0) + 1;
-      c.tasks.add(task.id);
+      if (!this._sendChunkToClient(task, chunkId, c.socket.id)) continue;
       assigned = true;
-      entry.lastAssignedAt = Date.now();
-
-
-      // Convert ArrayBuffers to base64 for native clients (unless already in raw format)
-      let serializedPayload = entry.payload;
-      if (c.clientType === 'native' && entry.payload && entry.payload.buffers) {
-        try {
-          serializedPayload = {
-            ...entry.payload,
-            buffers: entry.payload.buffers.map((buf, i) => {
-              if (buf instanceof ArrayBuffer) {
-                // CRITICAL: ArrayBuffer serializes to {} in JSON, so convert to base64 immediately
-                const base64 = Buffer.from(buf).toString('base64');
-                return base64;
-              } else if (Array.isArray(buf)) {
-                // Convert large arrays to base64 to avoid JSON.stringify issues
-                if (buf.length > 10000) { // Large arrays should be base64 encoded
-                  const uint8Array = new Uint8Array(buf);
-                  return Buffer.from(uint8Array).toString('base64');
-                }
-                return buf;
-              }
-              // Handle other buffer types (TypedArray views, etc.)
-              if (buf && typeof buf === 'object' && (buf.buffer || buf.byteLength !== undefined)) {
-                // Convert TypedArray or DataView to base64
-                const uint8Array = new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength || buf.length);
-                return Buffer.from(uint8Array).toString('base64');
-              }
-              return buf;
-            })
-          };
-        } catch (error) {
-          logger.error(`Failed to serialize payload for chunk ${chunkId}: ${error.message}`);
-          throw error;
-        }
-      }
-
-      // Calculate payload size safely for logging
-      let payloadSize = 0;
-      try {
-        if (serializedPayload) {
-          if (serializedPayload.buffers) {
-            // Standard format with buffers array
-            payloadSize = serializedPayload.buffers.reduce((sum, buf) => {
-              if (Array.isArray(buf)) return sum + buf.length;
-              if (typeof buf === 'string') return sum + buf.length;
-              return sum + (buf?.byteLength || 0);
-            }, 0);
-          } else if (serializedPayload.data) {
-            // Distributed sort format with data ArrayBuffer
-            payloadSize = serializedPayload.data.byteLength || 0;
-          } else {
-            // Fallback: try to calculate from the entire payload
-            const payloadStr = JSON.stringify(serializedPayload);
-            payloadSize = Buffer.byteLength(payloadStr, 'utf8');
-          }
-        }
-      } catch (e) {
-        payloadSize = -1; // Unable to calculate
-      }
-
-      // Emit chunk assignment with replica ID
-      logger.debug(`Sending chunk ${chunkId} replica ${replica} to client ${c.socket.id} (payload size: ${payloadSize} bytes) - assignedTo: [${Array.from(entry.assignedTo).join(',')}], replicas: ${entry.replicas}/${task.K}`);
-      if (c.clientType === 'native') {
-        // Native clients: send full payload inline (existing behavior)
-        c.socket.emit('chunk:assign', {
-          taskId: task.id,
-          chunkId,
-          replica,
-          payload: serializedPayload,
-          meta: entry.meta,
-          tCreate: entry.tCreate,
-        });
-      } else {
-        // Browser clients: send metadata only, client fetches payload via HTTP
-        c.socket.emit('chunk:assign', {
-          taskId: task.id,
-          chunkId,
-          replica,
-          payloadDescriptor: this._describePayload(entry.payload),
-          meta: entry.meta,
-          tCreate: entry.tCreate,
-        });
-      }
-
-      const tSent = Date.now();
-      task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tSent });
-
       if(entry.replicas >= task.K) break;
     }
     return assigned;
+  }
+
+  // Low-level: send a specific chunk to a specific client. Updates all bookkeeping.
+  // Returns true if the chunk was sent, false if preconditions failed.
+  _sendChunkToClient(task, chunkId, socketId) {
+    const entry = task.assignments.get(chunkId);
+    if (!entry || entry.completed || entry.replicas >= task.K) return false;
+    const c = this.clients.get(socketId);
+    if (!c || (c.inFlight || 0) >= (c.capacity || 1)) return false;
+
+    const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
+    if (!allowSameClient && entry.assignedTo.has(socketId)) return false;
+
+    const replica = entry.replicas;
+    entry.assignedTo.add(socketId);
+    entry.replicas++;
+    c.inFlight = (c.inFlight || 0) + 1;
+    c.tasks.add(task.id);
+    entry.lastAssignedAt = Date.now();
+
+    // Convert ArrayBuffers to base64 for native clients
+    let serializedPayload = entry.payload;
+    if (c.clientType === 'native' && entry.payload && entry.payload.buffers) {
+      try {
+        serializedPayload = {
+          ...entry.payload,
+          buffers: entry.payload.buffers.map((buf) => {
+            if (buf instanceof ArrayBuffer) {
+              return Buffer.from(buf).toString('base64');
+            } else if (Array.isArray(buf)) {
+              if (buf.length > 10000) {
+                return Buffer.from(new Uint8Array(buf)).toString('base64');
+              }
+              return buf;
+            }
+            if (buf && typeof buf === 'object' && (buf.buffer || buf.byteLength !== undefined)) {
+              const uint8Array = new Uint8Array(buf.buffer || buf, buf.byteOffset || 0, buf.byteLength || buf.length);
+              return Buffer.from(uint8Array).toString('base64');
+            }
+            return buf;
+          })
+        };
+      } catch (error) {
+        logger.error(`Failed to serialize payload for chunk ${chunkId}: ${error.message}`);
+        return false;
+      }
+    }
+
+    // Emit chunk assignment
+    logger.debug(`Sending chunk ${chunkId} replica ${replica} to client ${socketId} - replicas: ${entry.replicas}/${task.K}`);
+    if (c.clientType === 'native') {
+      c.socket.emit('chunk:assign', {
+        taskId: task.id, chunkId, replica,
+        payload: serializedPayload,
+        meta: entry.meta, tCreate: entry.tCreate,
+      });
+    } else {
+      c.socket.emit('chunk:assign', {
+        taskId: task.id, chunkId, replica,
+        payloadDescriptor: this._describePayload(entry.payload),
+        meta: entry.meta, tCreate: entry.tCreate,
+      });
+    }
+
+    task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tSent: Date.now() });
+    return true;
   }
 
   async receiveResult(socketId, data){
     const { taskId, chunkId, replica, status, checksum, result, timings } = data;
     const task = this.tasks.get(taskId);
     if(!task){ logger.warn('Result for unknown task', taskId); return; }
+    const client = this.clients.get(socketId);
     const entry = task.assignments.get(chunkId);
-    if(!entry){ logger.warn('Result for unknown chunk', chunkId); return; }
+    if(!entry){
+      // Entry already deleted (chunk completed) — still decrement inFlight
+      if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
+      logger.debug('Late result for completed/unknown chunk', chunkId);
+      return;
+    }
     if (entry.completed) {
+      if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
       logger.debug(`Dropping late result for completed chunk ${chunkId} (replica ${replica})`);
       return;
     }
     const tServerRecv = now();
-    const client = this.clients.get(socketId);
     if (client) client.inFlight = Math.max(0, (client.inFlight||0)-1);
 
     // Extract GPU timing data from response
@@ -666,7 +645,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         entry.assignedTo.delete(socketId);
       }
       this._assignChunkReplica(task, chunkId);
-      this._drainTaskQueue(task);
+      this._drainTaskQueue(task).catch(e => logger.error('drainTaskQueue error on failure recovery:', e));
       return;
     }
 
@@ -704,6 +683,9 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
             entry.assignedTo.clear();
             entry.replicas = 0;
             entry.payload = null; // free memory
+            // Remove the entire assignment entry — data is already persisted
+            // by assembler.integrate() and timers. Keeps assignments Map lean.
+            task.assignments.delete(chunkId);
           } finally {
             task.queueMutex.release();
           }
@@ -733,7 +715,10 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   _maybeFinish(taskId){
     const task = this.tasks.get(taskId);
     if(!task) return;
-    const allDone = task.chunkerFinished && [...task.assignments.values()].every(v=>v.completed);
+    // With assignment entries deleted on completion, use chunk counts instead.
+    // assignments.size holds only in-flight/pending entries now.
+    const allDone = task.chunkerFinished && task.totalChunks !== null &&
+                    task.completedChunks >= task.totalChunks;
     if(allDone && task.status==='running'){
       task.status = 'assembling';
       try{
@@ -756,6 +741,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
         this.io.emit('task:done', { taskId, outInfo });
         logger.info('Task completed', taskId, outInfo);
+        this._releaseTaskMemory(task);
       }catch(e){
         task.status = 'error';
 
@@ -763,6 +749,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
         try { task.osTracker?.stop('error'); } catch {}
 
         logger.error('Finalize error', e);
+        this._releaseTaskMemory(task);
       }
     }
   }
@@ -802,7 +789,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       startTime: t.startTime,
       completedChunks: t.completedChunks,
       totalChunks: t.totalChunks,
-      strategyId: t.strategy.id,
+      strategyId: t.strategy?.id ?? t.descriptor.strategyId,
       label: t.descriptor.label,
     };
   }
@@ -814,6 +801,19 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     } else {
       console.error('Socket does not have emit method');
     }
+  }
+
+  // Strip heavy data from a completed/errored task, keeping only status fields
+  // for REST API queries. Called after all data has been persisted to disk.
+  _releaseTaskMemory(task) {
+    task.assignments.clear();
+    task.pendingQueue.clear();
+    task.chunker = null;
+    task.assembler = null;
+    task.strategy = null;
+    task.osTracker = null;
+    task.queueMutex = null;
+    logger.info(`Task ${task.id}: Released in-memory data`);
   }
 
   _cleanupOutputFiles(task, outInfo) {
@@ -861,58 +861,70 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
   // ── HTTP Data Plane helpers ──────────────────────────────────────────
 
-  // Returns metadata-only description of a payload (no binary)
+  // Helper: detect if a value is binary (ArrayBuffer, Buffer, TypedArray)
+  _isBinary(val) {
+    if (!val || typeof val !== 'object') return false;
+    return val instanceof ArrayBuffer || Buffer.isBuffer(val) ||
+           ArrayBuffer.isView(val);
+  }
+
+  // Helper: convert any binary value to a Node Buffer
+  _toBuf(val) {
+    if (Buffer.isBuffer(val)) return val;
+    if (val instanceof ArrayBuffer) return Buffer.from(val);
+    if (ArrayBuffer.isView(val)) return Buffer.from(val.buffer, val.byteOffset, val.byteLength);
+    return Buffer.from(val);
+  }
+
+  // Returns metadata-only description of a payload (no binary data)
   _describePayload(payload) {
     if (!payload) return null;
     const desc = {};
-    if (payload.buffers) {
-      desc.bufferCount = payload.buffers.length;
-      desc.bufferSizes = payload.buffers.map(buf => {
-        if (buf instanceof ArrayBuffer) return buf.byteLength;
-        if (Array.isArray(buf)) return buf.length;
-        if (buf?.byteLength !== undefined) return buf.byteLength;
-        return 0;
-      });
-      // Copy all non-buffer scalar properties
-      for (const [key, val] of Object.entries(payload)) {
-        if (key !== 'buffers') desc[key] = val;
+    const binaryKeys = [];
+    for (const [key, val] of Object.entries(payload)) {
+      if (this._isBinary(val)) {
+        binaryKeys.push({ key, size: this._toBuf(val).length });
+      } else if (key === 'buffers' && Array.isArray(val)) {
+        // Legacy { buffers: [...] } format
+        binaryKeys.push({ key, size: val.reduce((s, b) => s + (this._isBinary(b) ? this._toBuf(b).length : 0), 0),
+          sizes: val.map(b => this._isBinary(b) ? this._toBuf(b).length : 0) });
+      } else {
+        desc[key] = val;
       }
-    } else {
-      Object.assign(desc, payload);
     }
+    desc.__binaryKeys__ = binaryKeys;
     return desc;
   }
 
-  // Pack a mixed payload into binary: [4-byte header len LE][JSON header][buf0][buf1]...
+  // Pack payload into binary: [4-byte header len LE][JSON header][buf0][buf1]...
+  // Handles both { buffers: [...] } format and arbitrary-key format (e.g. { a: ArrayBuffer, b: ArrayBuffer, dims: {...} })
   packPayload(payload) {
     if (!payload) return null;
 
     const headerObj = {};
     const rawBuffers = [];
+    const binaryKeys = []; // { key, size } or { key, sizes: [...] } for arrays
 
-    if (payload.buffers) {
-      for (const [key, val] of Object.entries(payload)) {
-        if (key !== 'buffers') headerObj[key] = val;
-      }
-      headerObj.bufferSizes = [];
-      for (const buf of payload.buffers) {
-        let nodeBuf;
-        if (buf instanceof ArrayBuffer) {
-          nodeBuf = Buffer.from(buf);
-        } else if (Array.isArray(buf)) {
-          nodeBuf = Buffer.from(new Uint8Array(buf));
-        } else if (buf?.buffer) {
-          nodeBuf = Buffer.from(buf.buffer, buf.byteOffset || 0, buf.byteLength);
-        } else {
-          nodeBuf = Buffer.from(buf);
-        }
-        headerObj.bufferSizes.push(nodeBuf.length);
+    for (const [key, val] of Object.entries(payload)) {
+      if (this._isBinary(val)) {
+        const nodeBuf = this._toBuf(val);
+        binaryKeys.push({ key, size: nodeBuf.length });
         rawBuffers.push(nodeBuf);
+      } else if (key === 'buffers' && Array.isArray(val)) {
+        // Legacy { buffers: [...] } format
+        const sizes = [];
+        for (const buf of val) {
+          const nodeBuf = this._toBuf(buf);
+          sizes.push(nodeBuf.length);
+          rawBuffers.push(nodeBuf);
+        }
+        binaryKeys.push({ key, sizes });
+      } else {
+        headerObj[key] = val;
       }
-    } else {
-      Object.assign(headerObj, payload);
     }
 
+    headerObj.__binaryKeys__ = binaryKeys;
     const headerJson = Buffer.from(JSON.stringify(headerObj));
     const headerLen = Buffer.alloc(4);
     headerLen.writeUInt32LE(headerJson.length, 0);
@@ -941,8 +953,11 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     });
   }
 
-  // O(1) assignment: picks the first pending chunk from the Set and assigns it
-  // directly to the client that just freed capacity (completed a chunk).
+  // HOT PATH (O(1)): assigns the next pending chunk directly to the worker
+  // that just completed one. No global client scan — the completing worker
+  // is the one that should get work next.
+  // Other idle workers are filled by _drainTaskQueue on the COLD PATH
+  // (worker:ready, registerClient).
   _assignNextToClient(task, socketId) {
     if (!task || task.status !== 'running' || task.cancelRequested) return;
     const client = this.clients.get(socketId);
@@ -956,8 +971,9 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
       if (!allowSameClient && entry.assignedTo.has(socketId)) continue;
 
-      // Found a pending chunk — assign it
-      this._assignChunkReplica(task, chunkId);
+      // Send directly to THIS client — not through _assignChunkReplica
+      // which would pick the globally-best client and might skip us.
+      this._sendChunkToClient(task, chunkId, socketId);
       return;
     }
   }

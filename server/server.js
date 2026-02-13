@@ -129,6 +129,12 @@ io.on('connection', (socket)=>{
   });
   socket.on('disconnect', ()=>tm.removeClient(socket.id));
   socket.on('chunk:result', (data)=>tm.receiveResult(socket.id, data));
+  socket.on('worker:ready', (data)=>{
+    const task = data?.taskId ? tm.getTask(data.taskId) : null;
+    if (task && task.status === 'running') {
+      tm._drainTaskQueue(task).catch(e => logger.error('drainTaskQueue error on worker:ready:', e));
+    }
+  });
 });
 
 // Raw WebSocket handlers (native clients and listeners)
@@ -312,7 +318,7 @@ wss.on('connection', (ws, req) => {
             const task = tm.getTask(taskId);
             if (task && task.status === 'running') {
               logger.info(`Draining task queue for ${taskId} after client ${ws.id} reported ready`);
-              tm._drainTaskQueue(task);
+              tm._drainTaskQueue(task).catch(e => logger.error('drainTaskQueue error on workload:ready:', e));
             }
           }
           break;
