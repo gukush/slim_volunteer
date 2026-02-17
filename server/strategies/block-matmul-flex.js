@@ -135,7 +135,17 @@ function toF32(x){
 }
 
 function readWindow(fd, rowStart, rowCount, colStart, colCount, rowLen, elementSize=4){
-  const out = Buffer.alloc(rowCount * colCount * elementSize);
+  const outBytes = rowCount * colCount * elementSize;
+  const out = Buffer.alloc(outBytes);
+
+  // If reading full-width rows, they're contiguous in the file — single syscall
+  if (colStart === 0 && colCount === rowLen) {
+    const fileOffset = rowStart * rowLen * elementSize;
+    fs.readSync(fd, out, 0, outBytes, fileOffset);
+    return out;
+  }
+
+  // Sub-row reads: one syscall per row
   const rowBytes = colCount * elementSize;
   for (let r = 0; r < rowCount; r++){
     const srcOff = ((rowStart + r) * rowLen + colStart) * elementSize;
@@ -237,18 +247,23 @@ export function buildChunker({ taskId, taskDir, K, config, inputFiles }){
   return {
     async *stream(){
       let actualChunkCount = 0;
+      // Loop order: ib → kb → jb
+      // A block depends on (ib, kb) only — read once, reuse across all jb.
+      // B block depends on (kb, jb) — must be read per chunk.
       for (let ib = 0; ib < nIB; ib++){
         const rNow = Math.min(baseRows, N - ib*baseRows);
-        for (let jb = 0; jb < nJB; jb++){
-          const cNow = Math.min(baseCols, M - jb*baseCols);
-          for (let kb = 0; kb < KK; kb += kSpan){
-            const kNow = Math.min(kSpan, KK - kb);
+        for (let kb = 0; kb < KK; kb += kSpan){
+          const kNow = Math.min(kSpan, KK - kb);
+
+          // Read & pack A once for this (ib, kb) tile
+          const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK, 4);
+          const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
+
+          for (let jb = 0; jb < nJB; jb++){
+            const cNow = Math.min(baseCols, M - jb*baseCols);
             actualChunkCount++;
 
-            const Ablock = readWindow(fdA, ib*baseRows, rNow, kb, kNow, KK, 4);
             const Bblock = readWindow(fdB, kb, kNow, jb*baseCols, cNow, M, 4);
-
-            const aData = packData(Ablock.buffer.slice(Ablock.byteOffset, Ablock.byteOffset + Ablock.byteLength), datatype);
             const bData = packData(Bblock.buffer.slice(Bblock.byteOffset, Bblock.byteOffset + Bblock.byteLength), datatype);
 
             let dims;

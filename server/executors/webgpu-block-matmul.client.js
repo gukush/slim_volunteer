@@ -375,5 +375,9 @@ export function createExecutor({ kernels, config }){
     };
   }
 
-  return { runChunk };
+  async function prewarm() {
+    await ensurePipeline();
+  }
+
+  return { runChunk, prewarm };
 }
