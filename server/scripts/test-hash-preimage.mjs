@@ -50,7 +50,7 @@ async function waitForCompletion(baseURL, taskId, { intervalMs = 1000, timeoutMs
     }
     const total = status.totalChunks || '?';
     process.stdout.write(`\rStatus=${status.status} completedChunks=${status.completedChunks || 0}/${total}   `);
-    if (Date.now() - start > timeoutMs) throw new Error('Timeout waiting for completion');
+    if (timeoutMs > 0 && Date.now() - start > timeoutMs) throw new Error('Timeout waiting for completion');
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
@@ -63,6 +63,8 @@ async function main() {
   const startNonce = BigInt(args.startNonce ?? 0);
   const totalNonces = BigInt(args.totalNonces ?? 512);
   const chunkSize = Number(args.chunkSize ?? 128);
+  const intervalMs = Number(args.intervalMs ?? 1000);
+  const timeoutMs = Number(args.timeoutMs ?? 120000);
   const outDir = args.outDir || path.join(process.cwd(), `hash-preimage-results-${Date.now()}`);
   const targetHash = args.targetHash || hashFor(prefix, expectedNonce);
 
@@ -96,7 +98,7 @@ async function main() {
 
   await api(baseURL, `/tasks/${taskId}/start`, { method: 'POST' });
   console.log('Started task', taskId);
-  await waitForCompletion(baseURL, taskId, { intervalMs: 1000 });
+  await waitForCompletion(baseURL, taskId, { intervalMs, timeoutMs });
   console.log('\nTask completed');
 
   const summary = await api(baseURL, `/tasks/${taskId}/output?name=output.json`);
