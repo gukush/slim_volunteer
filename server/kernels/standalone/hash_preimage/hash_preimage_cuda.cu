@@ -254,6 +254,8 @@ struct Config {
     int device = 0;
     std::string outPath;
     std::string csvPath;
+    bool hasExpectedNonce = false;
+    u64 expectedNonce = 0;
 };
 
 static std::unordered_map<std::string, std::string> parseArgs(int argc, char** argv) {
@@ -331,6 +333,11 @@ static std::string nonceToHex(u64 nonce) {
     std::ostringstream oss;
     oss << "0x" << std::hex << nonce;
     return oss.str();
+}
+
+static std::string digestToHex(const Digest& d) {
+    const u32 words[8] = { d.h0, d.h1, d.h2, d.h3, d.h4, d.h5, d.h6, d.h7 };
+    return digestToHex(words);
 }
 
 struct TimingResults {
@@ -436,7 +443,7 @@ static void printUsage() {
     std::cout
         << "Usage: ./hash-preimage-search [options]\n"
         << "  --prefix=TEXT or --prefix-hex=HEX\n"
-        << "  --target-hash=HEX64 or --leading-zero-bits=N\n"
+        << "  --target-hash=HEX64 or --expected-nonce=N or --leading-zero-bits=N\n"
         << "  --start-nonce=N            default 0\n"
         << "  --total-nonces=N           default 512\n"
         << "  --end-nonce=N              alternative to total-nonces\n"
@@ -457,29 +464,31 @@ static Config loadConfig(int argc, char** argv) {
     std::string prefixHex = getArg(args, {"prefix-hex", "prefixHex"});
     std::string prefixText = getArg(args, {"prefix"});
     std::string targetHash = getArg(args, {"target-hash", "targetHash"});
+    std::string expectedNonceText = getArg(args, {"expected-nonce", "expectedNonce"});
     std::string leadingBitsText = getArg(args, {"leading-zero-bits", "leadingZeroBits"});
     std::string outPath = getArg(args, {"out"});
     std::string csvPath = getArg(args, {"csv-file", "csvFile"});
     bool usedEnd = false;
+    bool usedExpectedNonce = false;
     u64 startNonce = parseU64(getArg(args, {"start-nonce", "startNonce"}), 0);
     u64 totalNonces = parseU64(getArg(args, {"total-nonces", "totalNonces"}), 512);
     u64 endNonce = parseU64(getArg(args, {"end-nonce", "endNonce"}), 0, &usedEnd);
     u64 chunkSize = parseU64(getArg(args, {"chunk-size", "chunkSize"}), 1'000'000);
     u64 device = parseU64(getArg(args, {"device"}), 0);
     u64 leadingBits64 = parseU64(leadingBitsText, 0);
+    u64 expectedNonce = parseU64(expectedNonceText, 0, &usedExpectedNonce);
 
     if (!prefixHex.empty()) cfg.prefix = parseHexBytes(prefixHex);
     else cfg.prefix.assign(prefixText.begin(), prefixText.end());
 
     if (cfg.prefix.size() > 47) throw std::runtime_error("prefix must be at most 47 bytes");
     if (leadingBits64 > 256) throw std::runtime_error("leadingZeroBits must be <= 256");
-    if (targetHash.empty() && leadingBits64 == 0) {
-        throw std::runtime_error("Either targetHash or leadingZeroBits must be provided");
+    if (targetHash.empty() && !usedExpectedNonce && leadingBits64 == 0) {
+        throw std::runtime_error("Either targetHash or expectedNonce or leadingZeroBits must be provided");
     }
     if (chunkSize == 0) throw std::runtime_error("chunkSize must be > 0");
 
     cfg.targetHash = targetHash;
-    cfg.targetWords = parseTargetWords(targetHash);
     cfg.leadingZeroBits = static_cast<u32>(leadingBits64);
     cfg.startNonce = startNonce;
     cfg.endNonce = usedEnd ? endNonce : (startNonce + totalNonces);
@@ -487,6 +496,12 @@ static Config loadConfig(int argc, char** argv) {
     cfg.device = static_cast<int>(device);
     cfg.outPath = outPath;
     cfg.csvPath = csvPath;
+    cfg.hasExpectedNonce = usedExpectedNonce;
+    cfg.expectedNonce = expectedNonce;
+
+    if (!cfg.targetHash.empty()) {
+        cfg.targetWords = parseTargetWords(cfg.targetHash);
+    }
 
     if (cfg.endNonce <= cfg.startNonce) throw std::runtime_error("Nonce range must satisfy endNonce > startNonce");
     return cfg;
@@ -546,6 +561,22 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaSetDevice(cfg.device));
 
         auto prefixWords = packPrefixWords(cfg.prefix);
+        if (cfg.targetHash.empty() && cfg.hasExpectedNonce) {
+            std::array<u32, 32> expectedParams{};
+            for (size_t i = 0; i < 16; i++) expectedParams[8 + i] = prefixWords[i];
+            expectedParams[27] = static_cast<u32>(cfg.prefix.size());
+            Digest expectedDigest = verifyDigest(
+                expectedParams,
+                static_cast<u32>(cfg.expectedNonce & 0xffffffffull),
+                static_cast<u32>((cfg.expectedNonce >> 32) & 0xffffffffull)
+            );
+            cfg.targetHash = digestToHex(expectedDigest);
+            cfg.targetWords = {
+                expectedDigest.h0, expectedDigest.h1, expectedDigest.h2, expectedDigest.h3,
+                expectedDigest.h4, expectedDigest.h5, expectedDigest.h6, expectedDigest.h7
+            };
+        }
+
         std::array<u32, 32> params{};
         for (size_t i = 0; i < 8; i++) params[i] = cfg.targetWords[i];
         for (size_t i = 0; i < 16; i++) params[8 + i] = prefixWords[i];
