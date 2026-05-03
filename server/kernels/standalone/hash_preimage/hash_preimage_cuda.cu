@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -252,6 +253,7 @@ struct Config {
     u64 chunkSize = 1'000'000;
     int device = 0;
     std::string outPath;
+    std::string csvPath;
 };
 
 static std::unordered_map<std::string, std::string> parseArgs(int argc, char** argv) {
@@ -331,6 +333,105 @@ static std::string nonceToHex(u64 nonce) {
     return oss.str();
 }
 
+struct TimingResults {
+    std::string timestamp;
+    std::string gpuName;
+    size_t prefixBytes = 0;
+    std::string targetHash;
+    u32 leadingZeroBits = 0;
+    u64 startNonce = 0;
+    u64 endNonce = 0;
+    u64 searchedNonces = 0;
+    u64 chunkSize = 0;
+    u64 batches = 0;
+    bool found = false;
+    double totalH2DMs = 0.0;
+    double totalKernelMs = 0.0;
+    double totalD2HMs = 0.0;
+    double totalOutputIOMs = 0.0;
+    double avgChunkTimeMs = 0.0;
+    double endToEndMs = 0.0;
+    double throughputNoncesPerSec = 0.0;
+};
+
+static std::string timestampHumanNow() {
+    auto now = std::chrono::system_clock::now();
+    auto tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    std::ostringstream ss;
+    ss << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    return ss.str();
+}
+
+static std::string generateCsvFilename(const std::string& custom = "") {
+    if (!custom.empty()) return custom;
+    auto now = std::chrono::system_clock::now();
+    auto tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    auto epochMs = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+
+    std::ostringstream ss;
+    ss << "hash_preimage_timing_"
+       << (tm.tm_year + 1900)
+       << std::setw(2) << std::setfill('0') << (tm.tm_mon + 1)
+       << std::setw(2) << std::setfill('0') << tm.tm_mday
+       << "_"
+       << std::setw(2) << std::setfill('0') << tm.tm_hour
+       << std::setw(2) << std::setfill('0') << tm.tm_min
+       << std::setw(2) << std::setfill('0') << tm.tm_sec
+       << "_" << (epochMs % 1000)
+       << ".csv";
+    return ss.str();
+}
+
+static void exportTimingToCsv(const TimingResults& r, const std::string& filename) {
+    bool exists = std::ifstream(filename).good();
+    std::ofstream csv(filename, std::ios::app);
+    if (!csv) {
+        std::cerr << "Warning: Cannot create CSV file: " << filename << std::endl;
+        return;
+    }
+
+    if (!exists) {
+        csv << "timestamp,gpu_name,prefix_bytes,target_hash,leading_zero_bits,start_nonce,end_nonce,"
+               "searched_nonces,chunk_size,batches,found,total_h2d_ms,total_kernel_ms,total_d2h_ms,"
+               "output_io_ms,avg_chunk_time_ms,end_to_end_ms,throughput_nonces_per_sec\n";
+    }
+
+    csv << std::quoted(r.timestamp) << ","
+        << std::quoted(r.gpuName) << ","
+        << r.prefixBytes << ","
+        << std::quoted(r.targetHash) << ","
+        << r.leadingZeroBits << ","
+        << r.startNonce << ","
+        << r.endNonce << ","
+        << r.searchedNonces << ","
+        << r.chunkSize << ","
+        << r.batches << ","
+        << (r.found ? "true" : "false") << ","
+        << std::fixed << std::setprecision(3)
+        << r.totalH2DMs << ","
+        << r.totalKernelMs << ","
+        << r.totalD2HMs << ","
+        << r.totalOutputIOMs << ","
+        << r.avgChunkTimeMs << ","
+        << r.endToEndMs << ","
+        << std::setprecision(1) << r.throughputNoncesPerSec
+        << "\n";
+
+    std::cout << "Timing CSV: " << filename << "\n";
+}
+
 static void printUsage() {
     std::cout
         << "Usage: ./hash-preimage-search [options]\n"
@@ -341,7 +442,8 @@ static void printUsage() {
         << "  --end-nonce=N              alternative to total-nonces\n"
         << "  --chunk-size=N             per-kernel batch size, default 1000000\n"
         << "  --device=N                 CUDA device index, default 0\n"
-        << "  --out=PATH                 optional JSON summary path\n";
+        << "  --out=PATH                 optional JSON summary path\n"
+        << "  --csv-file=PATH            optional CSV filename (auto-generated if omitted)\n";
 }
 
 static Config loadConfig(int argc, char** argv) {
@@ -357,6 +459,7 @@ static Config loadConfig(int argc, char** argv) {
     std::string targetHash = getArg(args, {"target-hash", "targetHash"});
     std::string leadingBitsText = getArg(args, {"leading-zero-bits", "leadingZeroBits"});
     std::string outPath = getArg(args, {"out"});
+    std::string csvPath = getArg(args, {"csv-file", "csvFile"});
     bool usedEnd = false;
     u64 startNonce = parseU64(getArg(args, {"start-nonce", "startNonce"}), 0);
     u64 totalNonces = parseU64(getArg(args, {"total-nonces", "totalNonces"}), 512);
@@ -383,6 +486,7 @@ static Config loadConfig(int argc, char** argv) {
     cfg.chunkSize = chunkSize;
     cfg.device = static_cast<int>(device);
     cfg.outPath = outPath;
+    cfg.csvPath = csvPath;
 
     if (cfg.endNonce <= cfg.startNonce) throw std::runtime_error("Nonce range must satisfy endNonce > startNonce");
     return cfg;
@@ -390,6 +494,50 @@ static Config loadConfig(int argc, char** argv) {
 
 static Digest verifyDigest(const std::array<u32, 32>& params, u32 nonceLo, u32 nonceHi) {
     return sha256_one_block_generic(params.data(), SHA256_K_HOST, nonceLo, nonceHi);
+}
+
+static std::string buildJsonSummary(bool found,
+                                    u64 searched,
+                                    u64 batches,
+                                    double wallMs,
+                                    double totalH2DMs,
+                                    double totalKernelMs,
+                                    double totalD2HMs,
+                                    double totalOutputIOMs,
+                                    double avgChunkTimeMs,
+                                    double throughputNoncesPerSec,
+                                    const std::array<u32, 12>& result) {
+    std::ostringstream json;
+    json << "{\n";
+    json << "  \"found\": " << (found ? "true" : "false") << ",\n";
+    json << "  \"searchedNonces\": \"" << searched << "\",\n";
+    json << "  \"batches\": " << batches << ",\n";
+    json << "  \"wallMs\": " << std::fixed << std::setprecision(3) << wallMs << ",\n";
+    json << "  \"timings\": {\n";
+    json << "    \"h2dMs\": " << std::fixed << std::setprecision(3) << totalH2DMs << ",\n";
+    json << "    \"kernelMs\": " << std::fixed << std::setprecision(3) << totalKernelMs << ",\n";
+    json << "    \"d2hMs\": " << std::fixed << std::setprecision(3) << totalD2HMs << ",\n";
+    json << "    \"outputIoMs\": " << std::fixed << std::setprecision(3) << totalOutputIOMs << ",\n";
+    json << "    \"avgChunkTimeMs\": " << std::fixed << std::setprecision(3) << avgChunkTimeMs << ",\n";
+    json << "    \"endToEndMs\": " << std::fixed << std::setprecision(3) << wallMs << ",\n";
+    json << "    \"throughputNoncesPerSec\": " << std::fixed << std::setprecision(1) << throughputNoncesPerSec << "\n";
+    json << "  }";
+
+    if (found) {
+        u64 nonce = (static_cast<u64>(result[2]) << 32) | static_cast<u64>(result[1]);
+        std::array<u32, 8> digestWords = {
+            result[3], result[4], result[5], result[6],
+            result[7], result[8], result[9], result[10]
+        };
+        std::string hashHex = digestToHex(digestWords.data());
+        json << ",\n  \"match\": {\n";
+        json << "    \"nonce\": \"" << nonce << "\",\n";
+        json << "    \"nonceHex\": \"" << nonceToHex(nonce) << "\",\n";
+        json << "    \"hash\": \"" << hashHex << "\"\n";
+        json << "  }";
+    }
+    json << "\n}\n";
+    return json.str();
 }
 
 int main(int argc, char** argv) {
@@ -411,13 +559,18 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMalloc(&d_result, sizeof(u32) * 12));
 
         auto t0 = std::chrono::high_resolution_clock::now();
+        double totalH2DMs = 0.0;
         double totalKernelMs = 0.0;
+        double totalD2HMs = 0.0;
+        double totalOutputIOMs = 0.0;
         u64 searched = 0;
         u64 batches = 0;
         std::array<u32, 12> result{};
         bool found = false;
+        std::vector<double> chunkTimesMs;
 
         for (u64 nonce = cfg.startNonce; nonce < cfg.endNonce; nonce += cfg.chunkSize) {
+            auto chunkT0 = std::chrono::high_resolution_clock::now();
             u64 remaining = cfg.endNonce - nonce;
             u64 batchCount64 = std::min<u64>(cfg.chunkSize, remaining);
             batchCount64 = std::min<u64>(batchCount64, 0xffffffffull);
@@ -427,33 +580,59 @@ int main(int argc, char** argv) {
             params[25] = static_cast<u32>((nonce >> 32) & 0xffffffffull);
             params[26] = batchCount;
 
+            cudaEvent_t evH2DStart, evH2DStop, evKernelStart, evKernelStop, evD2HStart, evD2HStop;
+            CUDA_CHECK(cudaEventCreate(&evH2DStart));
+            CUDA_CHECK(cudaEventCreate(&evH2DStop));
+            CUDA_CHECK(cudaEventCreate(&evKernelStart));
+            CUDA_CHECK(cudaEventCreate(&evKernelStop));
+            CUDA_CHECK(cudaEventCreate(&evD2HStart));
+            CUDA_CHECK(cudaEventCreate(&evD2HStop));
+
+            CUDA_CHECK(cudaEventRecord(evH2DStart));
             CUDA_CHECK(cudaMemcpy(d_params, params.data(), sizeof(u32) * 32, cudaMemcpyHostToDevice));
             CUDA_CHECK(cudaMemset(d_result, 0, sizeof(u32) * 12));
+            CUDA_CHECK(cudaEventRecord(evH2DStop));
+            CUDA_CHECK(cudaEventSynchronize(evH2DStop));
 
             constexpr u32 BLOCK_SIZE = 256u;
             u32 grid = (batchCount + BLOCK_SIZE - 1u) / BLOCK_SIZE;
 
-            cudaEvent_t evStart, evStop;
-            CUDA_CHECK(cudaEventCreate(&evStart));
-            CUDA_CHECK(cudaEventCreate(&evStop));
-            CUDA_CHECK(cudaEventRecord(evStart));
+            CUDA_CHECK(cudaEventRecord(evKernelStart));
             if (batchCount > 0) {
                 search_kernel<<<grid, BLOCK_SIZE>>>(d_params, d_result);
             }
-            CUDA_CHECK(cudaEventRecord(evStop));
-            CUDA_CHECK(cudaEventSynchronize(evStop));
+            CUDA_CHECK(cudaEventRecord(evKernelStop));
+            CUDA_CHECK(cudaEventSynchronize(evKernelStop));
 
+            float h2dMs = 0.0f;
             float kernelMs = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&kernelMs, evStart, evStop));
-            CUDA_CHECK(cudaEventDestroy(evStart));
-            CUDA_CHECK(cudaEventDestroy(evStop));
+            CUDA_CHECK(cudaEventElapsedTime(&h2dMs, evH2DStart, evH2DStop));
+            CUDA_CHECK(cudaEventElapsedTime(&kernelMs, evKernelStart, evKernelStop));
             CUDA_CHECK(cudaDeviceSynchronize());
 
+            CUDA_CHECK(cudaEventRecord(evD2HStart));
+            CUDA_CHECK(cudaMemcpy(result.data(), d_result, sizeof(u32) * 12, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaEventRecord(evD2HStop));
+            CUDA_CHECK(cudaEventSynchronize(evD2HStop));
+
+            float d2hMs = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&d2hMs, evD2HStart, evD2HStop));
+
+            CUDA_CHECK(cudaEventDestroy(evH2DStart));
+            CUDA_CHECK(cudaEventDestroy(evH2DStop));
+            CUDA_CHECK(cudaEventDestroy(evKernelStart));
+            CUDA_CHECK(cudaEventDestroy(evKernelStop));
+            CUDA_CHECK(cudaEventDestroy(evD2HStart));
+            CUDA_CHECK(cudaEventDestroy(evD2HStop));
+
+            totalH2DMs += h2dMs;
             totalKernelMs += kernelMs;
+            totalD2HMs += d2hMs;
             searched += batchCount64;
             batches++;
+            auto chunkT1 = std::chrono::high_resolution_clock::now();
+            chunkTimesMs.push_back(std::chrono::duration<double, std::milli>(chunkT1 - chunkT0).count());
 
-            CUDA_CHECK(cudaMemcpy(result.data(), d_result, sizeof(u32) * 12, cudaMemcpyDeviceToHost));
             if (result[0] == 1u) {
                 found = true;
                 break;
@@ -462,14 +641,9 @@ int main(int argc, char** argv) {
 
         auto t1 = std::chrono::high_resolution_clock::now();
         double wallMs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0;
-
-        std::ostringstream json;
-        json << "{\n";
-        json << "  \"found\": " << (found ? "true" : "false") << ",\n";
-        json << "  \"searchedNonces\": \"" << searched << "\",\n";
-        json << "  \"batches\": " << batches << ",\n";
-        json << "  \"wallMs\": " << std::fixed << std::setprecision(3) << wallMs << ",\n";
-        json << "  \"kernelMs\": " << std::fixed << std::setprecision(3) << totalKernelMs;
+        double avgChunkTimeMs = chunkTimesMs.empty() ? 0.0 :
+            (std::accumulate(chunkTimesMs.begin(), chunkTimesMs.end(), 0.0) / static_cast<double>(chunkTimesMs.size()));
+        double throughputNoncesPerSec = wallMs > 0.0 ? (static_cast<double>(searched) * 1000.0 / wallMs) : 0.0;
 
         if (found) {
             u64 nonce = (static_cast<u64>(result[2]) << 32) | static_cast<u64>(result[1]);
@@ -487,32 +661,61 @@ int main(int argc, char** argv) {
             }
 
             std::string hashHex = digestToHex(digestWords.data());
-            json << ",\n  \"match\": {\n";
-            json << "    \"nonce\": \"" << nonce << "\",\n";
-            json << "    \"nonceHex\": \"" << nonceToHex(nonce) << "\",\n";
-            json << "    \"hash\": \"" << hashHex << "\"\n";
-            json << "  }";
-
             std::cout << "Found nonce: " << nonce << " (" << nonceToHex(nonce) << ")\n";
             std::cout << "Hash: " << hashHex << "\n";
         }
-        json << "\n}\n";
 
         CUDA_CHECK(cudaFree(d_params));
         CUDA_CHECK(cudaFree(d_result));
-
         std::cout << "Searched nonces: " << searched << "\n";
         std::cout << "Batches: " << batches << "\n";
+        std::cout << "H2D time (ms): " << totalH2DMs << "\n";
         std::cout << "Kernel time (ms): " << totalKernelMs << "\n";
+        std::cout << "D2H time (ms): " << totalD2HMs << "\n";
+        std::cout << "Avg chunk time (ms): " << avgChunkTimeMs << "\n";
+        std::cout << "Throughput (nonces/s): " << throughputNoncesPerSec << "\n";
         std::cout << "Wall time (ms): " << wallMs << "\n";
 
         if (!cfg.outPath.empty()) {
+            auto outputIoT0 = std::chrono::high_resolution_clock::now();
+            std::string jsonText = buildJsonSummary(found, searched, batches, wallMs, totalH2DMs, totalKernelMs,
+                                                    totalD2HMs, 0.0, avgChunkTimeMs, throughputNoncesPerSec, result);
             std::ofstream out(cfg.outPath, std::ios::binary);
             if (!out) throw std::runtime_error("Failed to open output path: " + cfg.outPath);
-            out << json.str();
+            out << jsonText;
+            auto outputIoT1 = std::chrono::high_resolution_clock::now();
+            totalOutputIOMs += std::chrono::duration<double, std::milli>(outputIoT1 - outputIoT0).count();
         }
 
-        std::cout << json.str();
+        cudaDeviceProp prop{};
+        int dev = 0;
+        CUDA_CHECK(cudaGetDevice(&dev));
+        CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+
+        TimingResults timing{};
+        timing.timestamp = timestampHumanNow();
+        timing.gpuName = prop.name;
+        timing.prefixBytes = cfg.prefix.size();
+        timing.targetHash = cfg.targetHash;
+        timing.leadingZeroBits = cfg.leadingZeroBits;
+        timing.startNonce = cfg.startNonce;
+        timing.endNonce = cfg.endNonce;
+        timing.searchedNonces = searched;
+        timing.chunkSize = cfg.chunkSize;
+        timing.batches = batches;
+        timing.found = found;
+        timing.totalH2DMs = totalH2DMs;
+        timing.totalKernelMs = totalKernelMs;
+        timing.totalD2HMs = totalD2HMs;
+        timing.totalOutputIOMs = totalOutputIOMs;
+        timing.avgChunkTimeMs = avgChunkTimeMs;
+        timing.endToEndMs = wallMs;
+        timing.throughputNoncesPerSec = throughputNoncesPerSec;
+        exportTimingToCsv(timing, generateCsvFilename(cfg.csvPath));
+
+        std::string jsonText = buildJsonSummary(found, searched, batches, wallMs, totalH2DMs, totalKernelMs,
+                                                totalD2HMs, totalOutputIOMs, avgChunkTimeMs, throughputNoncesPerSec, result);
+        std::cout << jsonText;
         return 0;
     } catch (const std::exception& e) {
         std::cerr << e.what() << std::endl;
