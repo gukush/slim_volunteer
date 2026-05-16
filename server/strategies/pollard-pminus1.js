@@ -156,6 +156,15 @@ function normalizeInput(config, inputArgs) {
       ns0 = [N0];
     }
   }
+
+  const limit = inputArgs.limit ?? config.limit;
+  if (limit !== undefined && limit !== null && limit !== '') {
+    const limitNum = Number(limit);
+    if (Number.isInteger(limitNum) && limitNum > 0 && limitNum < ns0.length) {
+      ns0 = ns0.slice(0, limitNum);
+    }
+  }
+
   for (let i = 0; i < ns0.length; i++) {
     if (ns0[i] < 4n) throw new Error(`N[${i}] must be >= 4`);
     if (ns0[i] >= (1n << 256n)) throw new Error(`N[${i}] must fit in 256 bits`);
@@ -204,31 +213,39 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
   const evenFactors = [];
   for (let i = 0; i < ns0.length; i++) {
     const N0 = ns0[i];
-    const factor2 = N0 % 2n === 0n ? 2n : null;
-    const N = factor2 ? N0 / 2n : N0;
-    if (N % 2n === 0n) throw new Error(`N[${i}]: after removing one factor 2, reduced N is still even; use trial division first`);
+    let N = N0;
+    let hasFactor2 = false;
+    // Strip all factors of 2 (trial division for 2), matching CUDA behavior
+    while (N % 2n === 0n) {
+      N = N / 2n;
+      hasFactor2 = true;
+    }
     ns.push(N);
-    evenFactors.push(factor2 ? { index: i, N0, factor: '2', factorHex: '0x2', source: 'even-prepass' } : null);
+    evenFactors.push(hasFactor2 ? { index: i, N0, factor: '2', factorHex: '0x2', source: 'even-prepass' } : null);
   }
-  const totalChunks = Math.ceil(totalBases / chunkSize);
-  logger.info(`Pollard p-1: batch=${ns0.length} numbers, B1=${B1}, bases=${totalBases}, chunkSize=${chunkSize}`);
+  // Chunk by numbers, not by bases. Each number gets exactly 1 base (totalBases=1).
+  const totalChunks = Math.ceil(ns.length / chunkSize);
+  logger.info(`Pollard p-1: batch=${ns0.length} numbers, B1=${B1}, bases=${totalBases}, chunkSize=${chunkSize} numbers/chunk, totalChunks=${totalChunks}`);
 
   return {
     async *stream() {
-      for (let offset = 0, chunkIndex = 0; offset < totalBases; offset += chunkSize, chunkIndex++) {
-        const nBases = Math.min(chunkSize, totalBases - offset);
-        const baseStart = startBase + offset;
-        const payload = buildPayload({ ns, B1, baseStart, nBases });
+      for (let offset = 0, chunkIndex = 0; offset < ns.length; offset += chunkSize, chunkIndex++) {
+        const chunkNs = ns.slice(offset, offset + chunkSize);
+        const chunkNs0 = ns0.slice(offset, offset + chunkSize);
+        const nBases = totalBases; // 1
+        const baseStart = startBase; // 2
+        const payload = buildPayload({ ns: chunkNs, B1, baseStart, nBases });
         yield {
           id: uuidv4(),
           payload,
           meta: {
             chunkIndex,
+            offset,
             baseStart,
             nBases,
-            numNs: ns.length,
+            numNs: chunkNs.length,
             ppCount: payload.ppCount,
-            ns: ns0.map((n) => '0x' + n.toString(16)),
+            ns: chunkNs0.map((n) => '0x' + n.toString(16)),
             B1,
           },
           tCreate: Date.now(),
@@ -261,6 +278,7 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
     integrate({ result, meta }) {
       chunksProcessed++;
       basesProcessed += Number(meta.nBases || 0);
+      const offset = Number(meta.offset || 0);
       const u32 = readResultU32(result);
       if (u32[0] !== MAGIC) throw new Error(`Unexpected Pollard p-1 result magic 0x${(u32[0] >>> 0).toString(16)}`);
       const ppCount = u32[2] >>> 0;
@@ -270,8 +288,8 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
       const outStart = 8 + numNs * CONST_WORDS + ppCount;
 
       for (let n = 0; n < numNs; n++) {
-        const { N0, found } = perN[n];
-        const reducedN = N0 % 2n === 0n ? N0 / 2n : N0;
+        const globalIndex = offset + n;
+        const { N0, found } = perN[globalIndex];
         const nOutStart = outStart + n * nBases * 12;
         for (let i = 0; i < nBases; i++) {
           const base = nOutStart + i * 12;
@@ -281,7 +299,7 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
           if (status !== 2) continue;
           const g = gcdBig(factor, N0);
           if (g <= 1n || g >= N0 || N0 % g !== 0n) {
-            throw new Error(`Client reported invalid Pollard p-1 factor ${factor} for N[${n}]`);
+            throw new Error(`Client reported invalid Pollard p-1 factor ${factor} for N[${globalIndex}]`);
           }
           if (!found.some((x) => x.factor === g.toString())) {
             found.push({
@@ -320,8 +338,8 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
 }
 
 export function getTotalChunks(config, inputArgs) {
-  const { ns0, totalBases, chunkSize } = normalizeInput(config || {}, inputArgs || {});
+  const { ns0, chunkSize } = normalizeInput(config || {}, inputArgs || {});
   const allEven = ns0.every((N0) => N0 % 2n === 0n);
   if (allEven) return 0;
-  return Math.ceil(totalBases / chunkSize);
+  return Math.ceil(ns0.length / chunkSize);
 }

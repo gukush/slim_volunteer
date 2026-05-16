@@ -450,9 +450,10 @@ static void usage(const char* argv0) {
     << "Usage: " << argv0 << " [options]\n"
     << "  --N=HEX|DEC               Single number to factor\n"
     << "  --batch=N1,N2,...         Comma-separated list of numbers (same B1)\n"
-    << "  --batchFile=FILE          File with one number per line\n"
-    << "  --B1=N                    Stage-1 bound (default: 10000)\n"
-    << "  --blockSize=N             CUDA block size (default: 256)\n";
+  << "  --batchFile=FILE          File with one number per line\n"
+  << "  --limit=N                 Use only the first N numbers from the batch\n"
+  << "  --B1=N                    Stage-1 bound (default: 10000)\n"
+  << "  --blockSize=N             CUDA block size (default: 256)\n";
 }
 
 int main(int argc, char** argv) {
@@ -461,6 +462,7 @@ int main(int argc, char** argv) {
   std::string batchFile;
   uint32_t B1 = 10000;
   uint32_t blockSize = 256;
+  uint32_t limit = 0; // 0 means no limit
 
   // Fixed: each number gets exactly 1 base (a=2). Parallelism comes from batch size.
   const uint32_t totalBases = 1;
@@ -475,6 +477,7 @@ int main(int argc, char** argv) {
     if (key == "--N") Narg = val;
     else if (key == "--batch") batchArg = val;
     else if (key == "--batchFile") batchFile = val;
+    else if (key == "--limit") limit = parse_u32(val);
     else if (key == "--B1") B1 = parse_u32(val);
     else if (key == "--blockSize") blockSize = parse_u32(val);
     else { std::cerr << "Unknown option: " << arg << "\n"; usage(argv[0]); return 2; }
@@ -503,6 +506,10 @@ int main(int argc, char** argv) {
     ns_str.push_back(Narg);
   } else {
     ns_str.push_back("0x123456789abcdef01");
+  }
+
+  if (limit > 0 && ns_str.size() > limit) {
+    ns_str.resize(limit);
   }
 
   if (blockSize == 0 || blockSize > 1024) { std::cerr << "blockSize must be in [1, 1024]" << std::endl; return 2; }

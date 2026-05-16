@@ -9,11 +9,13 @@ const args = Object.fromEntries(process.argv.slice(2).map((s) => {
 }));
 
 const host = args.host || 'https://localhost:3000';
-const N = args.N || '8051';
-const B1 = Number(args.B1 ?? 100);
+const N = args.N || null;
+const batchFile = args.batchFile || null;
+const limit = args.limit ? Number(args.limit) : null;
+const B1 = Number(args.B1 ?? 100000);
 const startBase = Number(args.startBase ?? 2);
-const totalBases = Number(args.totalBases ?? 32);
-const chunkSize = Number(args.chunkSize ?? 16);
+const totalBases = Number(args.totalBases ?? 1);
+const chunkSize = Number(args.chunkSize ?? 128);
 const Krep = Number(args.Krep ?? args.K ?? 1);
 const timeoutMs = Number(args.timeoutMs ?? 300000);
 const intervalMs = Number(args.intervalMs ?? 1000);
@@ -52,12 +54,29 @@ async function waitForTask(taskId) {
 
 async function main() {
   fs.mkdirSync(outDir, { recursive: true });
+
+  const input = { B1, startBase, totalBases, chunkSize };
+  const config = { framework: 'webgpu', B1, startBase, totalBases, chunkSize };
+
+  if (batchFile) {
+    input.batchFile = batchFile;
+    config.batchFile = batchFile;
+    if (limit !== null && limit > 0) {
+      input.limit = limit;
+      config.limit = limit;
+    }
+    console.log(`Using batchFile: ${batchFile}${limit ? ` (limit=${limit})` : ''}`);
+  } else {
+    input.N = N || '8051';
+    console.log(`Using single N: ${input.N}`);
+  }
+
   const payload = {
     strategyId: 'pollard-pminus1',
     K: Krep,
     label: `pollard-pminus1-${Date.now()}`,
-    input: { N, B1, startBase, totalBases, chunkSize },
-    config: { framework: 'webgpu', B1, startBase, totalBases, chunkSize },
+    input,
+    config,
   };
   console.log('Creating Pollard p-1 task');
   console.log('Payload:', JSON.stringify(payload, null, 2));
