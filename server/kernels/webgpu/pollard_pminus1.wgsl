@@ -9,20 +9,18 @@ struct Header {
   pp_count: u32,
   n_bases: u32,
   base_start: u32,
-  num_ns: u32,
+  flags: u32,
   rsv0: u32,
   rsv1: u32,
 };
 
 fn getHeader() -> Header {
-  return Header(io.words[0], io.words[1], io.words[2], io.words[3],
-                io.words[4], io.words[5], io.words[6], io.words[7]);
+  return Header(io.words[0], io.words[1], io.words[2], io.words[3], io.words[4], io.words[5], io.words[6], io.words[7]);
 }
 
 fn constOffset() -> u32 { return 8u; }
-fn constWordsPerN() -> u32 { return 28u; }
-fn ppOffset(num_ns: u32) -> u32 { return constOffset() + num_ns * constWordsPerN(); }
-fn outOffset(num_ns: u32, pp_count: u32) -> u32 { return ppOffset(num_ns) + pp_count; }
+fn ppOffset() -> u32 { return constOffset() + (8u * 3u + 4u); }
+fn outOffset(h: Header) -> u32 { return ppOffset() + h.pp_count; }
 
 fn set_zero() -> U256 {
   var r: U256;
@@ -221,36 +219,23 @@ fn gcd_binary_u256_oddN(a_in: U256, N_odd: U256) -> U256 {
   }
 }
 
-fn read_u256(offset: u32) -> U256 {
-  var r: U256;
-  for (var i = 0u; i < 8u; i++) { r.limbs[i] = io.words[offset + i]; }
-  return r;
-}
-
-fn write_u256(offset: u32, v: U256) {
-  for (var i = 0u; i < 8u; i++) { io.words[offset + i] = v.limbs[i]; }
-}
-
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   let h = getHeader();
-  let total_threads = h.num_ns * h.n_bases;
-  if (idx >= total_threads) { return; }
+  if (idx >= h.n_bases) { return; }
 
-  let n_idx = idx / h.n_bases;
-  let base_idx = idx % h.n_bases;
+  var off = constOffset();
+  var N: U256;
+  var R2: U256;
+  var mont_one: U256;
+  for (var i = 0u; i < 8u; i++) { N.limbs[i] = io.words[off + i]; } off += 8u;
+  for (var i = 0u; i < 8u; i++) { R2.limbs[i] = io.words[off + i]; } off += 8u;
+  for (var i = 0u; i < 8u; i++) { mont_one.limbs[i] = io.words[off + i]; } off += 8u;
+  let n0inv32 = io.words[off];
 
-  let const_off = constOffset() + n_idx * constWordsPerN();
-  let pp_off = ppOffset(h.num_ns);
-  let out_off = outOffset(h.num_ns, h.pp_count) + n_idx * h.n_bases * 12u + base_idx * 12u;
-
-  var N = read_u256(const_off);
-  var R2 = read_u256(const_off + 8u);
-  var mont_one = read_u256(const_off + 16u);
-  let n0inv32 = io.words[const_off + 24u];
-
-  let base_u32 = h.base_start + base_idx;
+  let out_base = outOffset(h) + idx * 12u;
+  let base_u32 = h.base_start + idx;
   var result = set_zero();
   var status = 1u;
 
@@ -258,6 +243,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     status = 3u;
   } else {
     var a = to_mont(u256_from_u32(base_u32), R2, N, n0inv32);
+    let pp_off = ppOffset();
     for (var i = 0u; i < h.pp_count; i++) {
       let pp = io.words[pp_off + i];
       if (pp > 1u) {
@@ -279,9 +265,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  write_u256(out_off, result);
-  io.words[out_off + 8u] = status;
-  io.words[out_off + 9u] = base_u32;
-  io.words[out_off + 10u] = 0u;
-  io.words[out_off + 11u] = 0u;
+  for (var i = 0u; i < 8u; i++) { io.words[out_base + i] = result.limbs[i]; }
+  io.words[out_base + 8u] = status;
+  io.words[out_base + 9u] = base_u32;
+  io.words[out_base + 10u] = 0u;
+  io.words[out_base + 11u] = 0u;
 }

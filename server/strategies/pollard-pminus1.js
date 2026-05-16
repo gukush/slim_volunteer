@@ -16,10 +16,7 @@ export function getClientExecutorInfo(config) {
   return {
     framework: 'webgpu',
     path: 'executors/webgpu-pollard-pminus1.client.js',
-    kernels: [
-      'kernels/webgpu/pollard_pminus1_batched.wgsl',
-      'kernels/webgpu/pollard_pminus1.wgsl',
-    ],
+    kernels: ['kernels/webgpu/pollard_pminus1_batched.wgsl'],
     schema: { output: 'Uint32Array' },
   };
 }
@@ -126,25 +123,38 @@ function readResultU32(result) {
 
 function normalizeInput(config, inputArgs) {
   const B1 = Number(inputArgs.B1 ?? config.B1 ?? 10000);
-  const startBase = Number(inputArgs.startBase ?? config.startBase ?? 2);
-  const totalBases = Number(inputArgs.totalBases ?? config.totalBases ?? 64);
-  const chunkSize = Number(inputArgs.chunkSize ?? config.chunkSize ?? 64);
-  for (const [name, value] of [['startBase', startBase], ['totalBases', totalBases], ['chunkSize', chunkSize]]) {
-    if (!Number.isInteger(value) || value <= 0 || value > 0xffffffff) {
-      throw new Error(`${name} must be an integer in [1, 2^32-1]`);
-    }
+  const chunkSize = Number(inputArgs.chunkSize ?? config.chunkSize ?? 1024);
+  if (!Number.isInteger(chunkSize) || chunkSize <= 0 || chunkSize > 0xffffffff) {
+    throw new Error('chunkSize must be an integer in [1, 2^32-1]');
   }
-  if (startBase < 2) throw new Error('startBase must be >= 2');
-  if (startBase + totalBases - 1 > 0xffffffff) throw new Error('base range must fit in uint32');
+
+  // Fixed: parallelism comes from number of Ns, not bases per N.
+  const totalBases = 1;
+  const startBase = 2;
 
   let ns0 = [];
-  const batchRaw = inputArgs.batch ?? config.batch;
-  if (batchRaw !== undefined && batchRaw !== null) {
-    const arr = Array.isArray(batchRaw) ? batchRaw : String(batchRaw).split(',').map((x) => x.trim()).filter(Boolean);
-    ns0 = arr.map((s, i) => parseBig(s, `batch[${i}]`));
+  const batchFile = inputArgs.batchFile ?? config.batchFile;
+  if (batchFile) {
+    const text = fs.readFileSync(batchFile, 'utf-8').trim();
+    if (text.startsWith('{')) {
+      // JSON workload file like webgpu_workload.json
+      const json = JSON.parse(text);
+      const arr = Array.isArray(json.numbers) ? json.numbers : (Array.isArray(json.batch) ? json.batch : []);
+      ns0 = arr.map((s, i) => parseBig(String(s), `batchFile[${i}]`));
+    } else {
+      // Plain text: one number per line
+      const lines = text.split('\n').map((x) => x.trim()).filter(Boolean);
+      ns0 = lines.map((s, i) => parseBig(s, `batchFile[${i}]`));
+    }
   } else {
-    const N0 = parseBig(inputArgs.N ?? config.N, 'N');
-    ns0 = [N0];
+    const batchRaw = inputArgs.batch ?? config.batch;
+    if (batchRaw !== undefined && batchRaw !== null) {
+      const arr = Array.isArray(batchRaw) ? batchRaw : String(batchRaw).split(',').map((x) => x.trim()).filter(Boolean);
+      ns0 = arr.map((s, i) => parseBig(s, `batch[${i}]`));
+    } else {
+      const N0 = parseBig(inputArgs.N ?? config.N, 'N');
+      ns0 = [N0];
+    }
   }
   for (let i = 0; i < ns0.length; i++) {
     if (ns0[i] < 4n) throw new Error(`N[${i}] must be >= 4`);

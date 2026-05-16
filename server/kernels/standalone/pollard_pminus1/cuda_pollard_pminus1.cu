@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -133,11 +134,12 @@ __host__ __device__ static inline uint2 mul32x32_64(uint32_t a, uint32_t b) {
 }
 
 __host__ __device__ static inline U256 mont_mul(const U256& a, const U256& b, const U256& N, uint32_t n0inv32) {
-  uint32_t t[9];
-  for (int i = 0; i < 9; ++i) t[i] = 0;
+  uint32_t t[10];
+  for (int i = 0; i < 10; ++i) t[i] = 0;
 
   for (int i = 0; i < 8; ++i) {
     uint32_t carry = 0;
+    // Step 1: T = T + a_i * b
     for (int j = 0; j < 8; ++j) {
       uint2 prod = mul32x32_64(a.limbs[i], b.limbs[j]);
       uint2 s1 = addc(t[j], prod.x, 0);
@@ -145,10 +147,15 @@ __host__ __device__ static inline U256 mont_mul(const U256& a, const U256& b, co
       t[j] = s2.x;
       carry = prod.y + s1.y + s2.y;
     }
-    t[8] = t[8] + carry;
+    uint2 s_t8 = addc(t[8], carry, 0);
+    t[8] = s_t8.x;
+    t[9] = s_t8.y;
 
+    // Step 2: m = T[0] * n0inv mod 2^32
     uint32_t m = t[0] * n0inv32;
     carry = 0;
+
+    // Step 3: T = T + m * N
     for (int j = 0; j < 8; ++j) {
       uint2 prod = mul32x32_64(m, N.limbs[j]);
       uint2 s1 = addc(t[j], prod.x, 0);
@@ -156,15 +163,23 @@ __host__ __device__ static inline U256 mont_mul(const U256& a, const U256& b, co
       t[j] = s2.x;
       carry = prod.y + s1.y + s2.y;
     }
-    t[8] = t[8] + carry;
+    uint2 s_t8_2 = addc(t[8], carry, 0);
+    t[8] = s_t8_2.x;
+    t[9] += s_t8_2.y;
 
-    for (int k = 0; k < 8; ++k) t[k] = t[k + 1];
-    t[8] = 0;
+    // Step 4: Shift T right by 32 bits
+    for (int k = 0; k < 9; ++k) t[k] = t[k + 1];
+    t[9] = 0;
   }
 
   U256 r;
   for (int i = 0; i < 8; ++i) r.limbs[i] = t[i];
-  return cond_sub_N(r, N);
+
+  // Final reduction: subtract N if result overflowed 256 bits (t[8] > 0) OR if r >= N
+  if (t[8] > 0 || u256_cmp(r, N) >= 0) {
+    return u256_sub(r, N);
+  }
+  return r;
 }
 
 __host__ __device__ static inline U256 to_mont(const U256& a, const U256& R2, const U256& N, uint32_t n0inv32) {
@@ -427,19 +442,21 @@ static void usage(const char* argv0) {
     << "Usage: " << argv0 << " [options]\n"
     << "  --N=HEX|DEC               Single number to factor\n"
     << "  --batch=N1,N2,...         Comma-separated list of numbers (same B1)\n"
+    << "  --batchFile=FILE          File with one number per line\n"
     << "  --B1=N                    Stage-1 bound (default: 10000)\n"
-    << "  --startBase=N             First base a (default: 2)\n"
-    << "  --totalBases=N            Number of bases per number (default: 64)\n"
-    << "  --blockSize=N             CUDA block size (default: 64)\n";
+    << "  --blockSize=N             CUDA block size (default: 256)\n";
 }
 
 int main(int argc, char** argv) {
   std::string Narg;
   std::string batchArg;
+  std::string batchFile;
   uint32_t B1 = 10000;
-  uint32_t startBase = 2;
-  uint32_t totalBases = 64;
-  uint32_t blockSize = 64;
+  uint32_t blockSize = 256;
+
+  // Fixed: each number gets exactly 1 base (a=2). Parallelism comes from batch size.
+  const uint32_t totalBases = 1;
+  const uint32_t startBase = 2;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
@@ -449,15 +466,23 @@ int main(int argc, char** argv) {
     std::string val = (eq == std::string::npos) ? std::string() : arg.substr(eq + 1);
     if (key == "--N") Narg = val;
     else if (key == "--batch") batchArg = val;
+    else if (key == "--batchFile") batchFile = val;
     else if (key == "--B1") B1 = parse_u32(val);
-    else if (key == "--startBase") startBase = parse_u32(val);
-    else if (key == "--totalBases") totalBases = parse_u32(val);
     else if (key == "--blockSize") blockSize = parse_u32(val);
     else { std::cerr << "Unknown option: " << arg << "\n"; usage(argv[0]); return 2; }
   }
 
   std::vector<std::string> ns_str;
-  if (!batchArg.empty()) {
+  if (!batchFile.empty()) {
+    std::ifstream f(batchFile);
+    if (!f) { std::cerr << "Cannot open batch file: " << batchFile << std::endl; return 2; }
+    std::string line;
+    while (std::getline(f, line)) {
+      line.erase(0, line.find_first_not_of(" \t\r\n"));
+      line.erase(line.find_last_not_of(" \t\r\n") + 1);
+      if (!line.empty()) ns_str.push_back(line);
+    }
+  } else if (!batchArg.empty()) {
     size_t pos = 0;
     while (pos < batchArg.size()) {
       size_t comma = batchArg.find(',', pos);
@@ -472,8 +497,6 @@ int main(int argc, char** argv) {
     ns_str.push_back("0x123456789abcdef01");
   }
 
-  if (startBase < 2) { std::cerr << "startBase must be >= 2" << std::endl; return 2; }
-  if (totalBases == 0 || totalBases > 0xffffffffu) { std::cerr << "totalBases invalid" << std::endl; return 2; }
   if (blockSize == 0 || blockSize > 1024) { std::cerr << "blockSize must be in [1, 1024]" << std::endl; return 2; }
 
   std::vector<Number> numbers;
@@ -488,10 +511,9 @@ int main(int argc, char** argv) {
     num.hasEvenFactor = u256_is_even(num.N);
     num.reducedN = num.N;
     if (num.hasEvenFactor) {
-      num.reducedN = u256_rshift1(num.N);
-      if (u256_is_even(num.reducedN)) {
-        std::cerr << "After removing one factor 2, reduced N is still even for " << s << std::endl;
-        return 2;
+      // Strip all factors of 2 (trial division for 2)
+      while (u256_is_even(num.reducedN)) {
+        num.reducedN = u256_rshift1(num.reducedN);
       }
     }
     compute_montgomery_constants(num.reducedN, num.R2, num.montOne, num.n0inv32);

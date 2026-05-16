@@ -56,11 +56,8 @@ function getPipeline(device, kernelCode) {
 }
 
 export function createExecutor({ kernels }) {
-  const kernel = kernels.find((k) =>
-    k.name?.endsWith('pollard_pminus1_batched.wgsl') ||
-    k.name?.endsWith('pollard_pminus1.wgsl')
-  );
-  if (!kernel) throw new Error('Pollard p-1 WGSL source missing');
+  const kernel = kernels.find((k) => k.name?.endsWith('pollard_pminus1_batched.wgsl'));
+  if (!kernel) throw new Error('Pollard p-1 batched WGSL source missing');
   const kernelCode = kernel.content || kernel.code;
 
   async function prewarm() {
@@ -74,8 +71,7 @@ export function createExecutor({ kernels }) {
     const { pipeline, bgl } = getPipeline(device, kernelCode);
     const input = new Uint32Array(toArrayBuffer(payload.data));
     const nBases = Number(payload.nBases || input[3] || 0) >>> 0;
-    const version = Number(input[1] || 1) >>> 0;
-    const numNs = version >= 2 ? (Number(input[5] || 1) >>> 0) : 1;
+    const numNs = Number(input[5] || 1) >>> 0;
     const totalThreads = numNs * nBases;
     if (nBases === 0) throw new Error('Pollard p-1 chunk has no bases');
     if (totalThreads === 0) throw new Error('Pollard p-1 chunk has no work');
