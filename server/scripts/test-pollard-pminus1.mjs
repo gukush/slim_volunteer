@@ -95,7 +95,23 @@ async function main() {
   // Small delay to avoid race with kill-switch file write
   await new Promise((resolve) => setTimeout(resolve, 1000));
 
-  const summary = await api(`/tasks/${taskId}/output?name=output.json`);
+  let summary;
+  const directPath = path.join(process.cwd(), 'storage', 'tasks', taskId, 'output.json');
+  if (fs.existsSync(directPath)) {
+    console.log(`Reading output directly from: ${directPath}`);
+    summary = JSON.parse(fs.readFileSync(directPath, 'utf8'));
+  } else {
+    console.log(`Direct path not found: ${directPath}, falling back to API`);
+    try {
+      summary = await api(`/tasks/${taskId}/output?name=output.json`);
+    } catch (e) {
+      console.error(`API fetch failed: ${e.message}`);
+      console.error(`Task ${taskId} completed but output.json is missing.`);
+      console.error(`Expected at: ${directPath}`);
+      console.error(`CWD: ${process.cwd()}`);
+      throw e;
+    }
+  }
   fs.writeFileSync(path.join(outDir, 'output.json'), JSON.stringify(summary, null, 2));
 
   // Print found factors
