@@ -373,26 +373,19 @@ static void compute_montgomery_constants(const U256& N, U256& outR2, U256& outMo
   }
   RmodN = cur;
 
-  uint32_t prod[16] = {};
-  for (int i = 0; i < 8; ++i) {
-    uint64_t carry = 0;
-    for (int j = 0; j < 8; ++j) {
-      uint64_t p = static_cast<uint64_t>(RmodN.limbs[i]) * static_cast<uint64_t>(RmodN.limbs[j]) + prod[i + j] + carry;
-      prod[i + j] = static_cast<uint32_t>(p);
-      carry = p >> 32;
+  // R2 mod N = (RmodN * RmodN) mod N = (2^256)^2 mod N = 2^512 mod N.
+  // Instead of a 512-bit multiply + slow repeated subtraction,
+  // we just double RmodN 256 more times mod N (same O(256) loop as above).
+  cur = RmodN;
+  for (int i = 0; i < 256; ++i) {
+    U256 d = u256_add(cur, cur);
+    if (u256_cmp(d, N) >= 0 || u256_cmp(d, cur) < 0) {
+      d = u256_sub(d, N);
     }
-    prod[i + 8] = static_cast<uint32_t>(carry);
+    cur = d;
   }
 
-  U256 acc = u256_zero();
-  for (int i = 15; i >= 0; --i) {
-    uint32_t incoming = prod[i];
-    for (int j = 7; j > 0; --j) acc.limbs[j] = acc.limbs[j - 1];
-    acc.limbs[0] = incoming;
-    while (u256_cmp(acc, N) >= 0) acc = u256_sub(acc, N);
-  }
-
-  outR2 = acc;
+  outR2 = cur;
   outMontOne = RmodN;
 
   uint32_t n0 = N.limbs[0];
