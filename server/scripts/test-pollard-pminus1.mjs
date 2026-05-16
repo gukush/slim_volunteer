@@ -17,7 +17,7 @@ const startBase = Number(args.startBase ?? 2);
 const totalBases = Number(args.totalBases ?? 1);
 const chunkSize = Number(args.chunkSize ?? 128);
 const Krep = Number(args.Krep ?? args.K ?? 1);
-const timeoutMs = Number(args.timeoutMs ?? 300000);
+const timeoutMs = args.timeoutMs !== undefined ? Number(args.timeoutMs) : 0;
 const intervalMs = Number(args.intervalMs ?? 1000);
 const outDir = args.outDir || `/app/pollard-pminus1-results-${Date.now()}`;
 
@@ -47,7 +47,7 @@ async function waitForTask(taskId) {
       throw new Error(`Task ${taskId} ended with status ${status.status}`);
     }
     process.stdout.write(`\rStatus=${status.status} completedChunks=${status.completedChunks || 0}/${status.totalChunks ?? '?'}   `);
-    if (Date.now() - start > timeoutMs) throw new Error('Timeout waiting for Pollard p-1 task');
+    if (timeoutMs > 0 && Date.now() - start > timeoutMs) throw new Error('Timeout waiting for Pollard p-1 task');
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
 }
@@ -94,6 +94,31 @@ async function main() {
 
   const summary = await api(`/tasks/${taskId}/output?name=output.json`);
   fs.writeFileSync(path.join(outDir, 'output.json'), JSON.stringify(summary, null, 2));
+
+  // Print found factors
+  if (summary.results) {
+    const foundLines = [];
+    for (const r of summary.results) {
+      if (r.found && r.factors && r.factors.length > 0) {
+        for (const f of r.factors) {
+          if (f.source === 'pollard-pminus1') {
+            foundLines.push(`FOUND factor: N=${r.N} factor=${f.factorHex || f.factor} base=${f.base} chunk=${f.chunkIndex}`);
+          }
+        }
+      }
+    }
+
+    const totalFound = foundLines.length;
+    if (totalFound > 40) {
+      for (let i = 0; i < 20; i++) console.log(foundLines[i]);
+      console.log(`... (${totalFound - 40} more factors omitted) ...`);
+      for (let i = totalFound - 20; i < totalFound; i++) console.log(foundLines[i]);
+    } else {
+      for (const line of foundLines) console.log(line);
+    }
+    console.log(`Total Pollard p-1 factors found: ${totalFound}`);
+  }
+
   console.log('Summary:', JSON.stringify(summary, null, 2));
   console.log(`Pollard p-1 artifacts saved to ${outDir}`);
 }
