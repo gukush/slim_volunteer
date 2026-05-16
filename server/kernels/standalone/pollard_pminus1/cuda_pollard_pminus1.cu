@@ -126,10 +126,18 @@ __host__ __device__ static inline uint2 mul32x32_64(uint32_t a, uint32_t b) {
   uint32_t p01 = a0 * b1;
   uint32_t p10 = a1 * b0;
   uint32_t p11 = a1 * b1;
-  uint32_t mid = p01 + p10;
-  uint32_t lo = (p00 & 0xffffu) | ((mid & 0xffffu) << 16);
-  uint32_t carry = (p00 >> 16) + (mid >> 16);
-  uint32_t hi = p11 + carry;
+
+  // Catch 33rd-bit overflow from p01 + p10
+  uint32_t mid_sum = p10 + p01;
+  uint32_t mid_carry = (mid_sum < p10) ? 1u : 0u;
+
+  // Add shifted middle sum to p00, catch carry into upper 32-bits
+  uint32_t lo = p00 + (mid_sum << 16u);
+  uint32_t lo_carry = (lo < p00) ? 1u : 0u;
+
+  // Assemble high 32 bits
+  uint32_t hi = p11 + (mid_sum >> 16u) + (mid_carry << 16u) + lo_carry;
+
   return make_uint2(lo, hi);
 }
 

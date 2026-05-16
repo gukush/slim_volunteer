@@ -123,10 +123,18 @@ fn mul32x32_64(a: u32, b: u32) -> vec2<u32> {
   let p01 = a0 * b1;
   let p10 = a1 * b0;
   let p11 = a1 * b1;
-  let mid = p01 + p10;
-  let lo = (p00 & 0xffffu) | ((mid & 0xffffu) << 16u);
-  let carry = (p00 >> 16u) + (mid >> 16u);
-  let hi = p11 + carry;
+
+  // Catch 33rd-bit overflow from p01 + p10
+  let mid_sum = p10 + p01;
+  let mid_carry = select(0u, 1u, mid_sum < p10);
+
+  // Add shifted middle sum to p00, catch carry into upper 32-bits
+  let lo = p00 + (mid_sum << 16u);
+  let lo_carry = select(0u, 1u, lo < p00);
+
+  // Assemble high 32 bits
+  let hi = p11 + (mid_sum >> 16u) + (mid_carry << 16u) + lo_carry;
+
   return vec2<u32>(lo, hi);
 }
 
