@@ -92,6 +92,9 @@ async function main() {
   await waitForTask(taskId);
   console.log('\nTask completed');
 
+  // Small delay to avoid race with kill-switch file write
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
   const summary = await api(`/tasks/${taskId}/output?name=output.json`);
   fs.writeFileSync(path.join(outDir, 'output.json'), JSON.stringify(summary, null, 2));
 
