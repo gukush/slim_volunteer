@@ -14,6 +14,8 @@ import * as exeCpuQuicksort from '../strategies/exe-cpu-quicksort.js';
 import * as exeEcmStage1 from '../strategies/exe-ecm-stage1.js';
 import * as exeDistributedSort from '../strategies/exe-distributed-sort.js';
 import * as hashPreimage from '../strategies/hash-preimage.js';
+import * as goldbachVerification from '../strategies/goldbach-verification.js';
+import * as pollardPminus1 from '../strategies/pollard-pminus1.js';
 
 
 const strategies = new Map();
@@ -37,6 +39,8 @@ register(exeCpuQuicksort);
 register(exeEcmStage1);
 register(exeDistributedSort);
 register(hashPreimage);
+register(goldbachVerification);
+register(pollardPminus1);
 
 export function listStrategies() {
   return Array.from(strategies.keys());
