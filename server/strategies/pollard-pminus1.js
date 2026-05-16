@@ -339,7 +339,5 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
 
 export function getTotalChunks(config, inputArgs) {
   const { ns0, chunkSize } = normalizeInput(config || {}, inputArgs || {});
-  const allEven = ns0.every((N0) => N0 % 2n === 0n);
-  if (allEven) return 0;
   return Math.ceil(ns0.length / chunkSize);
 }
