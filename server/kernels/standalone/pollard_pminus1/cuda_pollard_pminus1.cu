@@ -210,27 +210,40 @@ __device__ static inline void write_u256(uint32_t* buf, int offset, const U256& 
   for (int i = 0; i < 8; ++i) buf[offset + i] = v.limbs[i];
 }
 
-__global__ void pollard_pminus1_kernel(uint32_t* io, uint32_t total_bases) {
+__global__ void pollard_pminus1_batched_kernel(uint32_t* io, uint32_t total_threads) {
   const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= total_bases) return;
+  if (idx >= total_threads) return;
 
   // Header
-  const uint32_t pp_count = io[2];
-  const uint32_t n_bases   = io[3];
+  const uint32_t pp_count   = io[2];
+  const uint32_t n_bases    = io[3];
   const uint32_t base_start = io[4];
-  if (idx >= n_bases) return;
+  const uint32_t num_ns     = io[5];
 
-  const int CONST_OFFSET = 8;
-  const int PP_OFFSET = CONST_OFFSET + (8 * 3 + 4);
-  const int OUT_OFFSET = PP_OFFSET + pp_count;
+  if (num_ns == 0 || n_bases == 0) return;
 
-  U256 N = read_u256(io, CONST_OFFSET);
-  U256 R2 = read_u256(io, CONST_OFFSET + 8);
-  U256 mont_one = read_u256(io, CONST_OFFSET + 16);
-  uint32_t n0inv32 = io[CONST_OFFSET + 24];
+  const uint32_t n_idx    = idx / n_bases;
+  const uint32_t base_idx = idx % n_bases;
 
-  const int out_base = OUT_OFFSET + idx * 12;
-  const uint32_t base_u32 = base_start + idx;
+  if (n_idx >= num_ns) return;
+
+  const int HEADER_WORDS = 8;
+  const int CONST_WORDS  = 8 * 3 + 4; // 28
+
+  const int CONST_OFFSET = HEADER_WORDS;
+  const int PP_OFFSET    = CONST_OFFSET + num_ns * CONST_WORDS;
+  const int OUT_OFFSET   = PP_OFFSET + pp_count;
+
+  const int n_const_off = CONST_OFFSET + n_idx * CONST_WORDS;
+  const int n_out_off   = OUT_OFFSET + n_idx * n_bases * 12;
+
+  U256 N = read_u256(io, n_const_off);
+  U256 R2 = read_u256(io, n_const_off + 8);
+  U256 mont_one = read_u256(io, n_const_off + 16);
+  uint32_t n0inv32 = io[n_const_off + 24];
+
+  const int out_base = n_out_off + base_idx * 12;
+  const uint32_t base_u32 = base_start + base_idx;
 
   U256 result = u256_zero();
   uint32_t status = 1u;
@@ -271,10 +284,6 @@ __global__ void pollard_pminus1_kernel(uint32_t* io, uint32_t total_bases) {
 
 // Host helpers
 
-static uint64_t parse_u64(const std::string& s) {
-  return static_cast<uint64_t>(std::stoull(s, nullptr, 0));
-}
-
 static uint32_t parse_u32(const std::string& s) {
   return static_cast<uint32_t>(std::stoul(s, nullptr, 0));
 }
@@ -294,32 +303,9 @@ static std::string u256_to_hex(const U256& v) {
   return os.str();
 }
 
-static std::string u256_to_dec(const U256& v) {
-  // Simple base-10 conversion by repeated division
-  uint32_t tmp[8];
-  for (int i = 0; i < 8; ++i) tmp[i] = v.limbs[i];
-  std::string s;
-  while (true) {
-    uint64_t rem = 0;
-    bool allzero = true;
-    for (int i = 7; i >= 0; --i) {
-      uint64_t cur = (rem << 32) | tmp[i];
-      tmp[i] = static_cast<uint32_t>(cur / 10);
-      rem = cur % 10;
-      if (tmp[i]) allzero = false;
-    }
-    s.push_back('0' + static_cast<char>(rem));
-    if (allzero && rem == 0) break;
-  }
-  while (s.size() > 1 && s.back() == '0') s.pop_back();
-  std::reverse(s.begin(), s.end());
-  return s;
-}
-
 static U256 parse_bigint(const std::string& s) {
   std::string t = s;
   if (t.rfind("0x", 0) == 0 || t.rfind("0X", 0) == 0) {
-    // hex
     t = t.substr(2);
     if (t.size() > 64) {
       std::cerr << "N must fit in 256 bits" << std::endl;
@@ -341,12 +327,10 @@ static U256 parse_bigint(const std::string& s) {
     }
     return r;
   } else {
-    // decimal
     U256 r = u256_zero();
     for (char c : t) {
       if (c < '0' || c > '9') { std::cerr << "Invalid decimal digit" << std::endl; std::exit(2); }
       uint32_t digit = c - '0';
-      // r = r * 10 + digit
       uint32_t carry = digit;
       for (int i = 0; i < 8; ++i) {
         uint64_t prod = (static_cast<uint64_t>(r.limbs[i]) * 10ull) + carry;
@@ -360,7 +344,6 @@ static U256 parse_bigint(const std::string& s) {
 }
 
 static uint64_t mod_inverse_u32(uint32_t a) {
-  // Extended Euclidean for 32-bit modulus 2^32
   int64_t t = 0, newT = 1;
   uint64_t r = 1ull << 32;
   uint64_t newR = a & 0xffffffffull;
@@ -378,33 +361,18 @@ static uint64_t mod_inverse_u32(uint32_t a) {
 }
 
 static void compute_montgomery_constants(const U256& N, U256& outR2, U256& outMontOne, uint32_t& outN0inv) {
-  // R = 2^256
-  // We compute R mod N and R^2 mod N by repeated doubling / addition
-  // Simple method: use built-in big integer via __int128 or manual doubling
   U256 RmodN = u256_zero();
-  U256 R2modN = u256_zero();
-
-  // RmodN = 2^256 mod N = ((0 - N) mod N) effectively 0 if we could represent it,
-  // but actually 2^256 mod N = (((...))) computed by starting with 1 and doubling 256 times.
-  // Simpler: start with 1, double 256 times mod N.
   U256 one = u256_one();
   U256 cur = one;
   for (int i = 0; i < 256; ++i) {
-    // cur = (cur + cur) mod N
     U256 d = u256_add(cur, cur);
     if (u256_cmp(d, N) >= 0 || u256_cmp(d, cur) < 0) {
-      // overflow or >= N
       d = u256_sub(d, N);
     }
     cur = d;
   }
   RmodN = cur;
 
-  // R2 mod N = (RmodN * RmodN) mod N using simple shift-add multiplication
-  // We'll use a simple 256x256 -> 512 bit multiply then reduce mod N by repeated subtraction
-  // Actually let's just do repeated addition: R2 = RmodN * RmodN mod N.
-  // Better: use the fact that R2modN = (RmodN << 256) mod N, but that's the same as repeated doubling.
-  // Let's do shift-and-add multiplication with 512-bit intermediate.
   uint32_t prod[16] = {};
   for (int i = 0; i < 8; ++i) {
     uint64_t carry = 0;
@@ -416,24 +384,15 @@ static void compute_montgomery_constants(const U256& N, U256& outR2, U256& outMo
     prod[i + 8] = static_cast<uint32_t>(carry);
   }
 
-  // Now reduce 512-bit prod mod N by dividing, or by using Barrett if we had it.
-  // Since N can be up to 256 bits, simple long division is nontrivial.
-  // Alternative: since we only need this once on host, do repeated subtraction if the number
-  // is not too much larger than N. But prod can be up to 512 bits.
-  // Let's use a simple shift-subtract reduction.
   U256 acc = u256_zero();
   for (int i = 15; i >= 0; --i) {
-    // acc = (acc << 32) | prod[i]
-    // We implement shift left 32 on U256
     uint32_t incoming = prod[i];
     for (int j = 7; j > 0; --j) acc.limbs[j] = acc.limbs[j - 1];
     acc.limbs[0] = incoming;
-    // while acc >= N, acc -= N
     while (u256_cmp(acc, N) >= 0) acc = u256_sub(acc, N);
   }
-  R2modN = acc;
 
-  outR2 = R2modN;
+  outR2 = acc;
   outMontOne = RmodN;
 
   uint32_t n0 = N.limbs[0];
@@ -460,18 +419,30 @@ static std::vector<uint32_t> generate_prime_powers(uint32_t B1) {
   return powers;
 }
 
+struct Number {
+  std::string original;
+  U256 N;
+  U256 reducedN;
+  bool hasEvenFactor;
+  U256 R2;
+  U256 montOne;
+  uint32_t n0inv32;
+};
+
 static void usage(const char* argv0) {
   std::cerr
     << "Usage: " << argv0 << " [options]\n"
-    << "  --N=HEX|DEC               Number to factor (default: 0x123456789abcdef01)\n"
+    << "  --N=HEX|DEC               Single number to factor\n"
+    << "  --batch=N1,N2,...         Comma-separated list of numbers (same B1)\n"
     << "  --B1=N                    Stage-1 bound (default: 10000)\n"
     << "  --startBase=N             First base a (default: 2)\n"
-    << "  --totalBases=N            Number of bases to try (default: 64)\n"
+    << "  --totalBases=N            Number of bases per number (default: 64)\n"
     << "  --blockSize=N             CUDA block size (default: 64)\n";
 }
 
 int main(int argc, char** argv) {
-  std::string Narg = "0x123456789abcdef01";
+  std::string Narg;
+  std::string batchArg;
   uint32_t B1 = 10000;
   uint32_t startBase = 2;
   uint32_t totalBases = 64;
@@ -484,6 +455,7 @@ int main(int argc, char** argv) {
     std::string key = (eq == std::string::npos) ? arg : arg.substr(0, eq);
     std::string val = (eq == std::string::npos) ? std::string() : arg.substr(eq + 1);
     if (key == "--N") Narg = val;
+    else if (key == "--batch") batchArg = val;
     else if (key == "--B1") B1 = parse_u32(val);
     else if (key == "--startBase") startBase = parse_u32(val);
     else if (key == "--totalBases") totalBases = parse_u32(val);
@@ -491,57 +463,80 @@ int main(int argc, char** argv) {
     else { std::cerr << "Unknown option: " << arg << "\n"; usage(argv[0]); return 2; }
   }
 
+  std::vector<std::string> ns_str;
+  if (!batchArg.empty()) {
+    size_t pos = 0;
+    while (pos < batchArg.size()) {
+      size_t comma = batchArg.find(',', pos);
+      std::string token = batchArg.substr(pos, comma - pos);
+      if (!token.empty()) ns_str.push_back(token);
+      if (comma == std::string::npos) break;
+      pos = comma + 1;
+    }
+  } else if (!Narg.empty()) {
+    ns_str.push_back(Narg);
+  } else {
+    ns_str.push_back("0x123456789abcdef01");
+  }
+
   if (startBase < 2) { std::cerr << "startBase must be >= 2" << std::endl; return 2; }
   if (totalBases == 0 || totalBases > 0xffffffffu) { std::cerr << "totalBases invalid" << std::endl; return 2; }
   if (blockSize == 0 || blockSize > 1024) { std::cerr << "blockSize must be in [1, 1024]" << std::endl; return 2; }
 
-  U256 N = parse_bigint(Narg);
-  if (u256_cmp(N, u256_from_u32(4)) < 0) { std::cerr << "N must be >= 4" << std::endl; return 2; }
-
-  // Strip factor 2 if present (matches server strategy)
-  bool has_even_factor = u256_is_even(N);
-  U256 reducedN = N;
-  if (has_even_factor) {
-    reducedN = u256_rshift1(N);
-    if (u256_is_even(reducedN)) {
-      std::cerr << "After removing one factor 2, reduced N is still even; use trial division first" << std::endl;
+  std::vector<Number> numbers;
+  for (const auto& s : ns_str) {
+    Number num;
+    num.original = s;
+    num.N = parse_bigint(s);
+    if (u256_cmp(num.N, u256_from_u32(4)) < 0) {
+      std::cerr << "N=" << s << " must be >= 4" << std::endl;
       return 2;
     }
+    num.hasEvenFactor = u256_is_even(num.N);
+    num.reducedN = num.N;
+    if (num.hasEvenFactor) {
+      num.reducedN = u256_rshift1(num.N);
+      if (u256_is_even(num.reducedN)) {
+        std::cerr << "After removing one factor 2, reduced N is still even for " << s << std::endl;
+        return 2;
+      }
+    }
+    compute_montgomery_constants(num.reducedN, num.R2, num.montOne, num.n0inv32);
+    numbers.push_back(num);
   }
 
-  // Compute Montgomery constants
-  U256 R2, montOne;
-  uint32_t n0inv32;
-  compute_montgomery_constants(reducedN, R2, montOne, n0inv32);
-
+  uint32_t numNs = static_cast<uint32_t>(numbers.size());
   std::vector<uint32_t> primePowers = generate_prime_powers(B1);
 
-  // Build host IO buffer matching WebGPU layout
+  // Build batched host IO buffer
   const int HEADER_WORDS = 8;
-  const int CONST_WORDS = 8 * 3 + 4; // N, R2, montOne, n0inv32, pad(3)
-  const int PP_OFFSET = HEADER_WORDS + CONST_WORDS;
-  const int OUT_OFFSET = PP_OFFSET + static_cast<int>(primePowers.size());
+  const int CONST_WORDS  = 8 * 3 + 4; // 28
+  const int PP_OFFSET    = HEADER_WORDS + numNs * CONST_WORDS;
+  const int OUT_OFFSET   = PP_OFFSET + static_cast<int>(primePowers.size());
   const int OUT_WORDS_PER_BASE = 12;
-  const int totalWords = OUT_OFFSET + totalBases * OUT_WORDS_PER_BASE;
+  const int totalWords   = OUT_OFFSET + numNs * totalBases * OUT_WORDS_PER_BASE;
 
   std::vector<uint32_t> h_io(totalWords, 0);
   int off = 0;
   h_io[off++] = MAGIC;
-  h_io[off++] = 1;
+  h_io[off++] = 2; // batched version
   h_io[off++] = static_cast<uint32_t>(primePowers.size());
   h_io[off++] = totalBases;
   h_io[off++] = startBase;
+  h_io[off++] = numNs;
   h_io[off++] = 0;
   h_io[off++] = 0;
-  h_io[off++] = 0;
-  for (int i = 0; i < 8; ++i) h_io[off++] = reducedN.limbs[i];
-  for (int i = 0; i < 8; ++i) h_io[off++] = R2.limbs[i];
-  for (int i = 0; i < 8; ++i) h_io[off++] = montOne.limbs[i];
-  h_io[off++] = n0inv32;
-  h_io[off++] = 0; h_io[off++] = 0; h_io[off++] = 0;
+
+  for (const auto& num : numbers) {
+    for (int i = 0; i < 8; ++i) h_io[off++] = num.reducedN.limbs[i];
+    for (int i = 0; i < 8; ++i) h_io[off++] = num.R2.limbs[i];
+    for (int i = 0; i < 8; ++i) h_io[off++] = num.montOne.limbs[i];
+    h_io[off++] = num.n0inv32;
+    h_io[off++] = 0; h_io[off++] = 0; h_io[off++] = 0;
+  }
   for (uint32_t pp : primePowers) h_io[off++] = pp;
 
-  // Allocate device memory
+  // Device memory
   uint32_t* d_io = nullptr;
   CUDA_CHECK(cudaMalloc(&d_io, totalWords * sizeof(uint32_t)));
   CUDA_CHECK(cudaMemcpy(d_io, h_io.data(), totalWords * sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -550,10 +545,11 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaEventCreate(&ev0));
   CUDA_CHECK(cudaEventCreate(&ev1));
 
+  uint32_t totalThreads = numNs * totalBases;
   const auto wall0 = std::chrono::steady_clock::now();
   CUDA_CHECK(cudaEventRecord(ev0));
-  uint32_t grid = (totalBases + blockSize - 1) / blockSize;
-  pollard_pminus1_kernel<<<grid, blockSize>>>(d_io, totalBases);
+  uint32_t grid = (totalThreads + blockSize - 1) / blockSize;
+  pollard_pminus1_batched_kernel<<<grid, blockSize>>>(d_io, totalThreads);
   CUDA_CHECK(cudaEventRecord(ev1));
   CUDA_CHECK(cudaEventSynchronize(ev1));
   const auto wall1 = std::chrono::steady_clock::now();
@@ -570,26 +566,10 @@ int main(int argc, char** argv) {
 
   double wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
 
-  // Parse results
-  bool found = false;
-  std::vector<std::string> factors;
-  for (uint32_t i = 0; i < totalBases; ++i) {
-    int base = OUT_OFFSET + i * 12;
-    uint32_t status = h_io[base + 8];
-    uint32_t baseValue = h_io[base + 9];
-    if (status == 2u) {
-      U256 f;
-      for (int j = 0; j < 8; ++j) f.limbs[j] = h_io[base + j];
-      if (!u256_is_zero(f) && u256_cmp(f, u256_one()) > 0 && u256_cmp(f, reducedN) < 0) {
-        found = true;
-        std::string fac = u256_to_hex(f);
-        factors.push_back(fac);
-      }
-    }
-  }
-
+  // Parse per-N results
+  bool anyFound = false;
   std::cout << std::fixed << std::setprecision(3)
-            << "N=" << Narg
+            << "batchSize=" << numNs
             << ",B1=" << B1
             << ",startBase=" << startBase
             << ",totalBases=" << totalBases
@@ -597,13 +577,34 @@ int main(int argc, char** argv) {
             << ",grid=" << grid
             << ",wall_ms=" << wall_ms
             << ",kernel_ms=" << kernel_ms
-            << ",found=" << (found ? "true" : "false")
-            << ",factors=";
-  for (size_t i = 0; i < factors.size(); ++i) {
-    if (i) std::cout << ";";
-    std::cout << "0x" << factors[i];
-  }
-  std::cout << "\n";
+            << "\n";
 
-  return found ? 0 : 1;
+  for (uint32_t n = 0; n < numNs; ++n) {
+    const auto& num = numbers[n];
+    bool found = false;
+    std::vector<std::string> factors;
+    for (uint32_t b = 0; b < totalBases; ++b) {
+      int base = OUT_OFFSET + n * totalBases * 12 + b * 12;
+      uint32_t status = h_io[base + 8];
+      if (status == 2u) {
+        U256 f;
+        for (int j = 0; j < 8; ++j) f.limbs[j] = h_io[base + j];
+        if (!u256_is_zero(f) && u256_cmp(f, u256_one()) > 0 && u256_cmp(f, num.reducedN) < 0) {
+          found = true;
+          factors.push_back(u256_to_hex(f));
+        }
+      }
+    }
+    if (found) anyFound = true;
+    std::cout << "N=" << num.original
+              << ",found=" << (found ? "true" : "false")
+              << ",factors=";
+    for (size_t i = 0; i < factors.size(); ++i) {
+      if (i) std::cout << ";";
+      std::cout << "0x" << factors[i];
+    }
+    std::cout << "\n";
+  }
+
+  return anyFound ? 0 : 1;
 }

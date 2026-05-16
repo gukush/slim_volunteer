@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -96,6 +97,7 @@ static void usage(const char* argv0) {
     << "  --start=N                 Start of even number range (default: 4)\n"
     << "  --end=N                   End of even number range (default: 10000)\n"
     << "  --numbers=N1,N2,...       Explicit comma-separated even numbers\n"
+    << "  --batchRanges=S1-E1,S2-E2  Comma-separated start-end ranges\n"
     << "  --blockSize=N             CUDA block size (default: 128)\n";
 }
 
@@ -103,6 +105,7 @@ int main(int argc, char** argv) {
   uint32_t start = 4;
   uint32_t end = 10000;
   std::string numbers_arg;
+  std::string batchRanges_arg;
   uint32_t blockSize = 128;
 
   for (int i = 1; i < argc; ++i) {
@@ -114,6 +117,7 @@ int main(int argc, char** argv) {
     if (key == "--start") start = parse_u32(val);
     else if (key == "--end") end = parse_u32(val);
     else if (key == "--numbers") numbers_arg = val;
+    else if (key == "--batchRanges") batchRanges_arg = val;
     else if (key == "--blockSize") blockSize = parse_u32(val);
     else { std::cerr << "Unknown option: " << arg << "\n"; usage(argv[0]); return 2; }
   }
@@ -124,7 +128,28 @@ int main(int argc, char** argv) {
   }
 
   std::vector<uint32_t> numbers;
-  if (!numbers_arg.empty()) {
+
+  if (!batchRanges_arg.empty()) {
+    size_t pos = 0;
+    while (pos < batchRanges_arg.size()) {
+      size_t comma = batchRanges_arg.find(',', pos);
+      std::string token = batchRanges_arg.substr(pos, comma - pos);
+      if (!token.empty()) {
+        size_t dash = token.find('-');
+        if (dash == std::string::npos) {
+          std::cerr << "Invalid range format: " << token << " (expected START-END)" << std::endl;
+          return 2;
+        }
+        uint32_t rstart = parse_u32(token.substr(0, dash));
+        uint32_t rend = parse_u32(token.substr(dash + 1));
+        uint32_t cur = (rstart % 2 == 0) ? rstart : rstart + 1;
+        if (cur < 4) cur = 4;
+        for (; cur <= rend; cur += 2) numbers.push_back(cur);
+      }
+      if (comma == std::string::npos) break;
+      pos = comma + 1;
+    }
+  } else if (!numbers_arg.empty()) {
     size_t pos = 0;
     while (pos < numbers_arg.size()) {
       size_t comma = numbers_arg.find(',', pos);
@@ -148,7 +173,6 @@ int main(int argc, char** argv) {
   uint32_t primeCount = static_cast<uint32_t>(smallPrimes.size());
   uint32_t count = static_cast<uint32_t>(numbers.size());
 
-  // Device allocations
   uint32_t* d_numbers = nullptr;
   uint32_t* d_result = nullptr;
   uint32_t* d_primes = nullptr;

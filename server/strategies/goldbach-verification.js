@@ -39,6 +39,30 @@ function normalizeNumbers(config, inputArgs) {
     return values.map((value, i) => parseU32(value, `numbers[${i}]`));
   }
 
+  const batch = inputArgs.batch ?? config.batch;
+  if (batch !== undefined && batch !== null) {
+    const entries = Array.isArray(batch) ? batch : [batch];
+    const all = [];
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      if (entry.numbers !== undefined) {
+        const values = Array.isArray(entry.numbers)
+          ? entry.numbers
+          : String(entry.numbers).split(',').map((x) => x.trim()).filter(Boolean);
+        for (const v of values) all.push(parseU32(v, `batch[${i}]`));
+      } else {
+        const s = parseU32(entry.start ?? 4, `batch[${i}].start`);
+        const e = parseU32(entry.end, `batch[${i}].end`);
+        if (e < s) throw new Error(`batch[${i}]: end must be >= start`);
+        let current = s % 2 === 0 ? s : s + 1;
+        if (current < 4) current = 4;
+        for (; current <= e; current += 2) all.push(current >>> 0);
+      }
+    }
+    if (all.length === 0) throw new Error('batch produced no numbers');
+    return all;
+  }
+
   const start = parseU32(inputArgs.start ?? config.start ?? 4, 'start');
   const end = parseU32(inputArgs.end ?? config.end, 'end');
   if (end < start) throw new Error('end must be >= start');

@@ -56,7 +56,10 @@ function getPipeline(device, kernelCode) {
 }
 
 export function createExecutor({ kernels }) {
-  const kernel = kernels.find((k) => k.name?.endsWith('pollard_pminus1.wgsl'));
+  const kernel = kernels.find((k) =>
+    k.name?.endsWith('pollard_pminus1_batched.wgsl') ||
+    k.name?.endsWith('pollard_pminus1.wgsl')
+  );
   if (!kernel) throw new Error('Pollard p-1 WGSL source missing');
   const kernelCode = kernel.content || kernel.code;
 
@@ -71,7 +74,11 @@ export function createExecutor({ kernels }) {
     const { pipeline, bgl } = getPipeline(device, kernelCode);
     const input = new Uint32Array(toArrayBuffer(payload.data));
     const nBases = Number(payload.nBases || input[3] || 0) >>> 0;
+    const version = Number(input[1] || 1) >>> 0;
+    const numNs = version >= 2 ? (Number(input[5] || 1) >>> 0) : 1;
+    const totalThreads = numNs * nBases;
     if (nBases === 0) throw new Error('Pollard p-1 chunk has no bases');
+    if (totalThreads === 0) throw new Error('Pollard p-1 chunk has no work');
 
     const ioBuf = device.createBuffer({
       label: 'pollard-pminus1-io',
@@ -96,7 +103,7 @@ export function createExecutor({ kernels }) {
     const pass = encoder.beginComputePass({ label: 'pollard-pminus1-pass' });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(nBases / 64));
+    pass.dispatchWorkgroups(Math.ceil(totalThreads / 64));
     pass.end();
     encoder.copyBufferToBuffer(ioBuf, 0, readBuf, 0, input.byteLength);
     device.queue.submit([encoder.finish()]);
