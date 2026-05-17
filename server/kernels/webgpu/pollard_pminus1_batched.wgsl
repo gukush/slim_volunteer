@@ -239,7 +239,7 @@ fn write_u256(offset: u32, v: U256) {
   for (var i = 0u; i < 8u; i++) { io.words[offset + i] = v.limbs[i]; }
 }
 
-@compute @workgroup_size(64)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
   let h = getHeader();

@@ -40,7 +40,7 @@ fn find_goldbach_witness(n: u32, prime_count: u32) -> u32 {
   return 0u;
 }
 
-@compute @workgroup_size(128)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let idx = gid.x;
 
