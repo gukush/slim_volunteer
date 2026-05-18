@@ -330,7 +330,14 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
         basesProcessed,
         completedAt: new Date().toISOString(),
       };
-      fs.writeFileSync(outPath, JSON.stringify(summary, null, 2));
+      console.log(`[POLLARD DEBUG] finalize writing to: ${outPath}`);
+      try {
+        fs.writeFileSync(outPath, JSON.stringify(summary, null, 2));
+        console.log(`[POLLARD DEBUG] wrote ${fs.statSync(outPath).size} bytes`);
+      } catch (e) {
+        console.error(`[POLLARD DEBUG] write failed: ${e.message}`);
+        throw e;
+      }
       const anyFound = perN.some((x) => x.found.length > 0);
       return { outPath, found: anyFound, results: summary.results };
     },

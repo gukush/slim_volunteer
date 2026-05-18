@@ -177,12 +177,32 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
     t[9] = 0u;
   }
 
-  var r: U256;
-  for (var i = 0u; i < 8u; i++) { r.limbs[i] = t[i]; }
+  // Precise 9-word check: Is T >= N?
+  var overflow = false;
+  if (t[8] > 0u) {
+    overflow = true;
+  } else {
+    for (var i: i32 = 7; i >= 0; i--) {
+      let ti = t[u32(i)];
+      let ni = N.limbs[u32(i)];
+      if (ti < ni) { break; }
+      if (ti > ni) { overflow = true; break; }
+    }
+  }
 
-  // Final reduction: subtract N if result overflowed 256 bits (t[8] > 0) OR if r >= N
-  if (t[8] > 0u || cmp(r, N) >= 0) {
-    return sub_u256(r, N);
+  // Perform subtraction directly from intermediate array t to prevent underflows
+  var r: U256;
+  if (overflow) {
+    var br = 0u;
+    for (var i = 0u; i < 8u; i++) {
+      let sb = subb(t[i], N.limbs[i], br);
+      r.limbs[i] = sb.x;
+      br = sb.y;
+    }
+  } else {
+    for (var i = 0u; i < 8u; i++) {
+      r.limbs[i] = t[i];
+    }
   }
   return r;
 }

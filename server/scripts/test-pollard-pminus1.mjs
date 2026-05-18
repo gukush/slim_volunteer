@@ -92,24 +92,25 @@ async function main() {
   await waitForTask(taskId);
   console.log('\nTask completed');
 
-  // Small delay to avoid race with kill-switch file write
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-
+  // The task status is 'completed' but the server may still be finalizing.
+  // Give it a generous window, then retry the API a few times.
+  const maxRetries = 5;
+  const retryDelayMs = 2000;
   let summary;
-  const directPath = path.join(process.cwd(), 'storage', 'tasks', taskId, 'output.json');
-  if (fs.existsSync(directPath)) {
-    console.log(`Reading output directly from: ${directPath}`);
-    summary = JSON.parse(fs.readFileSync(directPath, 'utf8'));
-  } else {
-    console.log(`Direct path not found: ${directPath}, falling back to API`);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
     try {
       summary = await api(`/tasks/${taskId}/output?name=output.json`);
+      console.log(`Fetched output.json on attempt ${attempt}`);
+      break;
     } catch (e) {
-      console.error(`API fetch failed: ${e.message}`);
-      console.error(`Task ${taskId} completed but output.json is missing.`);
-      console.error(`Expected at: ${directPath}`);
-      console.error(`CWD: ${process.cwd()}`);
-      throw e;
+      if (attempt === maxRetries) {
+        console.error(`Failed to fetch output.json after ${maxRetries} attempts.`);
+        console.error(`Task ${taskId} completed but output.json is missing from the API.`);
+        console.error(`Last error: ${e.message}`);
+        throw e;
+      }
+      console.log(`Attempt ${attempt} failed (${e.message}), retrying...`);
     }
   }
   fs.writeFileSync(path.join(outDir, 'output.json'), JSON.stringify(summary, null, 2));
