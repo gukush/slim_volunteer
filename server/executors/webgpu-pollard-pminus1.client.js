@@ -22,7 +22,11 @@ async function getDevice() {
   if (!('gpu' in navigator)) throw new Error('WebGPU not available');
   const adapter = await navigator.gpu.requestAdapter();
   if (!adapter) throw new Error('No WebGPU adapter');
-  const device = await adapter.requestDevice();
+  const device = await adapter.requestDevice({
+    requiredLimits: {
+      maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension,
+    },
+  });
   device.lost.then((info) => {
     const reason = info?.reason || 'unknown';
     __WGPU_PM1_CACHE__.lostReason = reason;
@@ -122,7 +126,12 @@ export function createExecutor({ kernels }) {
         const pass = encoder.beginComputePass({ label: `pollard-pminus1-pass-${pp_start}` });
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bindGroup);
-        pass.dispatchWorkgroups(Math.ceil(totalThreads / 256));
+        const totalGroups = Math.ceil(totalThreads / 256);
+        const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
+        if (totalGroups > maxDim) {
+          throw new Error(`Pollard p-1 dispatch ${totalGroups} exceeds maxComputeWorkgroupsPerDimension ${maxDim}. Reduce chunkSize.`);
+        }
+        pass.dispatchWorkgroups(totalGroups);
         pass.end();
 
         const isFinal = pp_start + currentPpLen >= ppCount;

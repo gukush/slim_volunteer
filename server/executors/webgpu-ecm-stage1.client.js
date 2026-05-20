@@ -165,8 +165,12 @@ export async function getDevice() {
     console.warn('[ECM] timestamp-query feature not available');
   }
 
+  const requiredLimits = {
+    maxComputeWorkgroupsPerDimension: adapter.limits.maxComputeWorkgroupsPerDimension,
+  };
   const device = await adapter.requestDevice({
     requiredFeatures,
+    requiredLimits,
   });
 
   __WGPU_ECM_CACHE__.device = device;
@@ -273,6 +277,20 @@ export function createExecutor({ kernels, config }){
       u32 = newU32;
     }
 
+    if (meta?.curveSeedMode === 'assignment') {
+      const seedLoRaw = Number(meta.assignmentSeedLo);
+      const seedHiRaw = Number(meta.assignmentSeedHi);
+      if (Number.isFinite(seedLoRaw) && Number.isFinite(seedHiRaw)) {
+        const seedLo = seedLoRaw >>> 0;
+        const seedHi = seedHiRaw >>> 0;
+        u32[6] = seedLo;
+        u32[7] = seedHi;
+        console.log(`[ECM] Using assignment seed ${meta.assignmentSeed || ''} for worker ${meta.assignedWorkerId || 'unknown'}`);
+      } else {
+        console.warn('[ECM] Assignment seed requested but missing/invalid; using chunk seed');
+      }
+    }
+
     const HEADER_WORDS_V3 = 12;
     const CONST_WORDS = 8*3 + 4; // N(8) + R2(8) + mont_one(8) + n0inv32(1) + pad(3)
     const CURVE_OUT_WORDS_PER = 8 + 1 + 3; // result(8) + status(1) + pad(3)
@@ -366,6 +384,10 @@ export function createExecutor({ kernels, config }){
       });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bindGroup);
+      const maxDim = dev.limits.maxComputeWorkgroupsPerDimension;
+      if (numWorkgroups > maxDim) {
+        throw new Error(`ECM dispatch ${numWorkgroups} exceeds maxComputeWorkgroupsPerDimension ${maxDim}. Reduce chunkSize.`);
+      }
       pass.dispatchWorkgroups(numWorkgroups, 1, 1);
       pass.end();
 
