@@ -19,6 +19,7 @@ const chunkSize = Number(args.chunkSize ?? 128);
 const Krep = Number(args.Krep ?? args.K ?? 1);
 const timeoutMs = args.timeoutMs !== undefined ? Number(args.timeoutMs) : 0;
 const intervalMs = Number(args.intervalMs ?? 1000);
+const skipOutput = args.skipOutput || args.noOutput || false;
 const outDir = args.outDir || `/app/pollard-pminus1-results-${Date.now()}`;
 
 async function api(pathname, options = {}) {
@@ -91,6 +92,11 @@ async function main() {
 
   await waitForTask(taskId);
   console.log('\nTask completed');
+
+  if (skipOutput) {
+    console.log(`--skipOutput set, skipping output.json fetch. Task ${taskId} done.`);
+    return;
+  }
 
   // The task status is 'completed' but the server may still be finalizing.
   // Give it a generous window, then retry the API a few times.
