@@ -52,6 +52,7 @@ function getPipeline(device, kernelCode) {
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
     ],
   });
   const layout = device.createPipelineLayout({ label: 'goldbach-verify-pipeline-layout', bindGroupLayouts: [bgl] });
@@ -124,8 +125,6 @@ export function createExecutor({ kernels }) {
     if (smallPrimes.byteLength > 0) device.queue.writeBuffer(primesBuf, 0, smallPrimes);
 
     const resultWords = new Uint32Array(8);
-    resultWords[5] = count >>> 0;
-    resultWords[6] = primeCount >>> 0;
     const resultBuf = device.createBuffer({
       label: 'goldbach-result',
       size: resultWords.byteLength,
@@ -139,6 +138,14 @@ export function createExecutor({ kernels }) {
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
 
+    const configWords = new Uint32Array([count >>> 0, primeCount >>> 0]);
+    const configBuf = device.createBuffer({
+      label: 'goldbach-config',
+      size: Math.max(16, configWords.byteLength),
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(configBuf, 0, configWords);
+
     const bindGroup = device.createBindGroup({
       label: 'goldbach-bindgroup',
       layout: bgl,
@@ -146,6 +153,7 @@ export function createExecutor({ kernels }) {
         { binding: 0, resource: { buffer: numbersBuf } },
         { binding: 1, resource: { buffer: resultBuf } },
         { binding: 2, resource: { buffer: primesBuf } },
+        { binding: 3, resource: { buffer: configBuf } },
       ],
     });
 
@@ -153,7 +161,7 @@ export function createExecutor({ kernels }) {
     const pass = encoder.beginComputePass({ label: 'goldbach-pass' });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(Math.ceil(count / 128));
+    pass.dispatchWorkgroups(Math.ceil(count / 256));
     pass.end();
     encoder.copyBufferToBuffer(resultBuf, 0, readBuf, 0, resultWords.byteLength);
     device.queue.submit([encoder.finish()]);
@@ -166,6 +174,7 @@ export function createExecutor({ kernels }) {
     try { primesBuf.destroy?.(); } catch {}
     try { resultBuf.destroy?.(); } catch {}
     try { readBuf.destroy?.(); } catch {}
+    try { configBuf.destroy?.(); } catch {}
 
     const tClientDone = performance.now();
     return {

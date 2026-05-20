@@ -177,12 +177,13 @@ function buildPayload({ ns, B1, baseStart, nBases }) {
   const HEADER_WORDS = 8;
   const CONST_WORDS = 8 * 3 + 4;
   const OUT_WORDS_PER_BASE = 12;
+  const STATE_WORDS_PER_THREAD = 8;
   const numNs = ns.length;
-  const totalWords = HEADER_WORDS + numNs * CONST_WORDS + primePowers.length + numNs * nBases * OUT_WORDS_PER_BASE;
+  const totalWords = HEADER_WORDS + numNs * CONST_WORDS + primePowers.length + numNs * nBases * OUT_WORDS_PER_BASE + numNs * nBases * STATE_WORDS_PER_THREAD;
   const buffer = new Uint32Array(totalWords);
   let offset = 0;
   buffer[offset++] = MAGIC;
-  buffer[offset++] = 2; // batched version
+  buffer[offset++] = 3; // batched version with chunked execution + state storage
   buffer[offset++] = primePowers.length;
   buffer[offset++] = nBases;
   buffer[offset++] = baseStart >>> 0;

@@ -10,8 +10,8 @@ struct Header {
   n_bases: u32,
   base_start: u32,
   num_ns: u32,
-  rsv0: u32,
-  rsv1: u32,
+  pp_start: u32,
+  pp_len: u32,
 };
 
 fn getHeader() -> Header {
@@ -23,6 +23,9 @@ fn constOffset() -> u32 { return 8u; }
 fn constWordsPerN() -> u32 { return 28u; }
 fn ppOffset(num_ns: u32) -> u32 { return constOffset() + num_ns * constWordsPerN(); }
 fn outOffset(num_ns: u32, pp_count: u32) -> u32 { return ppOffset(num_ns) + pp_count; }
+fn stateOffset(num_ns: u32, pp_count: u32, n_bases: u32) -> u32 {
+  return outOffset(num_ns, pp_count) + num_ns * n_bases * 12u;
+}
 
 fn set_zero() -> U256 {
   var r: U256;
@@ -124,15 +127,12 @@ fn mul32x32_64(a: u32, b: u32) -> vec2<u32> {
   let p10 = a1 * b0;
   let p11 = a1 * b1;
 
-  // Catch 33rd-bit overflow from p01 + p10
   let mid_sum = p10 + p01;
   let mid_carry = select(0u, 1u, mid_sum < p10);
 
-  // Add shifted middle sum to p00, catch carry into upper 32-bits
   let lo = p00 + (mid_sum << 16u);
   let lo_carry = select(0u, 1u, lo < p00);
 
-  // Assemble high 32 bits
   let hi = p11 + (mid_sum >> 16u) + (mid_carry << 16u) + lo_carry;
 
   return vec2<u32>(lo, hi);
@@ -144,7 +144,6 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
 
   for (var i = 0u; i < 8u; i++) {
     var carry = 0u;
-    // Step 1: T = T + a_i * b
     for (var j = 0u; j < 8u; j++) {
       let prod = mul32x32_64(a.limbs[i], b.limbs[j]);
       let s1 = addc(t[j], prod.x, 0u);
@@ -156,11 +155,9 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
     t[8] = s_t8.x;
     t[9] = s_t8.y;
 
-    // Step 2: m = T[0] * n0inv mod 2^32
     let m = t[0] * n0inv32;
     carry = 0u;
 
-    // Step 3: T = T + m * N
     for (var j = 0u; j < 8u; j++) {
       let prod = mul32x32_64(m, N.limbs[j]);
       let s1 = addc(t[j], prod.x, 0u);
@@ -172,12 +169,10 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
     t[8] = s_t8_2.x;
     t[9] += s_t8_2.y;
 
-    // Step 4: Shift T right by 32 bits
     for (var k = 0u; k < 9u; k++) { t[k] = t[k + 1u]; }
     t[9] = 0u;
   }
 
-  // Precise 9-word check: Is T >= N?
   var overflow = false;
   if (t[8] > 0u) {
     overflow = true;
@@ -190,7 +185,6 @@ fn mont_mul(a: U256, b: U256, N: U256, n0inv32: u32) -> U256 {
     }
   }
 
-  // Perform subtraction directly from intermediate array t to prevent underflows
   var r: U256;
   if (overflow) {
     var br = 0u;
@@ -272,6 +266,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
   let const_off = constOffset() + n_idx * constWordsPerN();
   let pp_off = ppOffset(h.num_ns);
   let out_off = outOffset(h.num_ns, h.pp_count) + n_idx * h.n_bases * 12u + base_idx * 12u;
+  let state_off = stateOffset(h.num_ns, h.pp_count, h.n_bases) + idx * 8u;
 
   var N = read_u256(const_off);
   var R2 = read_u256(const_off + 8u);
@@ -284,32 +279,47 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   if (base_u32 < 2u || is_even(N)) {
     status = 3u;
-  } else {
-    var a = to_mont(u256_from_u32(base_u32), R2, N, n0inv32);
-    for (var i = 0u; i < h.pp_count; i++) {
+  }
+
+  var a: U256;
+  if (status != 3u) {
+    if (h.pp_start == 0u) {
+      a = to_mont(u256_from_u32(base_u32), R2, N, n0inv32);
+    } else {
+      a = read_u256(state_off);
+    }
+
+    let pp_end = min(h.pp_start + h.pp_len, h.pp_count);
+    for (var i = h.pp_start; i < pp_end; i++) {
       let pp = io.words[pp_off + i];
       if (pp > 1u) {
         a = mont_pow_u32(a, pp, mont_one, N, n0inv32);
       }
     }
 
-    let a_std = from_mont(a, N, n0inv32);
-    var diff: U256;
-    if (cmp(a_std, set_one()) >= 0) {
-      diff = sub_u256(a_std, set_one());
-    } else {
-      diff = sub_u256(N, set_one());
-    }
-    let g = gcd_binary_u256_oddN(diff, N);
-    result = g;
-    if (cmp(g, set_one()) > 0 && cmp(g, N) < 0) {
-      status = 2u;
-    }
+    write_u256(state_off, a);
   }
 
-  write_u256(out_off, result);
-  io.words[out_off + 8u] = status;
-  io.words[out_off + 9u] = base_u32;
-  io.words[out_off + 10u] = 0u;
-  io.words[out_off + 11u] = 0u;
+  let isFinal = (h.pp_start + h.pp_len >= h.pp_count);
+  if (isFinal) {
+    if (status != 3u) {
+      let a_std = from_mont(a, N, n0inv32);
+      var diff: U256;
+      if (cmp(a_std, set_one()) >= 0) {
+        diff = sub_u256(a_std, set_one());
+      } else {
+        diff = sub_u256(N, set_one());
+      }
+      let g = gcd_binary_u256_oddN(diff, N);
+      result = g;
+      if (cmp(g, set_one()) > 0 && cmp(g, N) < 0) {
+        status = 2u;
+      }
+    }
+    write_u256(out_off, result);
+    io.words[out_off + 8u] = status;
+    io.words[out_off + 9u] = base_u32;
+    io.words[out_off + 10u] = 0u;
+    io.words[out_off + 11u] = 0u;
+  }
 }

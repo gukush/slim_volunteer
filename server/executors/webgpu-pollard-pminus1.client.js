@@ -81,8 +81,10 @@ export function createExecutor({ kernels }) {
       const nBases = Number(payload.nBases || input[3] || 0) >>> 0;
       const numNs = Number(input[5] || 1) >>> 0;
       const totalThreads = numNs * nBases;
+      const ppCount = Number(input[2] || 0) >>> 0;
       if (nBases === 0) throw new Error('Pollard p-1 chunk has no bases');
       if (totalThreads === 0) throw new Error('Pollard p-1 chunk has no work');
+      if (ppCount === 0) throw new Error('Pollard p-1 chunk has no prime powers');
 
       const ioBuf = device.createBuffer({
         label: 'pollard-pminus1-io',
@@ -103,14 +105,57 @@ export function createExecutor({ kernels }) {
         entries: [{ binding: 0, resource: { buffer: ioBuf } }],
       });
 
-      const encoder = device.createCommandEncoder({ label: 'pollard-pminus1-encoder' });
-      const pass = encoder.beginComputePass({ label: 'pollard-pminus1-pass' });
-      pass.setPipeline(pipeline);
-      pass.setBindGroup(0, bindGroup);
-      pass.dispatchWorkgroups(Math.ceil(totalThreads / 256));
-      pass.end();
-      encoder.copyBufferToBuffer(ioBuf, 0, readBuf, 0, input.byteLength);
-      device.queue.submit([encoder.finish()]);
+      // ----- RESUMABLE COMPUTATION LOOP (avoids browser TDR) -----
+      const TARGET_MS = 500; // target time per GPU submit
+      let pp_len = Math.min(500, ppCount);
+      let pp_start = 0;
+      let passCount = 0;
+      const overallStart = performance.now();
+
+      while (pp_start < ppCount) {
+        const currentPpLen = Math.min(pp_len, ppCount - pp_start);
+        input[6] = pp_start >>> 0;
+        input[7] = currentPpLen >>> 0;
+        device.queue.writeBuffer(ioBuf, 0, input.buffer, 0, 32); // update header only
+
+        const encoder = device.createCommandEncoder({ label: `pollard-pminus1-encoder-pass-${pp_start}` });
+        const pass = encoder.beginComputePass({ label: `pollard-pminus1-pass-${pp_start}` });
+        pass.setPipeline(pipeline);
+        pass.setBindGroup(0, bindGroup);
+        pass.dispatchWorkgroups(Math.ceil(totalThreads / 256));
+        pass.end();
+
+        const isFinal = pp_start + currentPpLen >= ppCount;
+        if (isFinal) {
+          encoder.copyBufferToBuffer(ioBuf, 0, readBuf, 0, input.byteLength);
+        }
+
+        const t0 = performance.now();
+        device.queue.submit([encoder.finish()]);
+        await device.queue.onSubmittedWorkDone().catch((e) => {
+          console.error('[Pollard p-1] GPU submit error:', e);
+          throw e;
+        });
+        const cpuTime = performance.now() - t0;
+
+        pp_start += currentPpLen;
+        passCount++;
+
+        const timingInfo = `CPU: ${cpuTime.toFixed(1)}ms`;
+        console.log(`Pollard p-1 pass ${passCount}: pp[${pp_start - currentPpLen}:${pp_start}]/${ppCount} - ${timingInfo}`);
+
+        // Adaptive tuning to stay near target time
+        if (!isFinal) {
+          if (cpuTime < TARGET_MS / 2 && pp_len < ppCount / 10) {
+            pp_len = Math.min(pp_len * 2, 10000);
+          } else if (cpuTime > TARGET_MS * 1.5) {
+            pp_len = Math.max(Math.floor(pp_len * TARGET_MS / cpuTime), 100);
+          }
+        }
+      }
+
+      const totalTime = ((performance.now() - overallStart) / 1000).toFixed(2);
+      console.log(`Pollard p-1 Stage 1 complete: ${ppCount} prime powers in ${totalTime}s (${passCount} passes)`);
 
       const KERNEL_TIMEOUT_MS = 120000;
       try {
@@ -143,7 +188,6 @@ export function createExecutor({ kernels }) {
         },
       };
     } catch (e) {
-      // Log to browser console for debugging
       const errMsg = e?.message || String(e) || 'unknown error';
       console.error(`[POLLARD P-1 EXECUTOR ERROR] ${errMsg}`, e);
       throw new Error(`Pollard p-1 executor failed: ${errMsg}`);
