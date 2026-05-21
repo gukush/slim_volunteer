@@ -565,6 +565,8 @@ int main(int argc, char** argv) {
     }
 
     std::vector<ResultItem> results(numNs);
+    int processed = 0;
+    int nextPrint = 100;
 
     /* collect results and push more work */
     do {
@@ -572,6 +574,12 @@ int main(int argc, char** argv) {
       MPI_Status status;
       MPI_Recv(&r, sizeof(ResultItem), MPI_BYTE, MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &status);
       results[slave_idx[status.MPI_SOURCE]] = r;
+      processed++;
+      if (processed >= nextPrint) {
+        std::cout << "[progress] " << processed << "/" << numNs << " done ("
+                  << (100.0 * processed / numNs) << "%)\n";
+        nextPrint += 100;
+      }
 
       if (offset < numNs) {
         WorkItem w;
@@ -590,7 +598,9 @@ int main(int argc, char** argv) {
       MPI_Status status;
       MPI_Recv(&r, sizeof(ResultItem), MPI_BYTE, MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &status);
       results[slave_idx[status.MPI_SOURCE]] = r;
+      processed++;
     }
+    std::cout << "[progress] " << processed << "/" << numNs << " done (100%)\n";
 
     /* send FINISH */
     for (int i = 1; i < nproc; i++) {
