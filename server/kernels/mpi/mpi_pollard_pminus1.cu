@@ -291,8 +291,8 @@ __device__ static inline U256 mont_mul_dev(const U256& a, const U256& b, const U
   return r;
 }
 
-__device__ static inline U256 mont_pow_dev(U256 base, uint32_t exp, const U256& montOne, const U256& N, uint32_t n0inv32) {
-  U256 result = montOne;
+__host__ __device__ static inline U256 mont_pow_u32(U256 base, uint32_t exp, const U256& mont_one, const U256& N, uint32_t n0inv32) {
+  U256 result = mont_one;
   U256 b = base;
   uint32_t e = exp;
   while (e) {
@@ -303,15 +303,25 @@ __device__ static inline U256 mont_pow_dev(U256 base, uint32_t exp, const U256& 
   return result;
 }
 
-__device__ static inline U256 to_mont_dev(const U256& a, const U256& R2, const U256& N, uint32_t n0inv32) {
+__device__ static inline U256 read_u256(const uint32_t* buf, int offset) {
+  U256 r;
+  for (int i = 0; i < 8; ++i) r.limbs[i] = buf[offset + i];
+  return r;
+}
+
+__device__ static inline void write_u256(uint32_t* buf, int offset, const U256& v) {
+  for (int i = 0; i < 8; ++i) buf[offset + i] = v.limbs[i];
+}
+
+__host__ __device__ static inline U256 to_mont(const U256& a, const U256& R2, const U256& N, uint32_t n0inv32) {
   return mont_mul_dev(a, R2, N, n0inv32);
 }
 
-__device__ static inline U256 from_mont_dev(const U256& a, const U256& N, uint32_t n0inv32) {
+__host__ __device__ static inline U256 from_mont(const U256& a, const U256& N, uint32_t n0inv32) {
   return mont_mul_dev(a, u256_one(), N, n0inv32);
 }
 
-__device__ static inline U256 gcd_binary_dev(U256 a, U256 b) {
+__host__ __device__ static inline U256 gcd_binary_u256_oddN(U256 a, U256 b) {
   if (u256_is_zero(a)) return b;
   if (u256_is_zero(b)) return a;
   while (u256_is_even(a)) a = u256_rshift1(a);
@@ -324,7 +334,76 @@ __device__ static inline U256 gcd_binary_dev(U256 a, U256 b) {
   }
 }
 
-__global__ void pollard_pminus1_batched_kernel(uint32_t* io, uint32_t total_threads);
+__global__ void pollard_pminus1_batched_kernel(uint32_t* io, uint32_t total_threads) {
+  const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total_threads) return;
+
+  const uint32_t pp_count   = io[2];
+  const uint32_t n_bases    = io[3];
+  const uint32_t base_start = io[4];
+  const uint32_t num_ns     = io[5];
+
+  if (num_ns == 0 || n_bases == 0) return;
+
+  const uint32_t n_idx    = idx / n_bases;
+  const uint32_t base_idx = idx % n_bases;
+
+  if (n_idx >= num_ns) return;
+
+  const int HEADER_WORDS = 8;
+  const int CONST_WORDS  = 8 * 3 + 4;
+
+  const int CONST_OFFSET = HEADER_WORDS;
+  const int PP_OFFSET    = CONST_OFFSET + num_ns * CONST_WORDS;
+  const int OUT_OFFSET   = PP_OFFSET + pp_count;
+
+  const int n_const_off = CONST_OFFSET + n_idx * CONST_WORDS;
+  const int n_out_off   = OUT_OFFSET + n_idx * n_bases * 12;
+
+  U256 N = read_u256(io, n_const_off);
+  U256 R2 = read_u256(io, n_const_off + 8);
+  U256 mont_one = read_u256(io, n_const_off + 16);
+  uint32_t n0inv32 = io[n_const_off + 24];
+
+  const int out_base = n_out_off + base_idx * 12;
+  const uint32_t base_u32 = base_start + base_idx;
+
+  U256 result = u256_zero();
+  uint32_t status = 1u;
+
+  if (base_u32 < 2u || u256_is_even(N)) {
+    status = 3u;
+  }
+
+  if (status != 3u) {
+    U256 a = to_mont(u256_from_u32(base_u32), R2, N, n0inv32);
+    for (uint32_t i = 0; i < pp_count; ++i) {
+      uint32_t pp = io[PP_OFFSET + i];
+      if (pp > 1u) {
+        a = mont_pow_u32(a, pp, mont_one, N, n0inv32);
+      }
+    }
+
+    U256 a_std = from_mont(a, N, n0inv32);
+    U256 diff;
+    if (u256_cmp(a_std, u256_one()) >= 0) {
+      diff = sub_u256(a_std, u256_one());
+    } else {
+      diff = sub_u256(N, u256_one());
+    }
+    U256 g = gcd_binary_u256_oddN(diff, N);
+    result = g;
+    if (u256_cmp(g, u256_one()) > 0 && u256_cmp(g, N) < 0) {
+      status = 2u;
+    }
+  }
+
+  write_u256(io, out_base, result);
+  io[out_base + 8] = status;
+  io[out_base + 9] = base_u32;
+  io[out_base + 10] = 0u;
+  io[out_base + 11] = 0u;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Host-side prime-power generation                                    */
