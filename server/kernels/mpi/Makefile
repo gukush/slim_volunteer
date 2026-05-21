@@ -1,9 +1,9 @@
 NVCC = nvcc
 NVCCFLAGS = -O2 -arch=sm_75
 
-# Tell nvcc to use mpicc as the host compiler so MPI headers/libs are found.
+# Tell nvcc to use mpicxx as the host compiler so MPI headers/libs are found.
 # Remove -arch=sm_75 or change it (e.g. sm_86) to match your GPU architecture.
-MPICC_FLAGS = -ccbin mpicc -Xcompiler -O2
+MPICC_FLAGS = -ccbin mpicxx -Xcompiler -O2
 
 TARGETS = mpi_goldbach_verify mpi_pollard_pminus1
 
