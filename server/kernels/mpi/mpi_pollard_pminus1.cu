@@ -291,7 +291,7 @@ __device__ static inline U256 mont_mul_dev(const U256& a, const U256& b, const U
   return r;
 }
 
-__host__ __device__ static inline U256 mont_pow_u32(U256 base, uint32_t exp, const U256& mont_one, const U256& N, uint32_t n0inv32) {
+__device__ static inline U256 mont_pow_u32(U256 base, uint32_t exp, const U256& mont_one, const U256& N, uint32_t n0inv32) {
   U256 result = mont_one;
   U256 b = base;
   uint32_t e = exp;
@@ -313,15 +313,15 @@ __device__ static inline void write_u256(uint32_t* buf, int offset, const U256& 
   for (int i = 0; i < 8; ++i) buf[offset + i] = v.limbs[i];
 }
 
-__host__ __device__ static inline U256 to_mont(const U256& a, const U256& R2, const U256& N, uint32_t n0inv32) {
+__device__ static inline U256 to_mont(const U256& a, const U256& R2, const U256& N, uint32_t n0inv32) {
   return mont_mul_dev(a, R2, N, n0inv32);
 }
 
-__host__ __device__ static inline U256 from_mont(const U256& a, const U256& N, uint32_t n0inv32) {
+__device__ static inline U256 from_mont(const U256& a, const U256& N, uint32_t n0inv32) {
   return mont_mul_dev(a, u256_one(), N, n0inv32);
 }
 
-__host__ __device__ static inline U256 gcd_binary_u256_oddN(U256 a, U256 b) {
+__device__ static inline U256 gcd_binary_u256_oddN(U256 a, U256 b) {
   if (u256_is_zero(a)) return b;
   if (u256_is_zero(b)) return a;
   while (u256_is_even(a)) a = u256_rshift1(a);
