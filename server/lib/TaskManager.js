@@ -115,18 +115,30 @@ export class TaskManager{
     }
   }
 
-  _finishByKillSwitch(task){
+  async _finishByKillSwitch(task){
     if (!task || task.status === 'completed' || task.status === 'assembling' || task.status === 'error') return;
     task.cancelRequested = true;                 // stop chunking/scheduling ASAP
-    task.status = 'completed';
-    task.endTime = now();
-    task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
-    try { task.assembler?.cleanup?.(); } catch {}
-    try { task.osTracker?.stop('completed'); } catch {}
-    this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true });
-    if (task.descriptor.config?.cleanupOutputFiles) this._cleanupOutputFiles(task, { killSwitch: true });
-    this.io.emit('task:done', { taskId: task.id, killSwitch: true });
-    this._releaseTaskMemory(task);
+    task.status = 'assembling';
+    try {
+      console.log(`[KILL-SWITCH DEBUG] task.assembler exists=${!!task.assembler}, finalize exists=${!!task.assembler?.finalize}`);
+      const outInfo = await task.assembler?.finalize?.();
+      console.log(`[KILL-SWITCH DEBUG] finalize returned, outInfo exists=${!!outInfo}, outPath=${outInfo?.outPath}`);
+      task.status = 'completed';
+      task.endTime = now();
+      task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
+      try { task.osTracker?.stop('completed'); } catch {}
+      this.sendMetricsToListeners('metrics:stop', { taskId: task.id, killSwitch: true, outInfo });
+      if (task.descriptor.config?.cleanupOutputFiles) this._cleanupOutputFiles(task, outInfo || { killSwitch: true });
+      this.io.emit('task:done', { taskId: task.id, killSwitch: true, outInfo });
+      logger.info('Task completed by kill-switch', task.id, outInfo || {});
+    } catch (e) {
+      task.status = 'error';
+      try { task.osTracker?.stop('error'); } catch {}
+      logger.error('Kill-switch finalize error', e);
+    } finally {
+      try { task.assembler?.cleanup?.(); } catch {}
+      this._releaseTaskMemory(task);
+    }
   }
 
 
@@ -134,7 +146,9 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
   const strategy = getStrategy(strategyId);
   const id = uuidv4();
   const taskDir = path.join(this.storageDir, 'tasks', id);
+  logger.info(`[TASK DEBUG] Creating task dir: ${taskDir}`);
   ensureDir(taskDir);
+  logger.info(`[TASK DEBUG] Task dir exists: ${fs.existsSync(taskDir)}`);
   const descriptor = { id, label, strategyId, status: 'created', createdAt: now(), K, config, inputArgs, inputFiles: [], cachedFilePaths };
 
   // Process cachedFilePaths first
@@ -583,19 +597,40 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       }
     }
 
+    let assignmentMeta = {};
+    if (typeof task.strategy?.getAssignmentMeta === 'function') {
+      try {
+        assignmentMeta = task.strategy.getAssignmentMeta({
+          taskId: task.id,
+          descriptor: task.descriptor,
+          chunkId,
+          socketId,
+          replica,
+          meta: entry.meta,
+          client: c,
+        }) || {};
+      } catch (error) {
+        logger.warn(`Failed to build assignment metadata for chunk ${chunkId}: ${error.message}`);
+        assignmentMeta = {};
+      }
+    }
+    const metaForClient = Object.keys(assignmentMeta).length
+      ? { ...entry.meta, ...assignmentMeta }
+      : entry.meta;
+
     // Emit chunk assignment
     logger.debug(`Sending chunk ${chunkId} replica ${replica} to client ${socketId} - replicas: ${entry.replicas}/${task.K}`);
     if (c.clientType === 'native') {
       c.socket.emit('chunk:assign', {
         taskId: task.id, chunkId, replica,
         payload: serializedPayload,
-        meta: entry.meta, tCreate: entry.tCreate,
+        meta: metaForClient, tCreate: entry.tCreate,
       });
     } else {
       c.socket.emit('chunk:assign', {
         taskId: task.id, chunkId, replica,
         payloadDescriptor: this._describePayload(entry.payload),
-        meta: entry.meta, tCreate: entry.tCreate,
+        meta: metaForClient, tCreate: entry.tCreate,
       });
     }
 
@@ -638,7 +673,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     });
 
     if(status!=='ok'){
-      logger.warn('Replica failed', taskId, chunkId, replica, 'from', socketId, 'error:', data?.error);
+      logger.warn('Replica failed', taskId, chunkId, replica, 'from', socketId, 'error:', data?.error, 'stack:', data?.stack || '');
       // For same-client replicas, we might want to reassign differently
       const allowSameClient = task.descriptor.config?.allowSameClientReplicas || false;
       if (!allowSameClient) {
@@ -694,10 +729,10 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           // KILL-SWITCH: evaluate immediately after counting a completion
           if (task.completionThreshold && task.completedChunks >= task.completionThreshold) {
             logger.warn(`KILL-SWITCH: Task ${task.id} reached ${task.completedChunks}/${task.completionThreshold}`);
-            this._finishByKillSwitch(task);   // helper below
+            await this._finishByKillSwitch(task);   // helper below
             return;
           }
-          this._maybeFinish(task.id);
+          this._maybeFinish(task.id).catch(e => logger.error('maybeFinish error', e));
           this._assignNextToClient(task, socketId);
         }catch(e){
           logger.error('Assembler integrate error', e);
@@ -712,7 +747,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
   }
 
-  _maybeFinish(taskId){
+  async _maybeFinish(taskId){
     const task = this.tasks.get(taskId);
     if(!task) return;
     // With assignment entries deleted on completion, use chunk counts instead.
@@ -722,7 +757,7 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
     if(allDone && task.status==='running'){
       task.status = 'assembling';
       try{
-        const outInfo = task.assembler.finalize();
+        const outInfo = await task.assembler.finalize();
         task.status = 'completed';
         task.endTime = now();
         task.timers.endSummary(path.join(this.storageDir, 'timing', 'task_summaries.csv'), 'completed');
