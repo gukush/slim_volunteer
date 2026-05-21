@@ -404,6 +404,7 @@ app.get('/tasks/:id/output', (req,res)=>{
     const taskDir = path.join(process.cwd(), STORAGE_DIR, 'tasks', req.params.id);
     const fileName = req.query.name || 'output.bin';
     const outPath = path.join(taskDir, fileName);
+    console.log(`[API DEBUG] looking for output at: ${outPath}, cwd=${process.cwd()}, STORAGE_DIR=${STORAGE_DIR}, exists=${fs.existsSync(outPath)}`);
 
     if(!fs.existsSync(outPath)) return res.status(404).json({error:'output not found'});
 

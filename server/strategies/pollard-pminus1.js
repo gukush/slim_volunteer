@@ -332,9 +332,10 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
         completedAt: new Date().toISOString(),
       };
       console.log(`[POLLARD DEBUG] finalize writing to: ${outPath}`);
+      console.log(`[POLLARD DEBUG] cwd=${process.cwd()}, taskDir=${taskDir}, exists=${fs.existsSync(taskDir)}`);
       try {
         fs.writeFileSync(outPath, JSON.stringify(summary, null, 2));
-        console.log(`[POLLARD DEBUG] wrote ${fs.statSync(outPath).size} bytes`);
+        console.log(`[POLLARD DEBUG] wrote ${fs.statSync(outPath).size} bytes, exists=${fs.existsSync(outPath)}`);
       } catch (e) {
         console.error(`[POLLARD DEBUG] write failed: ${e.message}`);
         throw e;
