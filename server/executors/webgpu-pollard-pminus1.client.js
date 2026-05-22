@@ -109,35 +109,25 @@ export function createExecutor({ kernels }) {
         entries: [{ binding: 0, resource: { buffer: ioBuf } }],
       });
 
-      // ----- RESUMABLE COMPUTATION LOOP (avoids browser TDR) -----
-      const TARGET_MS = 500; // target time per GPU submit
-      let pp_len = Math.min(500, ppCount);
-      let pp_start = 0;
-      let passCount = 0;
-      const overallStart = performance.now();
+      const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
+      const totalGroups = Math.ceil(totalThreads / 256);
+      if (totalGroups > maxDim) {
+        throw new Error(`Pollard p-1 dispatch ${totalGroups} exceeds maxComputeWorkgroupsPerDimension ${maxDim}. Reduce chunkSize.`);
+      }
 
-      while (pp_start < ppCount) {
-        const currentPpLen = Math.min(pp_len, ppCount - pp_start);
-        input[6] = pp_start >>> 0;
-        input[7] = currentPpLen >>> 0;
-        device.queue.writeBuffer(ioBuf, 0, input.buffer, 0, 32); // update header only
+      if (payload.disableWatchdog) {
+        // ----- SINGLE PASS (watchdog disabled) -----
+        input[6] = 0;
+        input[7] = ppCount >>> 0;
+        device.queue.writeBuffer(ioBuf, 0, input.buffer, 0, 32);
 
-        const encoder = device.createCommandEncoder({ label: `pollard-pminus1-encoder-pass-${pp_start}` });
-        const pass = encoder.beginComputePass({ label: `pollard-pminus1-pass-${pp_start}` });
+        const encoder = device.createCommandEncoder({ label: 'pollard-pminus1-encoder-single' });
+        const pass = encoder.beginComputePass({ label: 'pollard-pminus1-pass-single' });
         pass.setPipeline(pipeline);
         pass.setBindGroup(0, bindGroup);
-        const totalGroups = Math.ceil(totalThreads / 256);
-        const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
-        if (totalGroups > maxDim) {
-          throw new Error(`Pollard p-1 dispatch ${totalGroups} exceeds maxComputeWorkgroupsPerDimension ${maxDim}. Reduce chunkSize.`);
-        }
         pass.dispatchWorkgroups(totalGroups);
         pass.end();
-
-        const isFinal = pp_start + currentPpLen >= ppCount;
-        if (isFinal) {
-          encoder.copyBufferToBuffer(ioBuf, 0, readBuf, 0, input.byteLength);
-        }
+        encoder.copyBufferToBuffer(ioBuf, 0, readBuf, 0, input.byteLength);
 
         const t0 = performance.now();
         device.queue.submit([encoder.finish()]);
@@ -146,25 +136,59 @@ export function createExecutor({ kernels }) {
           throw e;
         });
         const cpuTime = performance.now() - t0;
+        console.log(`Pollard p-1 single pass: ${ppCount} prime powers - CPU: ${cpuTime.toFixed(1)}ms (watchdog disabled)`);
+      } else {
+        // ----- RESUMABLE COMPUTATION LOOP (avoids browser TDR) -----
+        const TARGET_MS = 500;
+        let pp_len = Math.min(500, ppCount);
+        let pp_start = 0;
+        let passCount = 0;
+        const overallStart = performance.now();
 
-        pp_start += currentPpLen;
-        passCount++;
+        while (pp_start < ppCount) {
+          const currentPpLen = Math.min(pp_len, ppCount - pp_start);
+          input[6] = pp_start >>> 0;
+          input[7] = currentPpLen >>> 0;
+          device.queue.writeBuffer(ioBuf, 0, input.buffer, 0, 32);
 
-        const timingInfo = `CPU: ${cpuTime.toFixed(1)}ms`;
-        console.log(`Pollard p-1 pass ${passCount}: pp[${pp_start - currentPpLen}:${pp_start}]/${ppCount} - ${timingInfo}`);
+          const encoder = device.createCommandEncoder({ label: `pollard-pminus1-encoder-pass-${pp_start}` });
+          const pass = encoder.beginComputePass({ label: `pollard-pminus1-pass-${pp_start}` });
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, bindGroup);
+          pass.dispatchWorkgroups(totalGroups);
+          pass.end();
 
-        // Adaptive tuning to stay near target time
-        if (!isFinal) {
-          if (cpuTime < TARGET_MS / 2 && pp_len < ppCount / 10) {
-            pp_len = Math.min(pp_len * 2, 10000);
-          } else if (cpuTime > TARGET_MS * 1.5) {
-            pp_len = Math.max(Math.floor(pp_len * TARGET_MS / cpuTime), 100);
+          const isFinal = pp_start + currentPpLen >= ppCount;
+          if (isFinal) {
+            encoder.copyBufferToBuffer(ioBuf, 0, readBuf, 0, input.byteLength);
+          }
+
+          const t0 = performance.now();
+          device.queue.submit([encoder.finish()]);
+          await device.queue.onSubmittedWorkDone().catch((e) => {
+            console.error('[Pollard p-1] GPU submit error:', e);
+            throw e;
+          });
+          const cpuTime = performance.now() - t0;
+
+          pp_start += currentPpLen;
+          passCount++;
+
+          const timingInfo = `CPU: ${cpuTime.toFixed(1)}ms`;
+          console.log(`Pollard p-1 pass ${passCount}: pp[${pp_start - currentPpLen}:${pp_start}]/${ppCount} - ${timingInfo}`);
+
+          if (!isFinal) {
+            if (cpuTime < TARGET_MS / 2 && pp_len < ppCount / 10) {
+              pp_len = Math.min(pp_len * 2, 10000);
+            } else if (cpuTime > TARGET_MS * 1.5) {
+              pp_len = Math.max(Math.floor(pp_len * TARGET_MS / cpuTime), 100);
+            }
           }
         }
-      }
 
-      const totalTime = ((performance.now() - overallStart) / 1000).toFixed(2);
-      console.log(`Pollard p-1 Stage 1 complete: ${ppCount} prime powers in ${totalTime}s (${passCount} passes)`);
+        const totalTime = ((performance.now() - overallStart) / 1000).toFixed(2);
+        console.log(`Pollard p-1 Stage 1 complete: ${ppCount} prime powers in ${totalTime}s (${passCount} passes)`);
+      }
 
       const KERNEL_TIMEOUT_MS = 120000;
       try {
