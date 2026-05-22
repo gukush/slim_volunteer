@@ -267,26 +267,16 @@ __device__ static inline U256 mont_mul_dev(const U256& a, const U256& b, const U
     t[9] = 0;
   }
 
-  bool overflow = false;
-  if (t[8] > 0) {
-    overflow = true;
-  } else {
-    for (int i = 7; i >= 0; --i) {
-      if (t[i] < N.limbs[i]) { break; }
-      if (t[i] > N.limbs[i]) { overflow = true; break; }
-    }
-  }
-
   U256 r;
-  if (overflow) {
+  for (int i = 0; i < 8; ++i) r.limbs[i] = t[i];
+
+  if (t[8] > 0 || u256_cmp(r, N) >= 0) {
     uint32_t br = 0;
     for (int i = 0; i < 8; ++i) {
       uint2 sb = subb_d(t[i], N.limbs[i], br);
       r.limbs[i] = sb.x;
       br = sb.y;
     }
-  } else {
-    for (int i = 0; i < 8; ++i) r.limbs[i] = t[i];
   }
   return r;
 }
@@ -323,14 +313,14 @@ __device__ static inline U256 from_mont(const U256& a, const U256& N, uint32_t n
 
 __device__ static inline U256 gcd_binary_u256_oddN(U256 a, U256 b) {
   if (u256_is_zero(a)) return b;
-  if (u256_is_zero(b)) return a;
   while (u256_is_even(a)) a = u256_rshift1(a);
-  while (u256_is_even(b)) b = u256_rshift1(b);
   while (true) {
-    if (u256_cmp(a, b) < 0) { U256 t = a; a = b; b = t; }
-    if (u256_cmp(b, u256_zero()) == 0) return a;
-    a = sub_u256(a, b);
-    while (u256_is_even(a)) a = u256_rshift1(a);
+    if (u256_is_zero(b)) return a;
+    while (u256_is_even(b)) b = u256_rshift1(b);
+    if (u256_cmp(a, b) > 0) {
+      U256 t = a; a = b; b = t;
+    }
+    b = sub_u256(b, a);
   }
 }
 
