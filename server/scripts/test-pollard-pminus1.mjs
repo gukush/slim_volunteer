@@ -15,8 +15,9 @@ const limit = args.limit ? Number(args.limit) : null;
 const B1 = Number(args.B1 ?? 100000);
 const startBase = Number(args.startBase ?? 2);
 const totalBases = Number(args.totalBases ?? 1);
-const chunkSize = Number(args.chunkSize ?? 128);
-const Krep = Number(args.Krep ?? args.K ?? 1);
+  const chunkSize = Number(args.chunkSize ?? 128);
+  const disableWatchdog = Boolean(args.disableWatchdog || false);
+  const Krep = Number(args.Krep ?? args.K ?? 1);
 const timeoutMs = args.timeoutMs !== undefined ? Number(args.timeoutMs) : 0;
 const intervalMs = Number(args.intervalMs ?? 1000);
 const skipOutput = args.skipOutput || args.noOutput || false;
@@ -56,8 +57,8 @@ async function waitForTask(taskId) {
 async function main() {
   fs.mkdirSync(outDir, { recursive: true });
 
-  const input = { B1, startBase, totalBases, chunkSize };
-  const config = { framework: 'webgpu', B1, startBase, totalBases, chunkSize };
+  const input = { B1, startBase, totalBases, chunkSize, disableWatchdog };
+  const config = { framework: 'webgpu', B1, startBase, totalBases, chunkSize, disableWatchdog };
 
   if (batchFile) {
     input.batchFile = batchFile;
