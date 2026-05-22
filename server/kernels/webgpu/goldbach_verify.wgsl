@@ -5,6 +5,8 @@
 struct Config {
     count: u32,
     prime_count: u32,
+    dispatch_x: u32,
+    _pad: u32,
 }
 @group(0) @binding(3) var<uniform> config: Config;
 
@@ -48,7 +50,7 @@ fn find_goldbach_witness(n: u32, prime_count: u32) -> u32 {
 
 @compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let idx = gid.x;
+  let idx = gid.y * config.dispatch_x + gid.x;
 
   // Read from uniform buffer instead of atomic storage
   let count = config.count;

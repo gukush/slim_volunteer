@@ -142,7 +142,20 @@ export function createExecutor({ kernels }) {
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
 
-    const configWords = new Uint32Array([count >>> 0, primeCount >>> 0]);
+    const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
+    const workgroupSize = 256;
+    const totalGroups = Math.ceil(count / workgroupSize);
+    const dispatchX = Math.min(totalGroups, maxDim);
+    const dispatchY = Math.ceil(totalGroups / maxDim);
+    if (dispatchY > maxDim) {
+      throw new Error(
+        `Goldbach dispatch grid (${dispatchX}x${dispatchY}) exceeds ` +
+        `maxComputeWorkgroupsPerDimension ${maxDim} in both dimensions. ` +
+        `Reduce chunkSize.`
+      );
+    }
+
+    const configWords = new Uint32Array([count >>> 0, primeCount >>> 0, dispatchX >>> 0, 0]);
     const configBuf = device.createBuffer({
       label: 'goldbach-config',
       size: Math.max(16, configWords.byteLength),
@@ -165,12 +178,7 @@ export function createExecutor({ kernels }) {
     const pass = encoder.beginComputePass({ label: 'goldbach-pass' });
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    const totalGroups = Math.ceil(count / 256);
-    const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
-    if (totalGroups > maxDim) {
-      throw new Error(`Goldbach dispatch ${totalGroups} exceeds maxComputeWorkgroupsPerDimension ${maxDim}. Reduce chunkSize.`);
-    }
-    pass.dispatchWorkgroups(totalGroups);
+    pass.dispatchWorkgroups(dispatchX, dispatchY);
     pass.end();
     encoder.copyBufferToBuffer(resultBuf, 0, readBuf, 0, resultWords.byteLength);
     device.queue.submit([encoder.finish()]);
