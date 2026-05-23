@@ -127,7 +127,6 @@ function normalizeInput(config, inputArgs) {
   if (!Number.isInteger(chunkSize) || chunkSize <= 0 || chunkSize > 0xffffffff) {
     throw new Error('chunkSize must be an integer in [1, 2^32-1]');
   }
-  const disableWatchdog = Boolean(inputArgs.disableWatchdog ?? config.disableWatchdog ?? false);
 
   // Fixed: parallelism comes from number of Ns, not bases per N.
   const totalBases = 1;
@@ -170,7 +169,7 @@ function normalizeInput(config, inputArgs) {
     if (ns0[i] < 4n) throw new Error(`N[${i}] must be >= 4`);
     if (ns0[i] >= (1n << 256n)) throw new Error(`N[${i}] must fit in 256 bits`);
   }
-  return { ns0, B1, startBase, totalBases, chunkSize, disableWatchdog };
+  return { ns0, B1, startBase, totalBases, chunkSize };
 }
 
 function buildPayload({ ns, B1, baseStart, nBases }) {
@@ -206,12 +205,11 @@ function buildPayload({ ns, B1, baseStart, nBases }) {
     numNs,
     ppCount: primePowers.length,
     totalWords,
-    disableWatchdog: false, // filled in by chunker
   };
 }
 
 export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
-  const { ns0, B1, startBase, totalBases, chunkSize, disableWatchdog } = normalizeInput(config, inputArgs);
+  const { ns0, B1, startBase, totalBases, chunkSize } = normalizeInput(config, inputArgs);
   const ns = [];
   const evenFactors = [];
   for (let i = 0; i < ns0.length; i++) {
@@ -238,7 +236,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
         const nBases = totalBases; // 1
         const baseStart = startBase; // 2
         const payload = buildPayload({ ns: chunkNs, B1, baseStart, nBases });
-        payload.disableWatchdog = disableWatchdog;
         yield {
           id: uuidv4(),
           payload,
@@ -251,7 +248,6 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
             ppCount: payload.ppCount,
             ns: chunkNs0.map((n) => '0x' + n.toString(16)),
             B1,
-            disableWatchdog,
           },
           tCreate: Date.now(),
         };
