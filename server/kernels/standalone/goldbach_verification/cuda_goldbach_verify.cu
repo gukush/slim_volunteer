@@ -173,6 +173,8 @@ int main(int argc, char** argv) {
   uint32_t primeCount = static_cast<uint32_t>(smallPrimes.size());
   uint32_t count = static_cast<uint32_t>(numbers.size());
 
+  const auto total_wall0 = std::chrono::steady_clock::now();
+
   uint32_t* d_numbers = nullptr;
   uint32_t* d_result = nullptr;
   uint32_t* d_primes = nullptr;
@@ -206,6 +208,7 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev0, ev1));
 
   CUDA_CHECK(cudaMemcpy(h_result, d_result, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  const auto total_wall1 = std::chrono::steady_clock::now();
 
   CUDA_CHECK(cudaFree(d_numbers));
   CUDA_CHECK(cudaFree(d_result));
@@ -213,7 +216,8 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaEventDestroy(ev0));
   CUDA_CHECK(cudaEventDestroy(ev1));
 
-  double wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+  double old_wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+  double wall_ms = std::chrono::duration<double, std::milli>(total_wall1 - total_wall0).count();
 
   bool valid = (h_result[0] == 0u);
   uint32_t failedIdx = h_result[1];
@@ -226,6 +230,7 @@ int main(int argc, char** argv) {
             << ",last=" << numbers.back()
             << ",blockSize=" << blockSize
             << ",grid=" << grid
+            << ",old_wall_ms=" << old_wall_ms
             << ",wall_ms=" << wall_ms
             << ",kernel_ms=" << kernel_ms
             << ",valid=" << (valid ? "true" : "false");

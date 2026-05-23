@@ -126,6 +126,12 @@ int main(int argc, char** argv) {
   MPI_Comm_rank(MPI_COMM_WORLD, &myrank);
   MPI_Comm_size(MPI_COMM_WORLD, &nproc);
 
+  if (nproc < 2) {
+    if (!myrank) std::cerr << "Error: This Master-Slave design requires at least 2 ranks (mpirun -np 2 or higher)." << std::endl;
+    MPI_Finalize();
+    return 1;
+  }
+
   uint32_t start = 4;
   uint32_t end = 10000;
   std::string numbers_arg;
@@ -209,62 +215,45 @@ int main(int argc, char** argv) {
 
   /* ---------- Master (rank 0) ---------- */
   if (!myrank) {
-    if (rangeSize * (uint32_t)nproc > count) {
-      std::cerr << "Warning: total capacity of processes exceeds size of input\n";
-      rangeSize = count / nproc;
-      if (rangeSize == 0) rangeSize = count;
-    }
+    int nworkers = nproc - 1;
+    if (nworkers <= 0) nworkers = 1;
 
-    uint32_t packetSize = rangeSize;
-    uint32_t offset = 0;
-    std::vector<uint32_t> slave_offset(nproc, 0);
+    /* Divide the list into nworkers contiguous slices */
+    std::vector<int> chunk_start(nworkers);
+    std::vector<int> chunk_count(nworkers);
+    int base = 0;
+    for (int w = 0; w < nworkers; ++w) {
+      chunk_start[w] = base;
+      chunk_count[w] = (int)(count / nworkers) + (w < (int)(count % nworkers) ? 1 : 0);
+      base += chunk_count[w];
+    }
 
     const auto wall0 = std::chrono::steady_clock::now();
 
-    /* send initial chunks */
-    int active = 0;
-    for (int i = 1; i < nproc && offset < count; i++) {
-      uint32_t sendSize = std::min(packetSize, count - offset);
-      MPI_Send(&numbers[offset], sendSize, MPI_UNSIGNED, i, DATA_TAG, MPI_COMM_WORLD);
-      slave_offset[i] = offset;
-      offset += sendSize;
-      active++;
+    /* send each worker its full slice once */
+    for (int w = 0; w < nworkers; ++w) {
+      int dst = w + 1;
+      if (dst >= nproc) continue;
+      int cnt = chunk_count[w];
+      if (cnt > 0) {
+        MPI_Send(&numbers[chunk_start[w]], cnt, MPI_UNSIGNED, dst, DATA_TAG, MPI_COMM_WORLD);
+      }
     }
 
+    /* collect results */
     uint32_t global_result[8] = {};
+    for (int w = 0; w < nworkers; ++w) {
+      int dst = w + 1;
+      if (dst >= nproc) continue;
+      int cnt = chunk_count[w];
+      if (cnt <= 0) continue;
 
-    /* collect results and push more work */
-    do {
       uint32_t slave_result[8];
-      MPI_Status status;
-      MPI_Recv(slave_result, 8, MPI_UNSIGNED, MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &status);
+      MPI_Recv(slave_result, 8, MPI_UNSIGNED, dst, RESULT_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
       if (slave_result[0] != 0 && global_result[0] == 0) {
         global_result[0] = 1;
-        global_result[1] = slave_offset[status.MPI_SOURCE] + slave_result[1];
-        global_result[2] = slave_result[2];
-        global_result[3] = slave_result[3];
-        global_result[4] = slave_result[4];
-      }
-
-      uint32_t sendSize = std::min(packetSize, count - offset);
-      if (sendSize > 0) {
-        MPI_Send(&numbers[offset], sendSize, MPI_UNSIGNED, status.MPI_SOURCE, DATA_TAG, MPI_COMM_WORLD);
-        slave_offset[status.MPI_SOURCE] = offset;
-        offset += sendSize;
-      } else {
-        active--;
-      }
-    } while (offset < count);
-
-    /* collect remaining in-flight results */
-    for (int i = 0; i < active; i++) {
-      uint32_t slave_result[8];
-      MPI_Status status;
-      MPI_Recv(slave_result, 8, MPI_UNSIGNED, MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &status);
-      if (slave_result[0] != 0 && global_result[0] == 0) {
-        global_result[0] = 1;
-        global_result[1] = slave_offset[status.MPI_SOURCE] + slave_result[1];
+        global_result[1] = chunk_start[w] + slave_result[1];
         global_result[2] = slave_result[2];
         global_result[3] = slave_result[3];
         global_result[4] = slave_result[4];
@@ -305,23 +294,33 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_primes, primeCount * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(d_primes, smallPrimes.data(), primeCount * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
-    uint32_t* h_chunk = (uint32_t*)malloc(rangeSize * sizeof(uint32_t));
+    uint32_t* h_chunk = nullptr;
     uint32_t* d_numbers = nullptr;
     uint32_t* d_result = nullptr;
-    CUDA_CHECK(cudaMalloc(&d_numbers, rangeSize * sizeof(uint32_t)));
+    uint32_t current_capacity = 0;
     CUDA_CHECK(cudaMalloc(&d_result, 8 * sizeof(uint32_t)));
 
     cudaEvent_t ev0, ev1;
     CUDA_CHECK(cudaEventCreate(&ev0));
     CUDA_CHECK(cudaEventCreate(&ev1));
-    float total_kernel_ms = 0.0f;
 
     MPI_Status status;
-    do {
+    while (true) {
       MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
       if (status.MPI_TAG == DATA_TAG) {
         int recvCount = 0;
         MPI_Get_count(&status, MPI_UNSIGNED, &recvCount);
+
+        // Dynamically resize if the incoming chunk is larger than our buffer
+        if (recvCount > (int)current_capacity) {
+          if (h_chunk) free(h_chunk);
+          if (d_numbers) CUDA_CHECK(cudaFree(d_numbers));
+          h_chunk = (uint32_t*)malloc(recvCount * sizeof(uint32_t));
+          CUDA_CHECK(cudaMalloc(&d_numbers, recvCount * sizeof(uint32_t)));
+          current_capacity = recvCount;
+        }
+
         MPI_Recv(h_chunk, recvCount, MPI_UNSIGNED, 0, DATA_TAG, MPI_COMM_WORLD, &status);
 
         uint32_t h_result[8] = {};
@@ -336,19 +335,20 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventRecord(ev1));
         CUDA_CHECK(cudaEventSynchronize(ev1));
 
-        float kernel_ms = 0.0f;
-        CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev0, ev1));
-        total_kernel_ms += kernel_ms;
-
         CUDA_CHECK(cudaMemcpy(h_result, d_result, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
         MPI_Send(h_result, 8, MPI_UNSIGNED, 0, RESULT_TAG, MPI_COMM_WORLD);
+
+      } else if (status.MPI_TAG == FINISH_TAG) {
+        // Consume the finish message so the queue is clean!
+        MPI_Recv(NULL, 0, MPI_UNSIGNED, 0, FINISH_TAG, MPI_COMM_WORLD, &status);
+        break;
       }
-    } while (status.MPI_TAG != FINISH_TAG);
+    }
 
     CUDA_CHECK(cudaEventDestroy(ev0));
     CUDA_CHECK(cudaEventDestroy(ev1));
-    free(h_chunk);
-    CUDA_CHECK(cudaFree(d_numbers));
+    if (h_chunk) free(h_chunk);
+    if (d_numbers) CUDA_CHECK(cudaFree(d_numbers));
     CUDA_CHECK(cudaFree(d_result));
     CUDA_CHECK(cudaFree(d_primes));
   }

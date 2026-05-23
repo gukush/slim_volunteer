@@ -567,6 +567,7 @@ int main(int argc, char** argv) {
   for (uint32_t pp : primePowers) h_io[off++] = pp;
 
   // Device memory
+  const auto total_wall0 = std::chrono::steady_clock::now();
   uint32_t* d_io = nullptr;
   CUDA_CHECK(cudaMalloc(&d_io, totalWords * sizeof(uint32_t)));
   CUDA_CHECK(cudaMemcpy(d_io, h_io.data(), totalWords * sizeof(uint32_t), cudaMemcpyHostToDevice));
@@ -589,12 +590,14 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev0, ev1));
 
   CUDA_CHECK(cudaMemcpy(h_io.data(), d_io, totalWords * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+  const auto total_wall1 = std::chrono::steady_clock::now();
 
   CUDA_CHECK(cudaFree(d_io));
   CUDA_CHECK(cudaEventDestroy(ev0));
   CUDA_CHECK(cudaEventDestroy(ev1));
 
-  double wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+  double old_wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+  double wall_ms = std::chrono::duration<double, std::milli>(total_wall1 - total_wall0).count();
 
   // Parse per-N results
   bool anyFound = false;
@@ -605,6 +608,7 @@ int main(int argc, char** argv) {
             << ",totalBases=" << totalBases
             << ",blockSize=" << blockSize
             << ",grid=" << grid
+            << ",old_wall_ms=" << old_wall_ms
             << ",wall_ms=" << wall_ms
             << ",kernel_ms=" << kernel_ms
             << "\n";
