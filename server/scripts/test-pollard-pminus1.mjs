@@ -91,8 +91,10 @@ async function main() {
   await api(`/tasks/${taskId}/start`, { method: 'POST' });
   console.log('Started task', taskId);
 
+  const taskStart = Date.now();
   await waitForTask(taskId);
-  console.log('\nTask completed');
+  const totalMs = Date.now() - taskStart;
+  console.log(`\nTask completed in ${(totalMs / 1000).toFixed(3)}s`);
 
   if (skipOutput) {
     console.log(`--skipOutput set, skipping output.json fetch. Task ${taskId} done.`);

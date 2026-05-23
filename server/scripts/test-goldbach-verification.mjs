@@ -139,8 +139,10 @@ async function main() {
   await api(host, `/tasks/${taskId}/start`, { method: 'POST' });
   console.log('Started task', taskId);
 
+  const taskStart = Date.now();
   await waitForCompletion(host, taskId, { intervalMs, timeoutMs });
-  console.log('\nTask completed');
+  const totalMs = Date.now() - taskStart;
+  console.log(`\nTask completed in ${(totalMs / 1000).toFixed(3)}s`);
 
   const summary = await api(host, `/tasks/${taskId}/output?name=output.json`);
   fs.writeFileSync(path.join(outDir, 'output.json'), JSON.stringify(summary, null, 2));
