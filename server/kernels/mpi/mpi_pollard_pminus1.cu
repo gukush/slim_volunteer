@@ -467,6 +467,8 @@ static void usage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+
+  const auto wall0 = std::chrono::steady_clock::now();
   MPI_Init(&argc, &argv);
 
   int myrank, nproc;
@@ -560,7 +562,7 @@ std::string machineId(hostname_buf);
       }
     }
 
-    const auto wall0 = std::chrono::steady_clock::now();
+
 
     int nworkers = nproc - 1;
     if (nworkers <= 0) nworkers = 1;
@@ -672,32 +674,29 @@ std::string machineId(hostname_buf);
               << ",slave_kernel_ms=" << avg_slave_kernel
               << "\n";
 
-    /* dump per-chunk timing CSV for easy correlation with listener/power logs */
+    /* dump single consolidated chunk-timing CSV (all chunks, all workers) */
     {
       auto epoch_ms = [](auto tp) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
           tp.time_since_epoch()).count();
       };
-      auto epoch0 = std::chrono::system_clock::now();
-      long long file_epoch_ms = epoch_ms(epoch0);
+      long long file_epoch_ms = epoch_ms(std::chrono::system_clock::now());
       std::ostringstream csvName;
-      csvName << "mpi_pollard_chunks_" << machineId << "_" << file_epoch_ms << ".csv";
+      csvName << "chunk_timing_mpi_" << file_epoch_ms << ".csv";
       std::ofstream csv(csvName.str());
       if (csv.is_open()) {
-        csv << "machine_id,chunk_index,worker_rank,num_numbers,"
-            << "master_dispatch_ms,master_recv_ms,"
-            << "slave_wall_ms,slave_kernel_ms,"
-            << "slave_epoch_start_ms,slave_epoch_end_ms\n";
+        csv << "chunkId,replica,client_id,t_chunk_create,t_sent,"
+            << "t_client_recv_abs,t_client_done_abs,"
+            << "duration_ms,gpu_time_ms\n";
         for (size_t i = 0; i < chunk_timings.size(); ++i) {
           const auto& ct = chunk_timings[i];
-          csv << machineId << "," << i << "," << ct.worker_rank << ","
-              << ct.num_numbers << ","
-              << ct.master_dispatch_ms << "," << ct.master_recv_ms << ","
+          csv << i << "," << ct.worker_rank << "," << machineId << ","
+              << ct.master_dispatch_ms << "," << ct.master_dispatch_ms << ","
+              << ct.slave_epoch_start_ms << "," << ct.slave_epoch_end_ms << ","
               << std::fixed << std::setprecision(3) << ct.slave_wall_ms << ","
-              << ct.slave_kernel_ms << ","
-              << ct.slave_epoch_start_ms << "," << ct.slave_epoch_end_ms << "\n";
+              << ct.slave_kernel_ms << "\n";
         }
-        std::cout << "[MPI] Wrote per-chunk timing CSV: " << csvName.str() << std::endl;
+        std::cout << "[MPI] Wrote consolidated chunk timing CSV: " << csvName.str() << std::endl;
       }
     }
 
