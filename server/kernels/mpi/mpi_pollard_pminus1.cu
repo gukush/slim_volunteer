@@ -12,6 +12,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <unistd.h> // gethostname
 
 #define CUDA_CHECK(call) do { \
   cudaError_t err__ = (call); \
@@ -197,18 +199,28 @@ __host__ static inline uint32_t modinv32(uint32_t a) {
 
 __host__ static inline void compute_montgomery_constants(const U256& N, U256& R2, U256& montOne, uint32_t& n0inv32) {
   /* R = 2^256 mod N, R2 = R^2 mod N, montOne = R mod N */
-  U256 R = u256_zero();
-  R.limbs[0] = 1;
+  U256 cur = u256_zero();
+  cur.limbs[0] = 1;
   for (int i = 0; i < 256; ++i) {
-    R = add_u256(R, R);
-    if (u256_cmp(R, N) >= 0) R = sub_u256(R, N);
+    U256 d = add_u256(cur, cur);
+    if (u256_cmp(d, N) >= 0 || u256_cmp(d, cur) < 0) {
+      d = sub_u256(d, N);
+    }
+    cur = d;
   }
-  montOne = R;
-  R2 = u256_zero();
+  montOne = cur;
+
+  /* Compute R2 = R^2 mod N by doubling R 256 more times */
+  cur = montOne;
   for (int i = 0; i < 256; ++i) {
-    R2 = add_u256(R2, R);
-    if (u256_cmp(R2, N) >= 0) R2 = sub_u256(R2, N);
+    U256 d = add_u256(cur, cur);
+    if (u256_cmp(d, N) >= 0 || u256_cmp(d, cur) < 0) {
+      d = sub_u256(d, N);
+    }
+    cur = d;
   }
+  R2 = cur;
+
   uint32_t n0 = N.limbs[0];
   uint32_t n0inv = modinv32(n0);
   n0inv32 = (uint32_t)((-(uint64_t)n0inv) & 0xffffffffu);
@@ -429,6 +441,13 @@ struct ResultItem {
   uint32_t pad[3];
 };
 
+struct TimingItem {
+  double wall_ms;
+  double kernel_ms;
+  int64_t epoch_start_ms;
+  int64_t epoch_end_ms;
+};
+
 static constexpr int DATA_TAG   = 1;
 static constexpr int RESULT_TAG = 2;
 static constexpr int FINISH_TAG = 3;
@@ -472,6 +491,14 @@ int main(int argc, char** argv) {
     else if (key == "--B1") B1 = parse_u32(val);
     else if (key == "--blockSize") blockSize = parse_u32(val);
   }
+
+/* Use actual hostname as machine identifier (works across hostfile MPI) */
+char hostname_buf[256];
+if (gethostname(hostname_buf, sizeof(hostname_buf)) != 0) {
+  std::strncpy(hostname_buf, "unknown", sizeof(hostname_buf));
+}
+hostname_buf[sizeof(hostname_buf) - 1] = '\0';
+std::string machineId(hostname_buf);
 
   if (blockSize == 0 || blockSize > 1024) {
     if (!myrank) std::cerr << "blockSize must be in [1, 1024]" << std::endl;
@@ -549,11 +576,30 @@ int main(int argc, char** argv) {
       base += chunk_count[w];
     }
 
+    struct ChunkTiming {
+      int worker_rank;
+      int num_numbers;
+      int64_t master_dispatch_ms;
+      int64_t master_recv_ms;
+      double slave_wall_ms;
+      double slave_kernel_ms;
+      int64_t slave_epoch_start_ms;
+      int64_t slave_epoch_end_ms;
+    };
+    std::vector<ChunkTiming> chunk_timings;
+    chunk_timings.reserve(nworkers);
+
+    auto epoch_ms = [](auto tp) {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+        tp.time_since_epoch()).count();
+    };
+
     /* send chunks */
     for (int w = 0; w < nworkers; ++w) {
       int dst = w + 1;
       if (dst >= nproc) continue;
       int cnt = chunk_count[w];
+      int64_t dispatch_ms = epoch_ms(std::chrono::system_clock::now());
       MPI_Send(&cnt, 1, MPI_INT, dst, DATA_TAG, MPI_COMM_WORLD);
       if (cnt > 0) {
         std::vector<WorkItem> chunk(cnt);
@@ -562,10 +608,13 @@ int main(int argc, char** argv) {
         }
         MPI_Send(chunk.data(), cnt * sizeof(WorkItem), MPI_BYTE, dst, DATA_TAG, MPI_COMM_WORLD);
       }
+      chunk_timings.push_back({dst, cnt, dispatch_ms, 0, 0.0, 0.0, 0, 0});
     }
 
     /* receive results */
     std::vector<ResultItem> results(numNs);
+    double total_slave_wall_ms = 0.0;
+    double total_slave_kernel_ms = 0.0;
     int processed = 0;
     int nextPrint = 1000;
     for (int w = 0; w < nworkers; ++w) {
@@ -578,6 +627,16 @@ int main(int argc, char** argv) {
       for (int i = 0; i < cnt; ++i) {
         results[chunk_start[w] + i] = chunk_res[i];
       }
+      TimingItem timing;
+      MPI_Recv(&timing, sizeof(TimingItem), MPI_BYTE, dst, RESULT_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      int64_t recv_ms = epoch_ms(std::chrono::system_clock::now());
+      total_slave_wall_ms += timing.wall_ms;
+      total_slave_kernel_ms += timing.kernel_ms;
+      chunk_timings[w].master_recv_ms = recv_ms;
+      chunk_timings[w].slave_wall_ms = timing.wall_ms;
+      chunk_timings[w].slave_kernel_ms = timing.kernel_ms;
+      chunk_timings[w].slave_epoch_start_ms = timing.epoch_start_ms;
+      chunk_timings[w].slave_epoch_end_ms = timing.epoch_end_ms;
       processed += cnt;
       if (processed >= nextPrint) {
         std::cout << "[progress] " << processed << "/" << numNs << " done ("
@@ -597,13 +656,50 @@ int main(int argc, char** argv) {
 
     /* print results */
     bool anyFound = false;
+    double avg_slave_wall = 0.0;
+    double avg_slave_kernel = 0.0;
+    if (nworkers > 0) {
+      avg_slave_wall = total_slave_wall_ms / nworkers;
+      avg_slave_kernel = total_slave_kernel_ms / nworkers;
+    }
     std::cout << std::fixed << std::setprecision(3)
               << "batchSize=" << numNs
               << ",B1=" << B1
               << ",blockSize=" << blockSize
               << ",nproc=" << nproc
               << ",wall_ms=" << wall_ms
+              << ",slave_wall_ms=" << avg_slave_wall
+              << ",slave_kernel_ms=" << avg_slave_kernel
               << "\n";
+
+    /* dump per-chunk timing CSV for easy correlation with listener/power logs */
+    {
+      auto epoch_ms = [](auto tp) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+          tp.time_since_epoch()).count();
+      };
+      auto epoch0 = std::chrono::system_clock::now();
+      long long file_epoch_ms = epoch_ms(epoch0);
+      std::ostringstream csvName;
+      csvName << "mpi_pollard_chunks_" << machineId << "_" << file_epoch_ms << ".csv";
+      std::ofstream csv(csvName.str());
+      if (csv.is_open()) {
+        csv << "machine_id,chunk_index,worker_rank,num_numbers,"
+            << "master_dispatch_ms,master_recv_ms,"
+            << "slave_wall_ms,slave_kernel_ms,"
+            << "slave_epoch_start_ms,slave_epoch_end_ms\n";
+        for (size_t i = 0; i < chunk_timings.size(); ++i) {
+          const auto& ct = chunk_timings[i];
+          csv << machineId << "," << i << "," << ct.worker_rank << ","
+              << ct.num_numbers << ","
+              << ct.master_dispatch_ms << "," << ct.master_recv_ms << ","
+              << std::fixed << std::setprecision(3) << ct.slave_wall_ms << ","
+              << ct.slave_kernel_ms << ","
+              << ct.slave_epoch_start_ms << "," << ct.slave_epoch_end_ms << "\n";
+        }
+        std::cout << "[MPI] Wrote per-chunk timing CSV: " << csvName.str() << std::endl;
+      }
+    }
 
     for (uint32_t n = 0; n < numNs; ++n) {
       const auto& r = results[n];
@@ -685,6 +781,9 @@ int main(int argc, char** argv) {
         for (uint32_t pp : primePowers) h_io[off++] = pp;
         /* output + state areas already zero-initialized */
 
+        const auto slave_wall0 = std::chrono::steady_clock::now();
+        const auto slave_epoch0 = std::chrono::system_clock::now();
+
         /* device memory */
         uint32_t* d_io = nullptr;
         CUDA_CHECK(cudaMalloc(&d_io, totalWords * sizeof(uint32_t)));
@@ -700,7 +799,11 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaEventSynchronize(ev1));
         CUDA_CHECK(cudaGetLastError());
 
+        float slave_kernel_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&slave_kernel_ms, ev0, ev1));
+
         CUDA_CHECK(cudaMemcpy(h_io.data(), d_io, totalWords * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        const auto slave_wall1 = std::chrono::steady_clock::now();
 
         CUDA_CHECK(cudaFree(d_io));
         CUDA_CHECK(cudaEventDestroy(ev0));
@@ -717,6 +820,27 @@ int main(int argc, char** argv) {
         }
 
         MPI_Send(chunk_res.data(), cnt * sizeof(ResultItem), MPI_BYTE, 0, RESULT_TAG, MPI_COMM_WORLD);
+
+        const auto slave_epoch1 = std::chrono::system_clock::now();
+        double slave_wall_ms = std::chrono::duration<double, std::milli>(slave_wall1 - slave_wall0).count();
+        auto epoch_ms = [](auto tp) {
+          return std::chrono::duration_cast<std::chrono::milliseconds>(
+            tp.time_since_epoch()).count();
+        };
+        TimingItem timing{
+          slave_wall_ms,
+          static_cast<double>(slave_kernel_ms),
+          epoch_ms(slave_epoch0),
+          epoch_ms(slave_epoch1)
+        };
+        MPI_Send(&timing, sizeof(TimingItem), MPI_BYTE, 0, RESULT_TAG, MPI_COMM_WORLD);
+
+        std::cout << "[MPI_TIMING] epoch_start_ms=" << timing.epoch_start_ms
+                  << " epoch_end_ms=" << timing.epoch_end_ms
+                  << " slave_wall_ms=" << std::fixed << std::setprecision(3) << slave_wall_ms
+                  << " slave_kernel_ms=" << slave_kernel_ms
+                  << " chunk_size=" << cnt
+                  << " rank=" << myrank << std::endl;
       }
     } while (status.MPI_TAG != FINISH_TAG);
   }

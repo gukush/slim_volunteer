@@ -1,5 +1,5 @@
 NVCC = nvcc
-NVCCFLAGS = -O2 -arch=sm_75
+NVCCFLAGS = -O2 -arch=sm_89
 
 # Tell nvcc to use mpicxx as the host compiler so MPI headers/libs are found.
 # Remove -arch=sm_75 or change it (e.g. sm_86) to match your GPU architecture.
