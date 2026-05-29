@@ -131,23 +131,29 @@ export function createExecutor({ kernels, config, inputArgs }) {
       label: 'torus-grid-rl-rewards',
       size: rewards.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
     });
-    device.queue.writeBuffer(rewardsBuf, 0, rewards);
+    new Float32Array(rewardsBuf.getMappedRange()).set(rewards);
+    rewardsBuf.unmap();
 
     const weightsBuf = device.createBuffer({
       label: 'torus-grid-rl-weights',
       size: fixedWeights.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
     });
-    device.queue.writeBuffer(weightsBuf, 0, fixedWeights);
+    new Int32Array(weightsBuf.getMappedRange()).set(fixedWeights);
+    weightsBuf.unmap();
 
     const stats = new Uint32Array(4);
     const statsBuf = device.createBuffer({
       label: 'torus-grid-rl-stats',
       size: stats.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
     });
-    device.queue.writeBuffer(statsBuf, 0, stats);
+    new Uint32Array(statsBuf.getMappedRange()).set(stats);
+    statsBuf.unmap();
 
     const maxDim = device.limits.maxComputeWorkgroupsPerDimension;
     const totalGroups = Math.ceil(trajectories / workgroupSize);
@@ -169,8 +175,10 @@ export function createExecutor({ kernels, config, inputArgs }) {
       label: 'torus-grid-rl-config',
       size: configWords.byteLength,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      mappedAtCreation: true,
     });
-    device.queue.writeBuffer(configBuf, 0, configWords);
+    new Uint32Array(configBuf.getMappedRange()).set(configWords);
+    configBuf.unmap();
 
     const readSize = fixedWeights.byteLength + stats.byteLength;
     const readBuf = device.createBuffer({
