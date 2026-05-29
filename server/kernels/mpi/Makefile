@@ -12,7 +12,7 @@ MAX_BLOCKS     = 16
 MAX_GRID_H     = 32
 RL_DEFS = -DMAX_STATE_DIM=$(MAX_STATE_DIM) -DMAX_HIDDEN_DIM=$(MAX_HIDDEN_DIM) -DMAX_ACTION_DIM=$(MAX_ACTION_DIM) -DMAX_BLOCKS=$(MAX_BLOCKS) -DMAX_GRID_H=$(MAX_GRID_H)
 
-TARGETS = mpi_goldbach_verify mpi_pollard_pminus1 mpi_gridpack_2d_rl
+TARGETS = mpi_goldbach_verify mpi_pollard_pminus1 mpi_gridpack_2d_rl mpi_torus_grid_rl
 
 all: $(TARGETS)
 
@@ -24,6 +24,9 @@ mpi_pollard_pminus1: mpi_pollard_pminus1.cu
 
 mpi_gridpack_2d_rl: mpi_gridpack_2d_rl.cu
 	$(NVCC) $(NVCCFLAGS) $(MPICC_FLAGS) $(RL_DEFS) $< -o $@ -lmpi
+
+mpi_torus_grid_rl: mpi_torus_grid_rl.cu
+	$(NVCC) $(NVCCFLAGS) $(MPICC_FLAGS) $< -o $@ -lmpi
 
 # Convenience run targets (edit -np and args for your cluster)
 run-goldbach:
@@ -37,6 +40,10 @@ run-gridpack:
 	  --gridW=16 --gridH=16 --numBlocks=6 \
 	  --numThreads=1024 --rollouts=128 --rounds=1 --sigma=0.01 --lr=0.001 \
 	  --mlpHiddenDim=32 --actionRegions=8
+
+run-torus-grid-rl:
+	mpirun --bind-to none -np 4 ./mpi_torus_grid_rl \
+	  --totalTrajectories=65536 --chunkSize=1024 --blockSize=128
 
 clean:
 	rm -f $(TARGETS)
