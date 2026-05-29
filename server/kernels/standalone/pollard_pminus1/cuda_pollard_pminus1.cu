@@ -112,6 +112,31 @@ __host__ __device__ static inline U256 u256_rshift1(const U256& a) {
   return r;
 }
 
+__host__ static inline uint32_t u256_get_bit(const U256& a, int bit) {
+  return (a.limbs[bit / 32] >> (bit % 32)) & 1u;
+}
+
+__host__ static inline U256 u256_shl1_add_bit(const U256& a, uint32_t bit) {
+  U256 r;
+  uint32_t carry = bit & 1u;
+  for (int i = 0; i < 8; ++i) {
+    uint32_t nextCarry = a.limbs[i] >> 31;
+    r.limbs[i] = (a.limbs[i] << 1) | carry;
+    carry = nextCarry;
+  }
+  return r;
+}
+
+__host__ static inline U256 u256_mod(const U256& a, const U256& m) {
+  U256 r = u256_zero();
+  if (u256_is_zero(m)) return r;
+  for (int bit = 255; bit >= 0; --bit) {
+    r = u256_shl1_add_bit(r, u256_get_bit(a, bit));
+    if (u256_cmp(r, m) >= 0) r = u256_sub(r, m);
+  }
+  return r;
+}
+
 __host__ __device__ static inline U256 cond_sub_N(const U256& a, const U256& N) {
   if (u256_cmp(a, N) >= 0) return u256_sub(a, N);
   return a;
@@ -604,8 +629,10 @@ int main(int argc, char** argv) {
   std::cout << std::fixed << std::setprecision(3)
             << "batchSize=" << numNs
             << ",B1=" << B1
+            << ",ppCount=" << primePowers.size()
             << ",startBase=" << startBase
             << ",totalBases=" << totalBases
+            << ",totalThreads=" << totalThreads
             << ",blockSize=" << blockSize
             << ",grid=" << grid
             << ",old_wall_ms=" << old_wall_ms
@@ -623,9 +650,14 @@ int main(int argc, char** argv) {
       if (status == 2u) {
         U256 f;
         for (int j = 0; j < 8; ++j) f.limbs[j] = h_io[base + j];
-        if (!u256_is_zero(f) && u256_cmp(f, u256_one()) > 0 && u256_cmp(f, num.reducedN) < 0) {
+        U256 rem = u256_mod(num.reducedN, f);
+        if (!u256_is_zero(f) && u256_cmp(f, u256_one()) > 0 && u256_cmp(f, num.reducedN) < 0 && u256_is_zero(rem)) {
           found = true;
           factors.push_back(u256_to_hex(f));
+        } else {
+          std::cerr << "Rejected invalid Pollard p-1 factor for N=" << num.original
+                    << ": factor=0x" << u256_to_hex(f)
+                    << ",status=" << status << std::endl;
         }
       }
     }

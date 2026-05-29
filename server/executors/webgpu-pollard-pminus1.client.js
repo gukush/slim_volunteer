@@ -110,11 +110,16 @@ export function createExecutor({ kernels }) {
       });
 
       // ----- RESUMABLE COMPUTATION LOOP (avoids browser TDR) -----
-      const TARGET_MS = 500; // target time per GPU submit
-      let pp_len = Math.min(500, ppCount);
+      const TARGET_MS = 2000; // target time per GPU submit
+      // Conservative initial pp_len: ~80 µs per prime power per thread on typical GPUs.
+      // Budget ~1 second for the first pass so we survive the TDR even on large chunks.
+      const initialPpLen = Math.max(1, Math.min(500, Math.floor(1000000 / (totalThreads * 80))));
+      let pp_len = Math.min(initialPpLen, ppCount);
       let pp_start = 0;
       let passCount = 0;
       const overallStart = performance.now();
+
+      console.log(`Pollard p-1 starting: ${ppCount} pp, ${totalThreads} threads, initial pp_len=${pp_len}`);
 
       while (pp_start < ppCount) {
         const currentPpLen = Math.min(pp_len, ppCount - pp_start);
@@ -158,7 +163,7 @@ export function createExecutor({ kernels }) {
           if (cpuTime < TARGET_MS / 2 && pp_len < ppCount / 10) {
             pp_len = Math.min(pp_len * 2, 10000);
           } else if (cpuTime > TARGET_MS * 1.5) {
-            pp_len = Math.max(Math.floor(pp_len * TARGET_MS / cpuTime), 100);
+            pp_len = Math.max(Math.floor(pp_len * TARGET_MS / cpuTime), 1);
           }
         }
       }

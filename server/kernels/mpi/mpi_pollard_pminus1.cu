@@ -174,9 +174,12 @@ __host__ __device__ static inline U256 add_u256(const U256& a, const U256& b) {
   U256 r = u256_zero();
   uint32_t c = 0;
   for (int i = 0; i < 8; ++i) {
-    uint64_t s = (uint64_t)a.limbs[i] + b.limbs[i] + c;
-    r.limbs[i] = (uint32_t)(s & 0xffffffffu);
-    c = (s > 0xffffffffu) ? 1 : 0;
+    uint32_t s = a.limbs[i] + b.limbs[i];
+    uint32_t c1 = (s < a.limbs[i]) ? 1u : 0u;
+    uint32_t s2 = s + c;
+    uint32_t c2 = (s2 < c) ? 1u : 0u;
+    r.limbs[i] = s2;
+    c = c1 + c2;
   }
   return r;
 }
@@ -185,9 +188,12 @@ __host__ __device__ static inline U256 sub_u256(const U256& a, const U256& b) {
   U256 r = u256_zero();
   uint32_t br = 0;
   for (int i = 0; i < 8; ++i) {
-    uint64_t d = (uint64_t)a.limbs[i] - b.limbs[i] - br;
-    r.limbs[i] = (uint32_t)(d & 0xffffffffu);
-    br = (d > 0xffffffffu) ? 1 : 0;
+    uint32_t d = a.limbs[i] - b.limbs[i];
+    uint32_t b1 = (a.limbs[i] < b.limbs[i]) ? 1u : 0u;
+    uint32_t d2 = d - br;
+    uint32_t b2 = (d < br) ? 1u : 0u;
+    r.limbs[i] = d2;
+    br = b1 | b2;
   }
   return r;
 }
@@ -258,18 +264,43 @@ __host__ static inline void compute_montgomery_constants(const U256& N, U256& R2
 /* ------------------------------------------------------------------ */
 
 __device__ static inline uint2 mul32x32_64(uint32_t a, uint32_t b) {
-  uint64_t p = (uint64_t)a * b;
-  return make_uint2((uint32_t)(p & 0xffffffffu), (uint32_t)(p >> 32u));
+  uint32_t a0 = a & 0xffffu;
+  uint32_t a1 = a >> 16;
+  uint32_t b0 = b & 0xffffu;
+  uint32_t b1 = b >> 16;
+  uint32_t p00 = a0 * b0;
+  uint32_t p01 = a0 * b1;
+  uint32_t p10 = a1 * b0;
+  uint32_t p11 = a1 * b1;
+
+  // Catch 33rd-bit overflow from p01 + p10
+  uint32_t mid_sum = p10 + p01;
+  uint32_t mid_carry = (mid_sum < p10) ? 1u : 0u;
+
+  // Add shifted middle sum to p00, catch carry into upper 32-bits
+  uint32_t lo = p00 + (mid_sum << 16u);
+  uint32_t lo_carry = (lo < p00) ? 1u : 0u;
+
+  // Assemble high 32 bits
+  uint32_t hi = p11 + (mid_sum >> 16u) + (mid_carry << 16u) + lo_carry;
+
+  return make_uint2(lo, hi);
 }
 
 __device__ static inline uint2 addc_d(uint32_t a, uint32_t b, uint32_t cin) {
-  uint64_t s = (uint64_t)a + b + cin;
-  return make_uint2((uint32_t)(s & 0xffffffffu), (s > 0xffffffffu) ? 1u : 0u);
+  uint32_t s = a + b;
+  uint32_t c1 = (s < a) ? 1u : 0u;
+  uint32_t s2 = s + cin;
+  uint32_t c2 = (s2 < cin) ? 1u : 0u;
+  return make_uint2(s2, c1 + c2);
 }
 
 __device__ static inline uint2 subb_d(uint32_t a, uint32_t b, uint32_t bin) {
-  uint64_t d = (uint64_t)a - b - bin;
-  return make_uint2((uint32_t)(d & 0xffffffffu), (d > 0xffffffffu) ? 1u : 0u);
+  uint32_t d = a - b;
+  uint32_t b1 = (a < b) ? 1u : 0u;
+  uint32_t d2 = d - bin;
+  uint32_t b2 = (d < bin) ? 1u : 0u;
+  return make_uint2(d2, (b1 | b2));
 }
 
 __device__ static inline U256 mont_mul_dev(const U256& a, const U256& b, const U256& N, uint32_t n0inv32) {
