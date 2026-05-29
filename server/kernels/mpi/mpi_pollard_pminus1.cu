@@ -81,6 +81,33 @@ __host__ __device__ static inline U256 u256_rshift1(const U256& a) {
   return r;
 }
 
+__host__ __device__ static inline U256 sub_u256(const U256& a, const U256& b);
+
+__host__ static inline uint32_t u256_get_bit(const U256& a, int bit) {
+  return (a.limbs[bit / 32] >> (bit % 32)) & 1u;
+}
+
+__host__ static inline U256 u256_shl1_add_bit(const U256& a, uint32_t bit) {
+  U256 r = u256_zero();
+  uint32_t carry = bit & 1u;
+  for (int i = 0; i < 8; ++i) {
+    uint32_t nextCarry = a.limbs[i] >> 31;
+    r.limbs[i] = (a.limbs[i] << 1) | carry;
+    carry = nextCarry;
+  }
+  return r;
+}
+
+__host__ static inline U256 u256_mod_checked(const U256& a, const U256& m) {
+  U256 r = u256_zero();
+  if (u256_is_zero(m)) return r;
+  for (int bit = 255; bit >= 0; --bit) {
+    r = u256_shl1_add_bit(r, u256_get_bit(a, bit));
+    if (u256_cmp(r, m) >= 0) r = sub_u256(r, m);
+  }
+  return r;
+}
+
 __host__ static inline U256 parse_bigint(const std::string& s) {
   U256 r = u256_zero();
   if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
@@ -553,12 +580,17 @@ std::string machineId(hostname_buf);
   /* ---------- Master ---------- */
   if (!myrank) {
     std::vector<U256> numbers(numNs);
+    std::vector<U256> reducedNumbers(numNs);
     for (uint32_t n = 0; n < numNs; ++n) {
       numbers[n] = parse_bigint(ns_str[n]);
       if (u256_cmp(numbers[n], u256_from_u32(4)) < 0) {
         std::cerr << "N=" << ns_str[n] << " must be >= 4" << std::endl;
         MPI_Finalize();
         return 2;
+      }
+      reducedNumbers[n] = numbers[n];
+      while (u256_is_even(reducedNumbers[n])) {
+        reducedNumbers[n] = u256_rshift1(reducedNumbers[n]);
       }
     }
 
@@ -667,6 +699,7 @@ std::string machineId(hostname_buf);
     std::cout << std::fixed << std::setprecision(3)
               << "batchSize=" << numNs
               << ",B1=" << B1
+              << ",ppCount=" << primePowers.size()
               << ",blockSize=" << blockSize
               << ",nproc=" << nproc
               << ",wall_ms=" << wall_ms
@@ -707,9 +740,14 @@ std::string machineId(hostname_buf);
       if (r.status == 2u) {
         U256 f;
         for (int j = 0; j < 8; ++j) f.limbs[j] = r.factor_limbs[j];
-        if (!u256_is_zero(f) && u256_cmp(f, u256_one()) > 0) {
+        U256 rem = u256_mod_checked(reducedNumbers[n], f);
+        if (!u256_is_zero(f) && u256_cmp(f, u256_one()) > 0 && u256_cmp(f, reducedNumbers[n]) < 0 && u256_is_zero(rem)) {
           found = true;
           factorStr = u256_to_hex(f);
+        } else {
+          std::cerr << "Rejected invalid Pollard p-1 factor for N=" << ns_str[n]
+                    << ": factor=0x" << u256_to_hex(f)
+                    << ",status=" << r.status << std::endl;
         }
       }
       if (found) anyFound = true;

@@ -1,4 +1,4 @@
-# Makefile for GridPack-2D RL standalone CUDA and MPI builds
+# Makefile for GridPack-2D RL standalone CUDA build
 #
 # Adjust ARCH to match your GPU (e.g. sm_70 for V100, sm_80 for A100, sm_89 for RTX 4090)
 ARCH ?= sm_89
@@ -11,16 +11,9 @@ MAX_ACTION_DIM ?= 256
 # CUDA compiler
 NVCC ?= nvcc
 
-# MPI compiler wrapper (usually mpicxx or mpicc)
-MPICXX ?= mpicxx
-
 # Common flags
 CUDA_FLAGS = -O3 -arch=$(ARCH) -DMAX_STATE_DIM=$(MAX_STATE_DIM) -DMAX_HIDDEN_DIM=$(MAX_HIDDEN_DIM) -DMAX_ACTION_DIM=$(MAX_ACTION_DIM)
 CXX_FLAGS  = -std=c++17
-
-# Some MPI wrappers (e.g. on clusters) are plain g++ without CUDA support.
-# In that case compile with nvcc and use the MPI wrapper as host compiler (-ccbin).
-HAS_CUDA_MPI := $(shell $(MPICXX) --version 2>/dev/null | grep -qi nvidia && echo yes || echo no)
 
 # -----------------------------------------------------------------------------
 # Standalone single-GPU target
@@ -29,21 +22,6 @@ standalone: gridpack-2d-rl-cuda
 
 gridpack-2d-rl-cuda: gridpack_2d_rl_cuda.cu
 	$(NVCC) $(CUDA_FLAGS) $(CXX_FLAGS) -o $@ $<
-
-# -----------------------------------------------------------------------------
-# MPI multi-GPU / multi-node target
-# -----------------------------------------------------------------------------
-mpi: gridpack-2d-rl-mpi
-
-ifeq ($(HAS_CUDA_MPI),yes)
-# mpicxx is CUDA-aware (e.g. OpenMPI built with CUDA)
-gridpack-2d-rl-mpi: gridpack_2d_rl_mpi.cu
-	$(MPICXX) -x cu $(CUDA_FLAGS) $(CXX_FLAGS) -o $@ $<
-else
-# mpicxx is plain g++; use nvcc with mpicxx as host compiler
-gridpack-2d-rl-mpi: gridpack_2d_rl_mpi.cu
-	$(NVCC) -ccbin $(MPICXX) $(CUDA_FLAGS) $(CXX_FLAGS) -o $@ $<
-endif
 
 # -----------------------------------------------------------------------------
 # Convenience: generate random theta + epsilon for testing (uses runtime dims)
@@ -61,23 +39,17 @@ epsilon.bin:
 	  np.random.normal(0,1,sz).astype('float32').tofile('epsilon.bin')"
 
 # -----------------------------------------------------------------------------
-# Test runs (requires GPU)
+# Test run (requires GPU)
 # -----------------------------------------------------------------------------
-test-standalone: gridpack-2d-rl-cuda theta.bin epsilon.bin
+test: gridpack-2d-rl-cuda theta.bin epsilon.bin
 	./gridpack-2d-rl-cuda \
 	  --gridW=16 --gridH=16 --numBlocks=6 \
 	  --theta=theta.bin --epsilon=epsilon.bin \
 	  --numThreads=256 --rollouts=64 --mode=0 --seed=12345 \
 	  --mlpHiddenDim=32 --actionRegions=8
 
-test-mpi: gridpack-2d-rl-mpi
-	mpirun -np 4 ./gridpack-2d-rl-mpi \
-	  --gridW=16 --gridH=16 --numBlocks=6 \
-	  --numThreads=1024 --rollouts=128 --rounds=5 --sigma=0.01 --lr=0.001 \
-	  --mlpHiddenDim=32 --actionRegions=8
-
 # -----------------------------------------------------------------------------
 clean:
-	rm -f gridpack-2d-rl-cuda gridpack-2d-rl-mpi theta.bin epsilon.bin *.bin
+	rm -f gridpack-2d-rl-cuda theta.bin epsilon.bin *.bin
 
-.PHONY: standalone mpi test-standalone test-mpi clean
+.PHONY: standalone test clean
