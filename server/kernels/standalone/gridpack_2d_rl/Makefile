@@ -18,6 +18,10 @@ MPICXX ?= mpicxx
 CUDA_FLAGS = -O3 -arch=$(ARCH) -DMAX_STATE_DIM=$(MAX_STATE_DIM) -DMAX_HIDDEN_DIM=$(MAX_HIDDEN_DIM) -DMAX_ACTION_DIM=$(MAX_ACTION_DIM)
 CXX_FLAGS  = -std=c++17
 
+# Some MPI wrappers (e.g. on clusters) are plain g++ without CUDA support.
+# In that case compile with nvcc and use the MPI wrapper as host compiler (-ccbin).
+HAS_CUDA_MPI := $(shell $(MPICXX) --version 2>/dev/null | grep -qi nvidia && echo yes || echo no)
+
 # -----------------------------------------------------------------------------
 # Standalone single-GPU target
 # -----------------------------------------------------------------------------
@@ -31,8 +35,15 @@ gridpack-2d-rl-cuda: gridpack_2d_rl_cuda.cu
 # -----------------------------------------------------------------------------
 mpi: gridpack-2d-rl-mpi
 
+ifeq ($(HAS_CUDA_MPI),yes)
+# mpicxx is CUDA-aware (e.g. OpenMPI built with CUDA)
 gridpack-2d-rl-mpi: gridpack_2d_rl_mpi.cu
 	$(MPICXX) -x cu $(CUDA_FLAGS) $(CXX_FLAGS) -o $@ $<
+else
+# mpicxx is plain g++; use nvcc with mpicxx as host compiler
+gridpack-2d-rl-mpi: gridpack_2d_rl_mpi.cu
+	$(NVCC) -ccbin $(MPICXX) $(CUDA_FLAGS) $(CXX_FLAGS) -o $@ $<
+endif
 
 # -----------------------------------------------------------------------------
 # Convenience: generate random theta + epsilon for testing (uses runtime dims)
