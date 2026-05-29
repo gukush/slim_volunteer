@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -48,17 +49,26 @@ using f32 = float;
 #define MAX_STATE_DIM 8
 #endif
 #ifndef MAX_HIDDEN_DIM
-#define MAX_HIDDEN_DIM 128
+#define MAX_HIDDEN_DIM 32
 #endif
 #ifndef MAX_ACTION_DIM
-#define MAX_ACTION_DIM 256
+#define MAX_ACTION_DIM 64
 #endif
 #ifndef MAX_BLOCKS
-#define MAX_BLOCKS 32
+#define MAX_BLOCKS 16
 #endif
 #ifndef MAX_GRID_H
-#define MAX_GRID_H 64
+#define MAX_GRID_H 32
 #endif
+
+static constexpr u32 STATE_DIM = 8;
+static constexpr u32 HIDDEN_DIM = 32;
+static constexpr u32 ACTION_REGIONS = 8;
+static constexpr u32 ACTION_DIM = ACTION_REGIONS * ACTION_REGIONS;
+static constexpr u32 L1_BIAS_OFF = STATE_DIM * HIDDEN_DIM;
+static constexpr u32 L2_WEIGHTS_OFF = L1_BIAS_OFF + HIDDEN_DIM;
+static constexpr u32 L2_BIAS_OFF = L2_WEIGHTS_OFF + HIDDEN_DIM * ACTION_DIM;
+static constexpr u32 THETA_SIZE = L2_BIAS_OFF + ACTION_DIM;
 
 // ------------------------------------------------------------------
 // Device RNG: match the WebGPU single-word xorshift path.
@@ -103,36 +113,29 @@ __device__ inline void place(u32* g, u32 x, u32 y, u32 w, u32 h) {
 }
 
 // ------------------------------------------------------------------
-// MLP forward pass (runtime dimensions, max-cap arrays)
+// MLP forward pass: fixed 8 -> 32 -> 64 architecture, thetaSize=2400.
 // ------------------------------------------------------------------
 struct BlockDef { u32 w, h; };
 
 __device__ void mlpForward(const f32* theta, const f32* epsilon, f32 sigma, bool useEps,
-                           u32 stateDim, u32 hiddenDim, u32 actionDim,
                            const f32* st, f32* logits) {
-    f32 hidden[MAX_HIDDEN_DIM];
-    // Layer 1: stateDim -> hiddenDim
-    u32 b1Size = stateDim * hiddenDim;
-    u32 b1BiasOff = b1Size;
-    for (u32 i = 0; i < hiddenDim; ++i) {
-        f32 sum = theta[b1BiasOff + i];
-        if (useEps) sum += sigma * epsilon[b1BiasOff + i];
-        for (u32 j = 0; j < stateDim; ++j) {
-            f32 w = theta[i * stateDim + j];
-            if (useEps) w += sigma * epsilon[i * stateDim + j];
+    f32 hidden[HIDDEN_DIM];
+    for (u32 i = 0; i < HIDDEN_DIM; ++i) {
+        f32 sum = theta[L1_BIAS_OFF + i];
+        if (useEps) sum += sigma * epsilon[L1_BIAS_OFF + i];
+        for (u32 j = 0; j < STATE_DIM; ++j) {
+            f32 w = theta[i * STATE_DIM + j];
+            if (useEps) w += sigma * epsilon[i * STATE_DIM + j];
             sum += st[j] * w;
         }
         hidden[i] = fmaxf(sum, 0.0f);
     }
-    // Layer 2: hiddenDim -> actionDim
-    u32 l2Off = b1Size + hiddenDim;
-    u32 b2BiasOff = l2Off + hiddenDim * actionDim;
-    for (u32 i = 0; i < actionDim; ++i) {
-        f32 sum = theta[b2BiasOff + i];
-        if (useEps) sum += sigma * epsilon[b2BiasOff + i];
-        for (u32 j = 0; j < hiddenDim; ++j) {
-            f32 w = theta[l2Off + i * hiddenDim + j];
-            if (useEps) w += sigma * epsilon[l2Off + i * hiddenDim + j];
+    for (u32 i = 0; i < ACTION_DIM; ++i) {
+        f32 sum = theta[L2_BIAS_OFF + i];
+        if (useEps) sum += sigma * epsilon[L2_BIAS_OFF + i];
+        for (u32 j = 0; j < HIDDEN_DIM; ++j) {
+            f32 w = theta[L2_WEIGHTS_OFF + i * HIDDEN_DIM + j];
+            if (useEps) w += sigma * epsilon[L2_WEIGHTS_OFF + i * HIDDEN_DIM + j];
             sum += hidden[j] * w;
         }
         logits[i] = sum;
@@ -142,30 +145,29 @@ __device__ void mlpForward(const f32* theta, const f32* epsilon, f32 sigma, bool
 // ------------------------------------------------------------------
 // Action sampling (softmax over actionDim regions)
 // ------------------------------------------------------------------
-__device__ void sampleAction(const f32* logits, RngState* rng, u32 actionDim, u32 gw, u32 gh, u32& px, u32& py) {
+__device__ void sampleAction(const f32* logits, RngState* rng, u32 gw, u32 gh, u32& px, u32& py) {
     f32 mx = logits[0];
-    for (u32 i = 1; i < actionDim; ++i) {
+    for (u32 i = 1; i < ACTION_DIM; ++i) {
         if (logits[i] > mx) mx = logits[i];
     }
     f32 expSum = 0.0f;
-    f32 probs[MAX_ACTION_DIM];
-    for (u32 i = 0; i < actionDim; ++i) {
-        f32 e = expf(logits[i] - mx);
+    f32 probs[ACTION_DIM];
+    for (u32 i = 0; i < ACTION_DIM; ++i) {
+        f32 e = __expf(logits[i] - mx);
         probs[i] = e;
         expSum += e;
     }
     f32 r = randF01(rng) * expSum;
     f32 c = 0.0f;
     u32 a = 0;
-    for (u32 i = 0; i < actionDim; ++i) {
+    for (u32 i = 0; i < ACTION_DIM; ++i) {
         c += probs[i];
         if (c >= r) { a = i; break; }
     }
-    u32 regionCount = u32(sqrtf(f32(actionDim)) + 0.5f);
-    u32 rx = a % regionCount;
-    u32 ry = a / regionCount;
-    u32 rw = max(1u, gw / regionCount);
-    u32 rh = max(1u, gh / regionCount);
+    u32 rx = a % ACTION_REGIONS;
+    u32 ry = a / ACTION_REGIONS;
+    u32 rw = max(1u, gw / ACTION_REGIONS);
+    u32 rh = max(1u, gh / ACTION_REGIONS);
     px = rx * rw + u32(randF01(rng) * f32(rw));
     py = ry * rh + u32(randF01(rng) * f32(rh));
     if (px >= gw) px = gw - 1;
@@ -176,7 +178,7 @@ __device__ void sampleAction(const f32* logits, RngState* rng, u32 actionDim, u3
 // Feature extraction
 // ------------------------------------------------------------------
 __device__ void extractFeatures(const u32* g, u32 gw, u32 gh, u32 bw, u32 bh,
-                                u32 left, u32 total, u32 stateDim, f32* feat) {
+                                u32 left, u32 total, f32* feat) {
     u32 occ = 0;
     for (u32 y = 0; y < gh; ++y) occ += __popc(g[y]);
     u32 mix = gw, miy = gh, mxx = 0, myy = 0;
@@ -211,7 +213,6 @@ __device__ void extractFeatures(const u32* g, u32 gw, u32 gh, u32 bw, u32 bh,
 // Single rollout
 // ------------------------------------------------------------------
 __device__ f32 rollout(u32 rolloutSeed, u32 gw, u32 gh, u32 nb, u32 ma, u32 ar,
-                       u32 stateDim, u32 hiddenDim, u32 actionDim,
                        const BlockDef* blocks, const f32* theta, const f32* epsilon,
                        f32 sigma, bool useEps) {
     RngState rng{rolloutSeed};
@@ -227,14 +228,14 @@ __device__ f32 rollout(u32 rolloutSeed, u32 gw, u32 gh, u32 nb, u32 ma, u32 ar,
             u32 t = bw; bw = bh; bh = t;
             if (bw > gw || bh > gh) { t = bw; bw = bh; bh = t; }
         }
-        f32 feat[MAX_STATE_DIM];
-        extractFeatures(grid, gw, gh, bw, bh, nb - b, nb, stateDim, feat);
-        f32 logits[MAX_ACTION_DIM];
-        mlpForward(theta, epsilon, sigma, useEps, stateDim, hiddenDim, actionDim, feat, logits);
+        f32 feat[STATE_DIM];
+        extractFeatures(grid, gw, gh, bw, bh, nb - b, nb, feat);
+        f32 logits[ACTION_DIM];
+        mlpForward(theta, epsilon, sigma, useEps, feat, logits);
         bool placed = false;
         for (u32 a = 0; a < ma; ++a) {
             u32 px, py;
-            sampleAction(logits, &rng, actionDim, gw, gh, px, py);
+            sampleAction(logits, &rng, gw, gh, px, py);
             if (canPlace(grid, px, py, bw, bh, gw, gh)) {
                 place(grid, px, py, bw, bh);
                 placed = true;
@@ -272,7 +273,7 @@ __device__ f32 rollout(u32 rolloutSeed, u32 gw, u32 gh, u32 nb, u32 ma, u32 ar,
 // ------------------------------------------------------------------
 __global__ void gridpackKernel(u32 numThreads, u32 numRollouts, u32 gw, u32 gh,
                                u32 nb, u32 ma, u32 ar, u32 baseSeed, f32 sigma,
-                               u32 mode, u32 stateDim, u32 hiddenDim, u32 actionDim,
+                               u32 mode,
                                const BlockDef* blocks,
                                const f32* theta, const f32* epsilon,
                                f32* outMean, u32* outValid) {
@@ -287,8 +288,7 @@ __global__ void gridpackKernel(u32 numThreads, u32 numRollouts, u32 gw, u32 gh,
     u32 validN = 0;
     for (u32 r = 0; r < numRollouts; ++r) {
         u32 rs = randU32(&rng);
-        f32 reward = rollout(rs, gw, gh, nb, ma, ar, stateDim, hiddenDim, actionDim,
-                             blocks, theta, epsilon, sigma, useEps);
+        f32 reward = rollout(rs, gw, gh, nb, ma, ar, blocks, theta, epsilon, sigma, useEps);
         if (reward > 0.0f) { sumR += reward; validN++; }
     }
     outMean[idx] = (validN > 0) ? (sumR / f32(validN)) : -1.0f;
@@ -312,6 +312,42 @@ static bool parseBlocks(const std::string& s, std::vector<BlockDef>& out) {
     return true;
 }
 
+static std::vector<BlockDef> generateBlocks(u32 numBlocks, u32 minSize, u32 maxSize, u32& rng) {
+    std::vector<BlockDef> out;
+    auto xorshift = [&rng]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        return (rng % 0x7FFFFFFFu);
+    };
+    u32 range = maxSize - minSize + 1;
+    for (u32 i = 0; i < numBlocks; ++i) {
+        u32 w = minSize + (xorshift() % range);
+        u32 h = minSize + (xorshift() % range);
+        out.push_back({w, h});
+    }
+    return out;
+}
+
+static void ensureFitsGrid(std::vector<BlockDef>& blocks, u32 gridW, u32 gridH) {
+    u32 maxArea = gridW * gridH;
+    u32 totalArea = 0;
+    for (const auto& b : blocks) totalArea += b.w * b.h;
+
+    if (totalArea > maxArea && totalArea > 0) {
+        f32 scale = std::sqrt(f32(maxArea) / (f32(totalArea) * 1.2f));
+        for (auto& b : blocks) {
+            b.w = std::max(1u, static_cast<u32>(std::floor(f32(b.w) * scale)));
+            b.h = std::max(1u, static_cast<u32>(std::floor(f32(b.h) * scale)));
+        }
+    }
+
+    for (auto& b : blocks) {
+        if (b.w > gridW) b.w = gridW;
+        if (b.h > gridH) b.h = gridH;
+    }
+}
+
 static std::vector<f32> readFloatFile(const std::string& path, size_t expected) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { std::cerr << "Cannot open: " << path << std::endl; std::exit(1); }
@@ -332,6 +368,8 @@ static void printUsage(const char* name) {
               << "  --gridW=N            Grid width (default 16)\n"
               << "  --gridH=N            Grid height (default 16)\n"
               << "  --numBlocks=N        Number of blocks (default 6)\n"
+              << "  --minBlockSize=N     Minimum generated block edge (default 2)\n"
+              << "  --maxBlockSize=N     Maximum generated block edge (default 6)\n"
               << "  --blocks=W1,H1,W2,H2,...  Block sizes (comma-separated)\n"
               << "  --theta=FILE         Binary float32 theta weights\n"
               << "  --epsilon=FILE       Binary float32 epsilon noise\n"
@@ -342,8 +380,8 @@ static void printUsage(const char* name) {
               << "  --mode=0|1           0=base, 1=perturbed (default 0)\n"
               << "  --sigma=F            ES noise scale (default 0.01)\n"
               << "  --seed=N             Random seed (default 12345)\n"
-              << "  --mlpHiddenDim=N     MLP hidden layer size (default 32)\n"
-              << "  --actionRegions=N    Action region grid, actionDim = N^2 (default 8)\n"
+              << "  --mlpHiddenDim=32    Fixed MLP hidden layer size\n"
+              << "  --actionRegions=8    Fixed action region grid, actionDim=64\n"
               << "  --output=FILE        Output JSON file (default stdout)\n";
 }
 
@@ -352,6 +390,7 @@ static void printUsage(const char* name) {
 // ------------------------------------------------------------------
 int main(int argc, char** argv) {
     u32 gridW = 16, gridH = 16, numBlocks = 6;
+    u32 minBlockSize = 2, maxBlockSize = 6;
     u32 numThreads = 1024, numRollouts = 128, maxAttempts = 50;
     u32 allowRotation = 1, mode = 0, seed = 12345;
     u32 mlpHiddenDim = 32, actionRegions = 8;
@@ -365,6 +404,8 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--gridW=", 0) == 0) gridW = std::stoul(arg.substr(8));
         else if (arg.rfind("--gridH=", 0) == 0) gridH = std::stoul(arg.substr(8));
         else if (arg.rfind("--numBlocks=", 0) == 0) numBlocks = std::stoul(arg.substr(12));
+        else if (arg.rfind("--minBlockSize=", 0) == 0) minBlockSize = std::stoul(arg.substr(15));
+        else if (arg.rfind("--maxBlockSize=", 0) == 0) maxBlockSize = std::stoul(arg.substr(15));
         else if (arg.rfind("--blocks=", 0) == 0) {
             if (!parseBlocks(arg.substr(9), hostBlocks)) {
                 std::cerr << "Invalid --blocks format" << std::endl; return 1;
@@ -374,6 +415,7 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--epsilon=", 0) == 0) epsilonPath = arg.substr(10);
         else if (arg.rfind("--numThreads=", 0) == 0) numThreads = std::stoul(arg.substr(13));
         else if (arg.rfind("--rollouts=", 0) == 0) numRollouts = std::stoul(arg.substr(11));
+        else if (arg.rfind("--rolloutsPerThread=", 0) == 0) numRollouts = std::stoul(arg.substr(20));
         else if (arg.rfind("--maxAttempts=", 0) == 0) maxAttempts = std::stoul(arg.substr(14));
         else if (arg.rfind("--allowRotation=", 0) == 0) allowRotation = std::stoul(arg.substr(16));
         else if (arg.rfind("--mode=", 0) == 0) mode = std::stoul(arg.substr(7));
@@ -385,39 +427,49 @@ int main(int argc, char** argv) {
         else { std::cerr << "Unknown arg: " << arg << std::endl; return 1; }
     }
 
-    u32 actionDim = actionRegions * actionRegions;
-    if (mlpHiddenDim > MAX_HIDDEN_DIM) {
-        std::cerr << "mlpHiddenDim " << mlpHiddenDim << " exceeds compile-time MAX_HIDDEN_DIM " << MAX_HIDDEN_DIM << std::endl;
+    if (mlpHiddenDim != HIDDEN_DIM) {
+        std::cerr << "gridpack-2d-rl now uses fixed mlpHiddenDim=" << HIDDEN_DIM << "; got " << mlpHiddenDim << std::endl;
         return 1;
     }
-    if (actionDim > MAX_ACTION_DIM) {
-        std::cerr << "actionDim " << actionDim << " exceeds compile-time MAX_ACTION_DIM " << MAX_ACTION_DIM << std::endl;
+    if (actionRegions != ACTION_REGIONS) {
+        std::cerr << "gridpack-2d-rl now uses fixed actionRegions=" << ACTION_REGIONS << "; got " << actionRegions << std::endl;
         return 1;
     }
-    u32 stateDim = 8; // fixed
-    u32 thetaSize = stateDim * mlpHiddenDim + mlpHiddenDim + mlpHiddenDim * actionDim + actionDim;
+    if (gridW > MAX_GRID_H || gridH > MAX_GRID_H) {
+        std::cerr << "grid dimensions exceed MAX_GRID_H " << MAX_GRID_H << std::endl;
+        return 1;
+    }
+    if (numBlocks > MAX_BLOCKS) {
+        std::cerr << "numBlocks " << numBlocks << " exceeds MAX_BLOCKS " << MAX_BLOCKS << std::endl;
+        return 1;
+    }
+    if (minBlockSize == 0 || maxBlockSize < minBlockSize) {
+        std::cerr << "Invalid block size range" << std::endl;
+        return 1;
+    }
 
     if (hostBlocks.empty()) {
         u32 rng = seed;
-        for (u32 i = 0; i < numBlocks; ++i) {
-            u32 w = 2 + (rng % 5); rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-            u32 h = 2 + (rng % 5); rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-            hostBlocks.push_back({w, h});
-        }
+        hostBlocks = generateBlocks(numBlocks, minBlockSize, maxBlockSize, rng);
     }
+    ensureFitsGrid(hostBlocks, gridW, gridH);
     numBlocks = hostBlocks.size();
+    if (numBlocks > MAX_BLOCKS) {
+        std::cerr << "parsed block count " << numBlocks << " exceeds MAX_BLOCKS " << MAX_BLOCKS << std::endl;
+        return 1;
+    }
 
     // Load theta and epsilon
     std::vector<f32> hTheta, hEpsilon;
     if (thetaPath.empty()) {
-        hTheta.resize(thetaSize, 0.0f);
+        hTheta.resize(THETA_SIZE, 0.0f);
     } else {
-        hTheta = readFloatFile(thetaPath, thetaSize);
+        hTheta = readFloatFile(thetaPath, THETA_SIZE);
     }
     if (epsilonPath.empty()) {
-        hEpsilon.resize(thetaSize, 0.0f);
+        hEpsilon.resize(THETA_SIZE, 0.0f);
     } else {
-        hEpsilon = readFloatFile(epsilonPath, thetaSize);
+        hEpsilon = readFloatFile(epsilonPath, THETA_SIZE);
     }
 
     // Start wall-clock timer (includes allocations, H2D, kernel, D2H)
@@ -430,21 +482,21 @@ int main(int argc, char** argv) {
     f32* dOutMean;
     u32* dOutValid;
     CUDA_CHECK(cudaMalloc(&dBlocks, numBlocks * sizeof(BlockDef)));
-    CUDA_CHECK(cudaMalloc(&dTheta, thetaSize * sizeof(f32)));
-    CUDA_CHECK(cudaMalloc(&dEpsilon, thetaSize * sizeof(f32)));
+    CUDA_CHECK(cudaMalloc(&dTheta, THETA_SIZE * sizeof(f32)));
+    CUDA_CHECK(cudaMalloc(&dEpsilon, THETA_SIZE * sizeof(f32)));
     CUDA_CHECK(cudaMalloc(&dOutMean, numThreads * sizeof(f32)));
     CUDA_CHECK(cudaMalloc(&dOutValid, numThreads * sizeof(u32)));
 
     CUDA_CHECK(cudaMemcpy(dBlocks, hostBlocks.data(), numBlocks * sizeof(BlockDef), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dTheta, hTheta.data(), thetaSize * sizeof(f32), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dEpsilon, hEpsilon.data(), thetaSize * sizeof(f32), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dTheta, hTheta.data(), THETA_SIZE * sizeof(f32), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dEpsilon, hEpsilon.data(), THETA_SIZE * sizeof(f32), cudaMemcpyHostToDevice));
 
     // Launch
-    u32 blockSize = 256;
+    u32 blockSize = 64;
     u32 gridSize = (numThreads + blockSize - 1) / blockSize;
     gridpackKernel<<<gridSize, blockSize>>>(numThreads, numRollouts, gridW, gridH,
                                             numBlocks, maxAttempts, allowRotation,
-                                            seed, sigma, mode, stateDim, mlpHiddenDim, actionDim,
+                                            seed, sigma, mode,
                                             dBlocks, dTheta, dEpsilon,
                                             dOutMean, dOutValid);
     CUDA_CHECK(cudaGetLastError());
@@ -485,10 +537,10 @@ int main(int argc, char** argv) {
     json << "  \"numBlocks\": " << numBlocks << ",\n";
     json << "  \"numThreads\": " << numThreads << ",\n";
     json << "  \"sigma\": " << sigma << ",\n";
-    json << "  \"mlpHiddenDim\": " << mlpHiddenDim << ",\n";
-    json << "  \"actionRegions\": " << actionRegions << ",\n";
-    json << "  \"actionDim\": " << actionDim << ",\n";
-    json << "  \"thetaSize\": " << thetaSize << ",\n";
+    json << "  \"mlpHiddenDim\": " << HIDDEN_DIM << ",\n";
+    json << "  \"actionRegions\": " << ACTION_REGIONS << ",\n";
+    json << "  \"actionDim\": " << ACTION_DIM << ",\n";
+    json << "  \"thetaSize\": " << THETA_SIZE << ",\n";
     json << "  \"wallTimeMs\": " << elapsedMs << "\n";
     json << "}\n";
 

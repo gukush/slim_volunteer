@@ -9,6 +9,13 @@ export const name = 'GridPack-2D RL Floor Planning (WebGPU ES)';
 const MAGIC = 0x47524C50; // "GRPL"
 const MAX_BLOCKS = 16;
 const MAX_GRID_H = 32;
+const FIXED_ARCH = Object.freeze({
+  stateDim: 8,
+  hiddenDim: 32,
+  actionRegions: 8,
+  actionDim: 64,
+});
+const FIXED_THETA_SIZE = 2400;
 
 // ── WGSL Template Generator (Option C: runtime shader generation) ───
 
@@ -203,27 +210,24 @@ function computeThetaSize(stateDim, hiddenDim, actionDim) {
 }
 
 function getArchitecture(config, inputArgs) {
-  const hiddenDim = Number(inputArgs?.mlpHiddenDim ?? config?.mlpHiddenDim ?? 32);
-  const actionRegions = Number(inputArgs?.actionRegions ?? config?.actionRegions ?? 8);
-  const actionDim = actionRegions * actionRegions;
-  const stateDim = 8; // fixed for now
+  const hiddenDim = Number(inputArgs?.mlpHiddenDim ?? config?.mlpHiddenDim ?? FIXED_ARCH.hiddenDim);
+  const actionRegions = Number(inputArgs?.actionRegions ?? config?.actionRegions ?? FIXED_ARCH.actionRegions);
 
-  // Validate
-  if (![4, 16, 32, 64, 128].includes(hiddenDim)) {
-    throw new Error(`mlpHiddenDim must be one of [4, 16, 32, 64, 128], got ${hiddenDim}`);
+  if (hiddenDim !== FIXED_ARCH.hiddenDim) {
+    throw new Error(`gridpack-2d-rl uses fixed mlpHiddenDim=${FIXED_ARCH.hiddenDim}; got ${hiddenDim}`);
   }
-  if (![2, 4, 8, 16].includes(actionRegions)) {
-    throw new Error(`actionRegions must be one of [2, 4, 8, 16], got ${actionRegions}`);
+  if (actionRegions !== FIXED_ARCH.actionRegions) {
+    throw new Error(`gridpack-2d-rl uses fixed actionRegions=${FIXED_ARCH.actionRegions}; got ${actionRegions}`);
   }
 
-  return { stateDim, hiddenDim, actionDim, actionRegions };
+  return { ...FIXED_ARCH };
 }
 
 // ── PolicyState: ES parameter management ───────────────────────────
 
 export class PolicyState {
   constructor(thetaPath = null, arch = null) {
-    this.arch = arch || { stateDim: 8, hiddenDim: 32, actionDim: 64 };
+    this.arch = arch || { ...FIXED_ARCH };
     this.thetaSize = computeThetaSize(this.arch.stateDim, this.arch.hiddenDim, this.arch.actionDim);
 
     if (thetaPath && fs.existsSync(thetaPath)) {
@@ -233,10 +237,25 @@ export class PolicyState {
         this.arch = data.arch;
         this.thetaSize = computeThetaSize(this.arch.stateDim, this.arch.hiddenDim, this.arch.actionDim);
       }
-      this.theta = new Float32Array(data.theta);
-      this.version = data.version || 0;
-      this.round = data.round || 0;
-      logger.info('Loaded policy state from', thetaPath, 'version', this.version, 'arch', this.arch);
+      if (this.arch.stateDim !== FIXED_ARCH.stateDim ||
+          this.arch.hiddenDim !== FIXED_ARCH.hiddenDim ||
+          this.arch.actionDim !== FIXED_ARCH.actionDim ||
+          this.thetaSize !== FIXED_THETA_SIZE ||
+          !Array.isArray(data.theta) ||
+          data.theta.length !== FIXED_THETA_SIZE) {
+        logger.warn('Ignoring incompatible policy state; reinitializing fixed GridPack policy',
+          { path: thetaPath, arch: this.arch, thetaSize: this.thetaSize });
+        this.arch = { ...FIXED_ARCH };
+        this.thetaSize = FIXED_THETA_SIZE;
+        this.theta = PolicyState.xavierInit(this.thetaSize, this.arch.stateDim, this.arch.hiddenDim);
+        this.version = 0;
+        this.round = 0;
+      } else {
+        this.theta = new Float32Array(data.theta);
+        this.version = data.version || 0;
+        this.round = data.round || 0;
+        logger.info('Loaded policy state from', thetaPath, 'version', this.version, 'arch', this.arch);
+      }
     } else {
       this.theta = PolicyState.xavierInit(this.thetaSize, this.arch.stateDim, this.arch.hiddenDim);
       this.version = 0;
@@ -394,7 +413,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
   policy.lr = inputArgs.lr ?? config.lr ?? 0.001;
 
   // Verify architecture matches loaded policy
-  if (policy.arch.hiddenDim !== arch.hiddenDim || policy.arch.actionDim !== arch.actionDim) {
+  if (policy.arch.stateDim !== arch.stateDim || policy.arch.hiddenDim !== arch.hiddenDim || policy.arch.actionDim !== arch.actionDim) {
     logger.warn('Policy architecture mismatch, reinitializing',
       { policy: policy.arch, requested: arch });
     policy.arch = arch;

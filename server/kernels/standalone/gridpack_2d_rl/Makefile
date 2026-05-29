@@ -3,16 +3,18 @@
 # Adjust ARCH to match your GPU (e.g. sm_70 for V100, sm_80 for A100, sm_89 for RTX 4090)
 ARCH ?= sm_89
 
-# Maximum MLP architecture caps (must be >= any runtime value used)
+# Fixed GridPack-2D RL architecture/caps used by WebGPU, CUDA, and MPI.
 MAX_STATE_DIM  ?= 8
-MAX_HIDDEN_DIM ?= 128
-MAX_ACTION_DIM ?= 256
+MAX_HIDDEN_DIM ?= 32
+MAX_ACTION_DIM ?= 64
+MAX_BLOCKS     ?= 16
+MAX_GRID_H     ?= 32
 
 # CUDA compiler
 NVCC ?= nvcc
 
 # Common flags
-CUDA_FLAGS = -O3 -arch=$(ARCH) -DMAX_STATE_DIM=$(MAX_STATE_DIM) -DMAX_HIDDEN_DIM=$(MAX_HIDDEN_DIM) -DMAX_ACTION_DIM=$(MAX_ACTION_DIM)
+CUDA_FLAGS = -O3 -arch=$(ARCH) -DMAX_STATE_DIM=$(MAX_STATE_DIM) -DMAX_HIDDEN_DIM=$(MAX_HIDDEN_DIM) -DMAX_ACTION_DIM=$(MAX_ACTION_DIM) -DMAX_BLOCKS=$(MAX_BLOCKS) -DMAX_GRID_H=$(MAX_GRID_H)
 CXX_FLAGS  = -std=c++17
 
 # -----------------------------------------------------------------------------
