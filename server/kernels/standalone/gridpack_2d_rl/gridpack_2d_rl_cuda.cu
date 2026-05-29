@@ -40,6 +40,7 @@
 } while (0)
 
 using u32 = uint32_t;
+using u64 = uint64_t;
 using f32 = float;
 
 // ------------------------------------------------------------------
@@ -69,6 +70,12 @@ static constexpr u32 L1_BIAS_OFF = STATE_DIM * HIDDEN_DIM;
 static constexpr u32 L2_WEIGHTS_OFF = L1_BIAS_OFF + HIDDEN_DIM;
 static constexpr u32 L2_BIAS_OFF = L2_WEIGHTS_OFF + HIDDEN_DIM * ACTION_DIM;
 static constexpr u32 THETA_SIZE = L2_BIAS_OFF + ACTION_DIM;
+
+struct EvalResult {
+    f32 meanReward;
+    u32 validCount;
+    u32 activeThreads;
+};
 
 // ------------------------------------------------------------------
 // Device RNG: match the WebGPU single-word xorshift path.
@@ -348,6 +355,12 @@ static void ensureFitsGrid(std::vector<BlockDef>& blocks, u32 gridW, u32 gridH) 
     }
 }
 
+static u32 stringHashSum(const std::string& s) {
+    u32 sum = 0;
+    for (unsigned char c : s) sum += c;
+    return sum;
+}
+
 static std::vector<f32> readFloatFile(const std::string& path, size_t expected) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { std::cerr << "Cannot open: " << path << std::endl; std::exit(1); }
@@ -368,6 +381,7 @@ static void printUsage(const char* name) {
               << "  --gridW=N            Grid width (default 16)\n"
               << "  --gridH=N            Grid height (default 16)\n"
               << "  --numBlocks=N        Number of blocks (default 6)\n"
+              << "  --numProblems=N      Run full ES round with N base/perturbed pairs\n"
               << "  --minBlockSize=N     Minimum generated block edge (default 2)\n"
               << "  --maxBlockSize=N     Maximum generated block edge (default 6)\n"
               << "  --blocks=W1,H1,W2,H2,...  Block sizes (comma-separated)\n"
@@ -380,9 +394,48 @@ static void printUsage(const char* name) {
               << "  --mode=0|1           0=base, 1=perturbed (default 0)\n"
               << "  --sigma=F            ES noise scale (default 0.01)\n"
               << "  --seed=N             Random seed (default 12345)\n"
+              << "  --taskId=STRING      Optional WebGPU-compatible task hash seed offset\n"
+              << "  --taskIdHash=N       Optional numeric task hash seed offset\n"
               << "  --mlpHiddenDim=32    Fixed MLP hidden layer size\n"
               << "  --actionRegions=8    Fixed action region grid, actionDim=64\n"
               << "  --output=FILE        Output JSON file (default stdout)\n";
+}
+
+static EvalResult runEvaluation(BlockDef* dBlocks, f32* dTheta, f32* dEpsilon,
+                                f32* dOutMean, u32* dOutValid,
+                                const std::vector<BlockDef>& hostBlocks,
+                                u32 gridW, u32 gridH, u32 maxAttempts, u32 allowRotation,
+                                u32 numThreads, u32 numRollouts, u32 seed, f32 sigma, u32 mode) {
+    const u32 numBlocks = static_cast<u32>(hostBlocks.size());
+    CUDA_CHECK(cudaMemcpy(dBlocks, hostBlocks.data(), numBlocks * sizeof(BlockDef), cudaMemcpyHostToDevice));
+
+    u32 blockSize = 64;
+    u32 gridSize = (numThreads + blockSize - 1) / blockSize;
+    gridpackKernel<<<gridSize, blockSize>>>(numThreads, numRollouts, gridW, gridH,
+                                            numBlocks, maxAttempts, allowRotation,
+                                            seed, sigma, mode,
+                                            dBlocks, dTheta, dEpsilon,
+                                            dOutMean, dOutValid);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<f32> hMean(numThreads);
+    std::vector<u32> hValid(numThreads);
+    CUDA_CHECK(cudaMemcpy(hMean.data(), dOutMean, numThreads * sizeof(f32), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(hValid.data(), dOutValid, numThreads * sizeof(u32), cudaMemcpyDeviceToHost));
+
+    f32 totalReward = 0.0f;
+    u32 totalValid = 0;
+    u32 activeThreads = 0;
+    for (u32 i = 0; i < numThreads; ++i) {
+        if (hValid[i] > 0) {
+            totalReward += hMean[i] * hValid[i];
+            totalValid += hValid[i];
+            activeThreads++;
+        }
+    }
+
+    return { (totalValid > 0) ? (totalReward / totalValid) : -1.0f, totalValid, activeThreads };
 }
 
 // ------------------------------------------------------------------
@@ -393,6 +446,7 @@ int main(int argc, char** argv) {
     u32 minBlockSize = 2, maxBlockSize = 6;
     u32 numThreads = 1024, numRollouts = 128, maxAttempts = 50;
     u32 allowRotation = 1, mode = 0, seed = 12345;
+    u32 numProblems = 0, taskIdHash = 0;
     u32 mlpHiddenDim = 32, actionRegions = 8;
     f32 sigma = 0.01f;
     std::string thetaPath, epsilonPath, outputPath;
@@ -404,6 +458,7 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--gridW=", 0) == 0) gridW = std::stoul(arg.substr(8));
         else if (arg.rfind("--gridH=", 0) == 0) gridH = std::stoul(arg.substr(8));
         else if (arg.rfind("--numBlocks=", 0) == 0) numBlocks = std::stoul(arg.substr(12));
+        else if (arg.rfind("--numProblems=", 0) == 0) numProblems = std::stoul(arg.substr(14));
         else if (arg.rfind("--minBlockSize=", 0) == 0) minBlockSize = std::stoul(arg.substr(15));
         else if (arg.rfind("--maxBlockSize=", 0) == 0) maxBlockSize = std::stoul(arg.substr(15));
         else if (arg.rfind("--blocks=", 0) == 0) {
@@ -421,6 +476,8 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--mode=", 0) == 0) mode = std::stoul(arg.substr(7));
         else if (arg.rfind("--sigma=", 0) == 0) sigma = std::stof(arg.substr(8));
         else if (arg.rfind("--seed=", 0) == 0) seed = std::stoul(arg.substr(7));
+        else if (arg.rfind("--taskIdHash=", 0) == 0) taskIdHash = std::stoul(arg.substr(13));
+        else if (arg.rfind("--taskId=", 0) == 0) taskIdHash = stringHashSum(arg.substr(9));
         else if (arg.rfind("--mlpHiddenDim=", 0) == 0) mlpHiddenDim = std::stoul(arg.substr(15));
         else if (arg.rfind("--actionRegions=", 0) == 0) actionRegions = std::stoul(arg.substr(16));
         else if (arg.rfind("--output=", 0) == 0) outputPath = arg.substr(9);
@@ -448,15 +505,24 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (hostBlocks.empty()) {
+    if (numProblems == 0 && hostBlocks.empty()) {
         u32 rng = seed;
         hostBlocks = generateBlocks(numBlocks, minBlockSize, maxBlockSize, rng);
     }
-    ensureFitsGrid(hostBlocks, gridW, gridH);
-    numBlocks = hostBlocks.size();
-    if (numBlocks > MAX_BLOCKS) {
-        std::cerr << "parsed block count " << numBlocks << " exceeds MAX_BLOCKS " << MAX_BLOCKS << std::endl;
-        return 1;
+    if (numProblems == 0) {
+        ensureFitsGrid(hostBlocks, gridW, gridH);
+        numBlocks = hostBlocks.size();
+        if (numBlocks > MAX_BLOCKS) {
+            std::cerr << "parsed block count " << numBlocks << " exceeds MAX_BLOCKS " << MAX_BLOCKS << std::endl;
+            return 1;
+        }
+    } else if (!hostBlocks.empty()) {
+        ensureFitsGrid(hostBlocks, gridW, gridH);
+        numBlocks = hostBlocks.size();
+        if (numBlocks > MAX_BLOCKS) {
+            std::cerr << "parsed block count " << numBlocks << " exceeds MAX_BLOCKS " << MAX_BLOCKS << std::endl;
+            return 1;
+        }
     }
 
     // Load theta and epsilon
@@ -481,68 +547,108 @@ int main(int argc, char** argv) {
     f32* dEpsilon;
     f32* dOutMean;
     u32* dOutValid;
-    CUDA_CHECK(cudaMalloc(&dBlocks, numBlocks * sizeof(BlockDef)));
+    CUDA_CHECK(cudaMalloc(&dBlocks, MAX_BLOCKS * sizeof(BlockDef)));
     CUDA_CHECK(cudaMalloc(&dTheta, THETA_SIZE * sizeof(f32)));
     CUDA_CHECK(cudaMalloc(&dEpsilon, THETA_SIZE * sizeof(f32)));
     CUDA_CHECK(cudaMalloc(&dOutMean, numThreads * sizeof(f32)));
     CUDA_CHECK(cudaMalloc(&dOutValid, numThreads * sizeof(u32)));
 
-    CUDA_CHECK(cudaMemcpy(dBlocks, hostBlocks.data(), numBlocks * sizeof(BlockDef), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dTheta, hTheta.data(), THETA_SIZE * sizeof(f32), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dEpsilon, hEpsilon.data(), THETA_SIZE * sizeof(f32), cudaMemcpyHostToDevice));
 
-    // Launch
-    u32 blockSize = 64;
-    u32 gridSize = (numThreads + blockSize - 1) / blockSize;
-    gridpackKernel<<<gridSize, blockSize>>>(numThreads, numRollouts, gridW, gridH,
-                                            numBlocks, maxAttempts, allowRotation,
-                                            seed, sigma, mode,
-                                            dBlocks, dTheta, dEpsilon,
-                                            dOutMean, dOutValid);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    // Reduce on host
-    std::vector<f32> hMean(numThreads);
-    std::vector<u32> hValid(numThreads);
-    CUDA_CHECK(cudaMemcpy(hMean.data(), dOutMean, numThreads * sizeof(f32), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hValid.data(), dOutValid, numThreads * sizeof(u32), cudaMemcpyDeviceToHost));
-
-    f32 totalReward = 0.0f;
-    u32 totalValid = 0;
-    u32 activeThreads = 0;
-    for (u32 i = 0; i < numThreads; ++i) {
-        if (hValid[i] > 0) {
-            totalReward += hMean[i] * hValid[i];
-            totalValid += hValid[i];
-            activeThreads++;
-        }
-    }
-    f32 overallMean = (totalValid > 0) ? (totalReward / totalValid) : -1.0f;
-    u32 totalRollouts = numThreads * numRollouts;
-
-    auto tEnd = std::chrono::high_resolution_clock::now();
-    double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
-
-    // Output JSON
     std::ostringstream json;
-    json << "{\n";
-    json << "  \"meanReward\": " << overallMean << ",\n";
-    json << "  \"validCount\": " << totalValid << ",\n";
-    json << "  \"totalRollouts\": " << (numThreads * numRollouts) << ",\n";
-    json << "  \"activeThreads\": " << activeThreads << ",\n";
-    json << "  \"mode\": " << mode << ",\n";
-    json << "  \"gridW\": " << gridW << ",\n";
-    json << "  \"gridH\": " << gridH << ",\n";
-    json << "  \"numBlocks\": " << numBlocks << ",\n";
-    json << "  \"numThreads\": " << numThreads << ",\n";
-    json << "  \"sigma\": " << sigma << ",\n";
-    json << "  \"mlpHiddenDim\": " << HIDDEN_DIM << ",\n";
-    json << "  \"actionRegions\": " << ACTION_REGIONS << ",\n";
-    json << "  \"actionDim\": " << ACTION_DIM << ",\n";
-    json << "  \"thetaSize\": " << THETA_SIZE << ",\n";
-    json << "  \"wallTimeMs\": " << elapsedMs << "\n";
-    json << "}\n";
+    if (numProblems > 0) {
+        f32 sumDelta = 0.0f;
+        f32 sumBase = 0.0f;
+        f32 sumPerturbed = 0.0f;
+        u32 validPairs = 0;
+        u32 chunksProcessed = 0;
+        u64 totalRolloutsAll = 0;
+
+        for (u32 problemIdx = 0; problemIdx < numProblems; ++problemIdx) {
+            u32 problemSeed = 123456789u + problemIdx * 747796405u + taskIdHash;
+            std::vector<BlockDef> blocks;
+            if (!hostBlocks.empty()) {
+                blocks = hostBlocks;
+            } else {
+                u32 rng = problemSeed;
+                blocks = generateBlocks(numBlocks, minBlockSize, maxBlockSize, rng);
+                ensureFitsGrid(blocks, gridW, gridH);
+            }
+
+            EvalResult base = runEvaluation(dBlocks, dTheta, dEpsilon, dOutMean, dOutValid,
+                                            blocks, gridW, gridH, maxAttempts, allowRotation,
+                                            numThreads, numRollouts, problemSeed, sigma, 0);
+            EvalResult perturbed = runEvaluation(dBlocks, dTheta, dEpsilon, dOutMean, dOutValid,
+                                                 blocks, gridW, gridH, maxAttempts, allowRotation,
+                                                 numThreads, numRollouts, problemSeed + 1u, sigma, 1);
+            chunksProcessed += 2;
+            totalRolloutsAll += static_cast<u64>(numThreads) * static_cast<u64>(numRollouts) * 2ull;
+
+            if (base.validCount > 0 && perturbed.validCount > 0 &&
+                base.meanReward > 0.0f && perturbed.meanReward > 0.0f) {
+                sumDelta += perturbed.meanReward - base.meanReward;
+                sumBase += base.meanReward;
+                sumPerturbed += perturbed.meanReward;
+                validPairs++;
+            }
+        }
+
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+
+        f32 meanDelta = validPairs > 0 ? sumDelta / f32(validPairs) : 0.0f;
+        f32 meanBase = validPairs > 0 ? sumBase / f32(validPairs) : 0.0f;
+        f32 meanPerturbed = validPairs > 0 ? sumPerturbed / f32(validPairs) : 0.0f;
+
+        json << "{\n";
+        json << "  \"validPairs\": " << validPairs << ",\n";
+        json << "  \"totalPairs\": " << numProblems << ",\n";
+        json << "  \"meanDelta\": " << meanDelta << ",\n";
+        json << "  \"meanBase\": " << meanBase << ",\n";
+        json << "  \"meanPerturbed\": " << meanPerturbed << ",\n";
+        json << "  \"chunksProcessed\": " << chunksProcessed << ",\n";
+        json << "  \"totalRollouts\": " << totalRolloutsAll << ",\n";
+        json << "  \"gridW\": " << gridW << ",\n";
+        json << "  \"gridH\": " << gridH << ",\n";
+        json << "  \"numBlocks\": " << numBlocks << ",\n";
+        json << "  \"numProblems\": " << numProblems << ",\n";
+        json << "  \"numThreads\": " << numThreads << ",\n";
+        json << "  \"rolloutsPerThread\": " << numRollouts << ",\n";
+        json << "  \"sigma\": " << sigma << ",\n";
+        json << "  \"mlpHiddenDim\": " << HIDDEN_DIM << ",\n";
+        json << "  \"actionRegions\": " << ACTION_REGIONS << ",\n";
+        json << "  \"actionDim\": " << ACTION_DIM << ",\n";
+        json << "  \"thetaSize\": " << THETA_SIZE << ",\n";
+        json << "  \"wallTimeMs\": " << elapsedMs << "\n";
+        json << "}\n";
+    } else {
+        EvalResult eval = runEvaluation(dBlocks, dTheta, dEpsilon, dOutMean, dOutValid,
+                                        hostBlocks, gridW, gridH, maxAttempts, allowRotation,
+                                        numThreads, numRollouts, seed, sigma, mode);
+
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double elapsedMs = std::chrono::duration<double, std::milli>(tEnd - tStart).count();
+
+        json << "{\n";
+        json << "  \"meanReward\": " << eval.meanReward << ",\n";
+        json << "  \"validCount\": " << eval.validCount << ",\n";
+        json << "  \"totalRollouts\": " << (numThreads * numRollouts) << ",\n";
+        json << "  \"activeThreads\": " << eval.activeThreads << ",\n";
+        json << "  \"mode\": " << mode << ",\n";
+        json << "  \"gridW\": " << gridW << ",\n";
+        json << "  \"gridH\": " << gridH << ",\n";
+        json << "  \"numBlocks\": " << numBlocks << ",\n";
+        json << "  \"numThreads\": " << numThreads << ",\n";
+        json << "  \"rolloutsPerThread\": " << numRollouts << ",\n";
+        json << "  \"sigma\": " << sigma << ",\n";
+        json << "  \"mlpHiddenDim\": " << HIDDEN_DIM << ",\n";
+        json << "  \"actionRegions\": " << ACTION_REGIONS << ",\n";
+        json << "  \"actionDim\": " << ACTION_DIM << ",\n";
+        json << "  \"thetaSize\": " << THETA_SIZE << ",\n";
+        json << "  \"wallTimeMs\": " << elapsedMs << "\n";
+        json << "}\n";
+    }
 
     if (!outputPath.empty()) {
         std::ofstream ofs(outputPath);
