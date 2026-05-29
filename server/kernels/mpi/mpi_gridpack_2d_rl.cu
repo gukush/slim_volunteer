@@ -140,7 +140,8 @@ __device__ void mlpForward(const f32* theta, const f32* epsilon, f32 sigma, bool
 // ------------------------------------------------------------------
 // Action sampling
 // ------------------------------------------------------------------
-__device__ void sampleAction(const f32* logits, RngState* rng, u32 actionDim, u32 gw, u32 gh, u32& px, u32& py) {
+__device__ void sampleAction(const f32* logits, RngState* rng, u32 actionDim,
+                             u32 regionCount, u32 gw, u32 gh, u32& px, u32& py) {
     f32 mx = logits[0];
     for (u32 i = 1; i < actionDim; ++i) {
         if (logits[i] > mx) mx = logits[i];
@@ -148,7 +149,7 @@ __device__ void sampleAction(const f32* logits, RngState* rng, u32 actionDim, u3
     f32 expSum = 0.0f;
     f32 probs[MAX_ACTION_DIM];
     for (u32 i = 0; i < actionDim; ++i) {
-        f32 e = expf(logits[i] - mx);
+        f32 e = __expf(logits[i] - mx);
         probs[i] = e;
         expSum += e;
     }
@@ -159,7 +160,6 @@ __device__ void sampleAction(const f32* logits, RngState* rng, u32 actionDim, u3
         c += probs[i];
         if (c >= r) { a = i; break; }
     }
-    u32 regionCount = u32(sqrtf(f32(actionDim)) + 0.5f);
     u32 rx = a % regionCount;
     u32 ry = a / regionCount;
     u32 rw = max(1u, gw / regionCount);
@@ -210,6 +210,7 @@ __device__ void extractFeatures(const u32* g, u32 gw, u32 gh, u32 bw, u32 bh,
 // ------------------------------------------------------------------
 __device__ f32 rollout(u32 rolloutSeed, u32 gw, u32 gh, u32 nb, u32 ma, u32 ar,
                        u32 stateDim, u32 hiddenDim, u32 actionDim,
+                       u32 regionCount,
                        const BlockDef* blocks, const f32* theta, const f32* epsilon,
                        f32 sigma, bool useEps) {
     RngState rng{rolloutSeed};
@@ -231,7 +232,7 @@ __device__ f32 rollout(u32 rolloutSeed, u32 gw, u32 gh, u32 nb, u32 ma, u32 ar,
         bool placed = false;
         for (u32 a = 0; a < ma; ++a) {
             u32 px, py;
-            sampleAction(logits, &rng, actionDim, gw, gh, px, py);
+            sampleAction(logits, &rng, actionDim, regionCount, gw, gh, px, py);
             if (canPlace(grid, px, py, bw, bh, gw, gh)) {
                 place(grid, px, py, bw, bh);
                 placed = true;
@@ -269,6 +270,7 @@ __device__ f32 rollout(u32 rolloutSeed, u32 gw, u32 gh, u32 nb, u32 ma, u32 ar,
 __global__ void evalKernel(u32 numThreads, u32 numRollouts, u32 gw, u32 gh,
                            u32 nb, u32 ma, u32 ar, u32 seed, f32 sigma,
                            u32 mode, u32 stateDim, u32 hiddenDim, u32 actionDim,
+                           u32 regionCount,
                            const BlockDef* blocks,
                            const f32* theta, const f32* epsilon,
                            f32* outMean, u32* outValid) {
@@ -284,6 +286,7 @@ __global__ void evalKernel(u32 numThreads, u32 numRollouts, u32 gw, u32 gh,
     for (u32 r = 0; r < numRollouts; ++r) {
         u32 rs = randU32(&rng);
         f32 reward = rollout(rs, gw, gh, nb, ma, ar, stateDim, hiddenDim, actionDim,
+                             regionCount,
                              blocks, theta, epsilon, sigma, useEps);
         if (reward > 0.0f) { sumR += reward; validN++; }
     }
@@ -298,53 +301,6 @@ struct EvalResult {
     f32 meanReward;
     u32 validCount;
 };
-
-EvalResult evaluateOnGPU(u32 numThreads, u32 numRollouts, u32 gw, u32 gh,
-                         u32 nb, u32 ma, u32 ar, u32 seed, f32 sigma, u32 mode,
-                         u32 stateDim, u32 hiddenDim, u32 actionDim,
-                         const std::vector<BlockDef>& blocks,
-                         const f32* theta, const f32* epsilon) {
-    u32 thetaSize = stateDim * hiddenDim + hiddenDim + hiddenDim * actionDim + actionDim;
-
-    BlockDef* dBlocks;
-    f32 *dTheta, *dEpsilon, *dOut;
-    u32* dValid;
-    CUDA_CHECK(cudaMalloc(&dBlocks, nb * sizeof(BlockDef)));
-    CUDA_CHECK(cudaMalloc(&dTheta, thetaSize * sizeof(f32)));
-    CUDA_CHECK(cudaMalloc(&dEpsilon, thetaSize * sizeof(f32)));
-    CUDA_CHECK(cudaMalloc(&dOut, numThreads * sizeof(f32)));
-    CUDA_CHECK(cudaMalloc(&dValid, numThreads * sizeof(u32)));
-
-    CUDA_CHECK(cudaMemcpy(dBlocks, blocks.data(), nb * sizeof(BlockDef), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dTheta, theta, thetaSize * sizeof(f32), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dEpsilon, epsilon, thetaSize * sizeof(f32), cudaMemcpyHostToDevice));
-
-    u32 blockSize = 64;
-    u32 gridSize = (numThreads + blockSize - 1) / blockSize;
-    evalKernel<<<gridSize, blockSize>>>(numThreads, numRollouts, gw, gh, nb, ma, ar,
-                                        seed, sigma, mode, stateDim, hiddenDim, actionDim,
-                                        dBlocks, dTheta, dEpsilon, dOut, dValid);
-    CUDA_CHECK(cudaGetLastError());
-    CUDA_CHECK(cudaDeviceSynchronize());
-
-    std::vector<f32> hOut(numThreads);
-    std::vector<u32> hValid(numThreads);
-    CUDA_CHECK(cudaMemcpy(hOut.data(), dOut, numThreads * sizeof(f32), cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(hValid.data(), dValid, numThreads * sizeof(u32), cudaMemcpyDeviceToHost));
-
-    f32 totalR = 0.0f;
-    u32 totalV = 0;
-    for (u32 i = 0; i < numThreads; ++i) {
-        if (hValid[i] > 0) {
-            totalR += hOut[i] * f32(hValid[i]);
-            totalV += hValid[i];
-        }
-    }
-
-    cudaFree(dBlocks); cudaFree(dTheta); cudaFree(dEpsilon); cudaFree(dOut); cudaFree(dValid);
-
-    return { (totalV > 0) ? (totalR / totalV) : -1.0f, totalV };
-}
 
 // ------------------------------------------------------------------
 // Problem generator
@@ -423,18 +379,92 @@ struct ResultMsg {
     f32 meanReward;
 };
 
-static ResultMsg evaluateTask(u32 round, u32 problemIdx, u32 problemSeed, u32 mode,
+class GpuEvalContext {
+public:
+    GpuEvalContext(u32 maxBlocks, u32 thetaSize, u32 numThreads)
+        : maxBlocks_(maxBlocks), thetaSize_(thetaSize), numThreads_(numThreads) {
+        CUDA_CHECK(cudaMalloc(&dBlocks_, maxBlocks_ * sizeof(BlockDef)));
+        CUDA_CHECK(cudaMalloc(&dTheta_, thetaSize_ * sizeof(f32)));
+        CUDA_CHECK(cudaMalloc(&dEpsilon_, thetaSize_ * sizeof(f32)));
+        CUDA_CHECK(cudaMalloc(&dOut_, numThreads_ * sizeof(f32)));
+        CUDA_CHECK(cudaMalloc(&dValid_, numThreads_ * sizeof(u32)));
+        hOut_.resize(numThreads_);
+        hValid_.resize(numThreads_);
+    }
+
+    ~GpuEvalContext() {
+        cudaFree(dBlocks_);
+        cudaFree(dTheta_);
+        cudaFree(dEpsilon_);
+        cudaFree(dOut_);
+        cudaFree(dValid_);
+    }
+
+    void uploadRound(const std::vector<f32>& theta, const std::vector<f32>& epsilon) {
+        CUDA_CHECK(cudaMemcpy(dTheta_, theta.data(), thetaSize_ * sizeof(f32), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dEpsilon_, epsilon.data(), thetaSize_ * sizeof(f32), cudaMemcpyHostToDevice));
+    }
+
+    EvalResult evaluate(u32 numThreads, u32 numRollouts, u32 gw, u32 gh,
+                        u32 nb, u32 ma, u32 ar, u32 seed, f32 sigma, u32 mode,
+                        u32 stateDim, u32 hiddenDim, u32 actionDim, u32 regionCount,
+                        const std::vector<BlockDef>& blocks) {
+        if (nb > maxBlocks_ || numThreads > numThreads_) {
+            std::cerr << "GpuEvalContext capacity exceeded" << std::endl;
+            std::exit(1);
+        }
+
+        CUDA_CHECK(cudaMemcpy(dBlocks_, blocks.data(), nb * sizeof(BlockDef), cudaMemcpyHostToDevice));
+
+        u32 blockSize = 64;
+        u32 gridSize = (numThreads + blockSize - 1) / blockSize;
+        evalKernel<<<gridSize, blockSize>>>(numThreads, numRollouts, gw, gh, nb, ma, ar,
+                                            seed, sigma, mode, stateDim, hiddenDim, actionDim,
+                                            regionCount,
+                                            dBlocks_, dTheta_, dEpsilon_, dOut_, dValid_);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaMemcpy(hOut_.data(), dOut_, numThreads * sizeof(f32), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(hValid_.data(), dValid_, numThreads * sizeof(u32), cudaMemcpyDeviceToHost));
+
+        f32 totalR = 0.0f;
+        u32 totalV = 0;
+        for (u32 i = 0; i < numThreads; ++i) {
+            if (hValid_[i] > 0) {
+                totalR += hOut_[i] * f32(hValid_[i]);
+                totalV += hValid_[i];
+            }
+        }
+        return { (totalV > 0) ? (totalR / totalV) : -1.0f, totalV };
+    }
+
+private:
+    u32 maxBlocks_ = 0;
+    u32 thetaSize_ = 0;
+    u32 numThreads_ = 0;
+    BlockDef* dBlocks_ = nullptr;
+    f32* dTheta_ = nullptr;
+    f32* dEpsilon_ = nullptr;
+    f32* dOut_ = nullptr;
+    u32* dValid_ = nullptr;
+    std::vector<f32> hOut_;
+    std::vector<u32> hValid_;
+};
+
+static ResultMsg evaluateTask(GpuEvalContext& gpu, u32 round, u32 problemIdx,
+                              u32 problemSeed, u32 mode,
                               u32 gridW, u32 gridH, u32 numBlocks,
                               u32 maxAttempts, u32 allowRotation,
                               u32 numThreads, u32 numRollouts,
                               f32 sigma, u32 stateDim, u32 mlpHiddenDim,
-                              u32 actionDim, const std::vector<BlockDef>& blocks,
-                              const f32* theta, const f32* epsilon) {
-    EvalResult eval = evaluateOnGPU(numThreads, numRollouts, gridW, gridH,
-                                    numBlocks, maxAttempts, allowRotation,
-                                    problemSeed + mode, sigma, mode,
-                                    stateDim, mlpHiddenDim, actionDim,
-                                    blocks, theta, epsilon);
+                              u32 actionDim, u32 regionCount,
+                              const std::vector<BlockDef>& blocks) {
+    EvalResult eval = gpu.evaluate(numThreads, numRollouts, gridW, gridH,
+                                   numBlocks, maxAttempts, allowRotation,
+                                   problemSeed + mode, sigma, mode,
+                                   stateDim, mlpHiddenDim, actionDim, regionCount,
+                                   blocks);
     ResultMsg result{};
     result.round = round;
     result.problemIdx = problemIdx;
@@ -450,6 +480,9 @@ static void workerLoop(u32 gridW, u32 gridH,
                        u32 stateDim, u32 mlpHiddenDim, u32 actionDim) {
     std::vector<f32> theta;
     std::vector<f32> epsilon;
+    const u32 thetaSize = stateDim * mlpHiddenDim + mlpHiddenDim + mlpHiddenDim * actionDim + actionDim;
+    const u32 regionCount = static_cast<u32>(std::sqrt(f32(actionDim)) + 0.5f);
+    GpuEvalContext gpu(MAX_BLOCKS, thetaSize, numThreads);
 
     for (;;) {
         MPI_Status status{};
@@ -467,6 +500,7 @@ static void workerLoop(u32 gridW, u32 gridH,
         epsilon.resize(init.thetaSize);
         MPI_Recv(theta.data(), init.thetaSize, MPI_FLOAT, 0, TAG_ROUND_INIT, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         MPI_Recv(epsilon.data(), init.thetaSize, MPI_FLOAT, 0, TAG_ROUND_INIT, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        gpu.uploadRound(theta, epsilon);
 
         for (;;) {
             TaskMsg task{};
@@ -486,13 +520,12 @@ static void workerLoop(u32 gridW, u32 gridH,
             MPI_Recv(blocks.data(), task.numBlocks * sizeof(BlockDef), MPI_BYTE,
                      0, TAG_TASK, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            ResultMsg result = evaluateTask(task.round, task.problemIdx, task.problemSeed, task.mode,
+            ResultMsg result = evaluateTask(gpu, task.round, task.problemIdx, task.problemSeed, task.mode,
                                             gridW, gridH, task.numBlocks,
                                             maxAttempts, allowRotation,
                                             numThreads, numRollouts,
                                             sigma, stateDim, mlpHiddenDim,
-                                            actionDim, blocks,
-                                            theta.data(), epsilon.data());
+                                            actionDim, regionCount, blocks);
             MPI_Send(&result, sizeof(result), MPI_BYTE, 0, TAG_RESULT, MPI_COMM_WORLD);
         }
     }
