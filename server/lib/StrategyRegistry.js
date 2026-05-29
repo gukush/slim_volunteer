@@ -17,6 +17,7 @@ import * as hashPreimage from '../strategies/hash-preimage.js';
 import * as goldbachVerification from '../strategies/goldbach-verification.js';
 import * as pollardPminus1 from '../strategies/pollard-pminus1.js';
 import * as gridpack2dRl from '../strategies/gridpack-2d-rl.js';
+import * as torusGridRl from '../strategies/torus-grid-rl.js';
 
 
 const strategies = new Map();
@@ -43,6 +44,7 @@ register(hashPreimage);
 register(goldbachVerification);
 register(pollardPminus1);
 register(gridpack2dRl);
+register(torusGridRl);
 
 export function listStrategies() {
   return Array.from(strategies.keys());
