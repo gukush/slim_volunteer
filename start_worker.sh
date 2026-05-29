@@ -7,7 +7,7 @@ SERVER_IP="172.20.83.202"
 
 cd "$BASE_DIR"
 
-mkdir -p "${DES}_metrics" "tmp_data_dir_${DES}"
+mkdir -p "metrics" "tmp_data_dir_${DES}"
 
 if screen -list | grep -q "[.]chrome[[:space:]]"; then
   echo "chrome screen already exists"
@@ -40,9 +40,10 @@ else
   screen -S listener -dm bash -lc "
     cd '$BASE_DIR' &&
     exec ./build/unified_monitor \
-      --url ws://${SERVER_IP}:3001/ws-native \
-      --insecure \
-      --out-dir ${DES}_metrics/
+      --label ${DES} \
+      --out-dir metrics/ \
+      --interval 100 \
+      --gpu-index 0
   "
   echo "started listener"
 fi
