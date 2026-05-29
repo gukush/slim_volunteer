@@ -279,10 +279,16 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           throw new Error(`Strategy ${task.strategy.id} does not provide browser executor path`);
         }
         const executorCode = fs.readFileSync(path.join(process.cwd(), execInfo.path), 'utf-8');
-        const kernels = (execInfo.kernels || []).map(p => ({
-          name: p,
-          content: fs.readFileSync(path.join(process.cwd(), p), 'utf-8')
-        }));
+        const kernels = (execInfo.kernels || []).map(p => {
+          if (typeof p === 'string') {
+            return { name: p, content: fs.readFileSync(path.join(process.cwd(), p), 'utf-8') };
+          }
+          // Inline kernel object: { name, content }
+          if (p && p.name && typeof p.content === 'string') {
+            return p;
+          }
+          throw new Error(`Invalid kernel entry in strategy ${task.strategy.id}: ${JSON.stringify(p)}`);
+        });
 
         this.io.emit('task:init', {
           taskId: id,
@@ -634,7 +640,6 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       });
     }
 
-    task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tSent: Date.now() });
     return true;
   }
 
@@ -664,10 +669,14 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
 
     task.timers.chunkRow({
       chunkId, replica,
+      clientId: client ? (client.workerId || client.clientId || socketId) : socketId,
       tCreate: entry.tCreate,
+      tSent: entry.lastAssignedAt,
       tServerRecv,
       tClientRecv: timings?.tClientRecv,
       tClientDone: timings?.tClientDone,
+      tClientRecvAbs: timings?.tClientRecvAbs,
+      tClientDoneAbs: timings?.tClientDoneAbs,
       cpuTimeMs,
       gpuTimeMs,
     });

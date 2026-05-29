@@ -16,6 +16,7 @@ import * as exeDistributedSort from '../strategies/exe-distributed-sort.js';
 import * as hashPreimage from '../strategies/hash-preimage.js';
 import * as goldbachVerification from '../strategies/goldbach-verification.js';
 import * as pollardPminus1 from '../strategies/pollard-pminus1.js';
+import * as gridpack2dRl from '../strategies/gridpack-2d-rl.js';
 
 
 const strategies = new Map();
@@ -41,6 +42,7 @@ register(exeDistributedSort);
 register(hashPreimage);
 register(goldbachVerification);
 register(pollardPminus1);
+register(gridpack2dRl);
 
 export function listStrategies() {
   return Array.from(strategies.keys());
