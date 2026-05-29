@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &nproc);
 
-  uint32_t totalTrajectories = 65536, chunkSize = 1024, blockSize = 128;
+  uint32_t totalTrajectories = 65536, chunkSize = 4096, blockSize = 128;
   uint32_t seed = 0xabcdef01u, environmentSeed = 0x5eed1234u;
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);

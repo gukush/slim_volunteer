@@ -43,7 +43,7 @@ run-gridpack:
 
 run-torus-grid-rl:
 	mpirun --bind-to none -np 4 ./mpi_torus_grid_rl \
-	  --totalTrajectories=65536 --chunkSize=1024 --blockSize=128
+	  --totalTrajectories=65536 --chunkSize=4096 --blockSize=128
 
 clean:
 	rm -f $(TARGETS)

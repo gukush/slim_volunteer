@@ -79,7 +79,7 @@ async function main() {
   const args = parseArgs(process.argv);
   const host = args.host || args.baseURL || process.env.BASE_URL || 'https://localhost:3000';
   const totalTrajectories = Number(args.totalTrajectories || 8192);
-  const chunkTrajectories = Number(args.chunkTrajectories || args.chunkSize || 2048);
+  const chunkTrajectories = Number(args.chunkTrajectories || args.chunkSize || 4096);
   const workgroupSize = Number(args.workgroupSize || 128);
   const Krep = Number(args.Krep || 1);
   const timeoutMs = Number(args.timeoutMs || 120000);
@@ -119,8 +119,10 @@ async function main() {
   await api(host, `/tasks/${taskId}/start`, { method: 'POST' });
   console.log('Started task', taskId);
 
+  const taskStart = Date.now();
   await waitForCompletion(host, taskId, { intervalMs, timeoutMs });
-  console.log('\nTask completed');
+  const taskDuration = Date.now() - taskStart;
+  console.log(`\nTask completed in ${taskDuration} ms.`);
 
   const summary = await api(host, `/tasks/${taskId}/output?name=output.json`);
   fs.writeFileSync(path.join(outDir, 'output.json'), JSON.stringify(summary, null, 2));
