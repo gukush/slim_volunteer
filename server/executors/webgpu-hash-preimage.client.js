@@ -206,7 +206,7 @@ export function createExecutor({ kernels, config }) {
   }
 
   async function runChunk({ payload }) {
-    const tClientRecv = performance.now();
+    const tClientRecv = Date.now();
     const device = await getDevice();
     const { pipeline, bgl } = getPipeline(device, kernelCode);
 
@@ -280,8 +280,8 @@ export function createExecutor({ kernels, config }) {
           result,
           timings: {
             tClientRecv,
-            tClientDone: performance.now(),
-            cpuTimeMs: performance.now() - tClientRecv,
+            tClientDone: Date.now(),
+            cpuTimeMs: Date.now() - tClientRecv,
             gpuTimeMs: null,
           },
         };
@@ -294,7 +294,7 @@ export function createExecutor({ kernels, config }) {
       result = cpuSearch(prefixBytes, payload, targetWords);
     }
 
-    const tClientDone = performance.now();
+    const tClientDone = Date.now();
     return {
       status: 'ok',
       result,

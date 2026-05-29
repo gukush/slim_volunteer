@@ -382,7 +382,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
   }
 
   async function runChunk({ payload, meta }) {
-    const tClientRecv = performance.now();
+    const tClientRecv = Date.now();
 
     // Accept either raw ArrayBuffer or the payload object
     const srcData = (payload && payload.data != null) ? payload.data : payload;
@@ -550,7 +550,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
     // CRITICAL: Clean up timing context to ensure buffers are unmapped
     cleanupTimingContext(timingCtx);
 
-    const tClientDone = performance.now();
+    const tClientDone = Date.now();
     const totalTime = tClientDone - tClientRecv;
 
     // Log timing results

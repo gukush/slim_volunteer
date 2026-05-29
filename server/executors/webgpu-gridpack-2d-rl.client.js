@@ -76,7 +76,7 @@ export function createExecutor({ kernels }) {
   }
 
   async function runChunk({ payload }) {
-    const tClientRecv = performance.now();
+    const tClientRecv = Date.now();
     const device = await getDevice();
     const { pipeline, bgl } = getPipeline(device, kernelCode);
 
@@ -234,7 +234,7 @@ export function createExecutor({ kernels }) {
     summary[4] = mode;
     summary[5] = threadCount;
 
-    const tClientDone = performance.now();
+    const tClientDone = Date.now();
     return {
       status: 'ok',
       result: summary.buffer.slice(summary.byteOffset, summary.byteOffset + summary.byteLength),

@@ -99,7 +99,7 @@ export function createExecutor({ kernels }) {
   }
 
   async function runChunk({ payload }) {
-    const tClientRecv = performance.now();
+    const tClientRecv = Date.now();
     const device = await getDevice();
     const { pipeline, bgl } = getPipeline(device, kernelCode);
 
@@ -193,7 +193,7 @@ export function createExecutor({ kernels }) {
     try { readBuf.destroy?.(); } catch {}
     try { configBuf.destroy?.(); } catch {}
 
-    const tClientDone = performance.now();
+    const tClientDone = Date.now();
     return {
       status: 'ok',
       result,

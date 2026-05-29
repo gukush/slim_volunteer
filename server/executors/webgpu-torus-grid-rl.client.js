@@ -41,14 +41,19 @@ async function getDevice() {
   return device;
 }
 
-function specializeKernel(kernelCode, workgroupSize) {
+function specializeKernel(kernelCode, workgroupSize, maxSteps) {
   const size = Number(workgroupSize || 128);
+  const steps = Number(maxSteps || 128);
   if (!Number.isInteger(size) || size <= 0 || size > 1024) {
     throw new Error(`Invalid torus-grid-rl workgroupSize: ${workgroupSize}`);
   }
+  if (!Number.isInteger(steps) || steps <= 0 || steps > 1024) {
+    throw new Error(`Invalid torus-grid-rl maxSteps: ${maxSteps}`);
+  }
   return kernelCode
     .replace('const WORKGROUP_SIZE: u32 = 128u;', `const WORKGROUP_SIZE: u32 = ${size}u;`)
-    .replace('@compute @workgroup_size(128)', `@compute @workgroup_size(${size})`);
+    .replace('@compute @workgroup_size(128)', `@compute @workgroup_size(${size})`)
+    .replace('const MAX_STEPS: u32 = {{MAX_STEPS}}u;', `const MAX_STEPS: u32 = ${steps}u;`);
 }
 
 function getPipeline(device, kernelCode, workgroupSize) {
@@ -102,24 +107,29 @@ export function createExecutor({ kernels, config, inputArgs }) {
   if (!kernel) throw new Error('Torus Grid RL WGSL source missing');
   const kernelCode = kernel.content || kernel.code;
   const configuredWorkgroupSize = Number(inputArgs?.workgroupSize ?? config?.workgroupSize ?? 128);
+  const configuredMaxSteps = Number(inputArgs?.maxSteps ?? config?.maxSteps ?? 128);
 
   async function prewarm() {
     const device = await getDevice();
-    getPipeline(device, kernelCode, configuredWorkgroupSize);
+    getPipeline(device, kernelCode, configuredWorkgroupSize, configuredMaxSteps);
   }
 
   async function runChunk({ payload }) {
-    const tClientRecv = performance.now();
+    const tClientRecv = Date.now();
     const device = await getDevice();
 
     const paramsIn = new Uint32Array(toArrayBuffer(payload.params));
     const trajectories = Number(paramsIn[0] || 0);
     const workgroupSize = Number(paramsIn[1] || configuredWorkgroupSize);
+    const maxSteps = Number(paramsIn[4] || configuredMaxSteps);
     if (trajectories <= 0) throw new Error('torus-grid-rl chunk has no trajectories');
     if (workgroupSize !== configuredWorkgroupSize) {
       throw new Error(`torus-grid-rl workgroupSize changed after init: ${configuredWorkgroupSize} -> ${workgroupSize}`);
     }
-    const { pipeline, bgl } = getPipeline(device, kernelCode, workgroupSize);
+    if (maxSteps !== configuredMaxSteps) {
+      throw new Error(`torus-grid-rl maxSteps changed after init: ${configuredMaxSteps} -> ${maxSteps}`);
+    }
+    const { pipeline, bgl } = getPipeline(device, kernelCode, workgroupSize, maxSteps);
 
     const rewards = new Float32Array(toArrayBuffer(payload.rewardMap));
     if (rewards.length !== TILE_COUNT) throw new Error(`Expected ${TILE_COUNT} reward tiles, got ${rewards.length}`);
@@ -234,7 +244,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
     try { configBuf.destroy?.(); } catch {}
     try { readBuf.destroy?.(); } catch {}
 
-    const tClientDone = performance.now();
+    const tClientDone = Date.now();
     return {
       status: 'ok',
       result: result.buffer.slice(result.byteOffset, result.byteOffset + result.byteLength),
