@@ -306,9 +306,17 @@ socket.on('chunk:assign', async (job)=>{
 
   try{
     log('debug', 'Starting chunk execution for', chunkId);
+    const tClientRecvAbs = Date.now();
     const res = await exec.runChunk({ payload: actualPayload, meta });
+    const tClientDoneAbs = Date.now();
     log('debug', 'Chunk execution completed, result:', res);
     const checksum = await checksumHex(res.result);
+
+    // Enrich timings with absolute machine-local epoch timestamps (ms)
+    // so they can be directly joined with listener power logs on the same machine.
+    res.timings = res.timings || {};
+    res.timings.tClientRecvAbs = tClientRecvAbs;
+    res.timings.tClientDoneAbs = tClientDoneAbs;
 
     // Try HTTP POST first (avoids blocking Socket.IO event loop with large binary)
     let httpOk = false;
