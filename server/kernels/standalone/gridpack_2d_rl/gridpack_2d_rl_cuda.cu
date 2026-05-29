@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -361,6 +362,36 @@ static u32 stringHashSum(const std::string& s) {
     return sum;
 }
 
+static std::vector<f32> initThetaXavier(u32 thetaSeed) {
+    std::vector<f32> theta(THETA_SIZE);
+    std::mt19937 gen(thetaSeed);
+    std::uniform_real_distribution<f32> dist(-1.0f, 1.0f);
+    f32 scale = std::sqrt(2.0f / f32(STATE_DIM + HIDDEN_DIM));
+    for (u32 i = 0; i < THETA_SIZE; ++i) theta[i] = dist(gen) * scale;
+    return theta;
+}
+
+static std::vector<f32> generateEpsilon(u32 epsilonSeed) {
+    std::vector<f32> epsilon(THETA_SIZE);
+    u32 rng = epsilonSeed;
+    auto xorshift = [&rng]() {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        return rng;
+    };
+    auto rand01 = [&]() {
+        return f32(xorshift()) / 4294967295.0f;
+    };
+    auto randN = [&]() {
+        f32 u1 = std::max(rand01(), 0.0001f);
+        f32 u2 = rand01();
+        return std::sqrt(-2.0f * std::log(u1)) * std::cos(6.28318530718f * u2);
+    };
+    for (u32 i = 0; i < THETA_SIZE; ++i) epsilon[i] = randN();
+    return epsilon;
+}
+
 static std::vector<f32> readFloatFile(const std::string& path, size_t expected) {
     std::ifstream f(path, std::ios::binary);
     if (!f) { std::cerr << "Cannot open: " << path << std::endl; std::exit(1); }
@@ -394,6 +425,8 @@ static void printUsage(const char* name) {
               << "  --mode=0|1           0=base, 1=perturbed (default 0)\n"
               << "  --sigma=F            ES noise scale (default 0.01)\n"
               << "  --seed=N             Random seed (default 12345)\n"
+              << "  --thetaSeed=N        Default theta init seed when --theta is omitted (default 42)\n"
+              << "  --epsilonSeed=N      Default epsilon seed when --epsilon is omitted (default --seed)\n"
               << "  --taskId=STRING      Optional WebGPU-compatible task hash seed offset\n"
               << "  --taskIdHash=N       Optional numeric task hash seed offset\n"
               << "  --mlpHiddenDim=32    Fixed MLP hidden layer size\n"
@@ -447,6 +480,8 @@ int main(int argc, char** argv) {
     u32 numThreads = 1024, numRollouts = 128, maxAttempts = 50;
     u32 allowRotation = 1, mode = 0, seed = 12345;
     u32 numProblems = 0, taskIdHash = 0;
+    u32 thetaSeed = 42, epsilonSeed = 0;
+    bool hasEpsilonSeed = false;
     u32 mlpHiddenDim = 32, actionRegions = 8;
     f32 sigma = 0.01f;
     std::string thetaPath, epsilonPath, outputPath;
@@ -476,6 +511,8 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--mode=", 0) == 0) mode = std::stoul(arg.substr(7));
         else if (arg.rfind("--sigma=", 0) == 0) sigma = std::stof(arg.substr(8));
         else if (arg.rfind("--seed=", 0) == 0) seed = std::stoul(arg.substr(7));
+        else if (arg.rfind("--thetaSeed=", 0) == 0) thetaSeed = std::stoul(arg.substr(12));
+        else if (arg.rfind("--epsilonSeed=", 0) == 0) { epsilonSeed = std::stoul(arg.substr(14)); hasEpsilonSeed = true; }
         else if (arg.rfind("--taskIdHash=", 0) == 0) taskIdHash = std::stoul(arg.substr(13));
         else if (arg.rfind("--taskId=", 0) == 0) taskIdHash = stringHashSum(arg.substr(9));
         else if (arg.rfind("--mlpHiddenDim=", 0) == 0) mlpHiddenDim = std::stoul(arg.substr(15));
@@ -528,12 +565,12 @@ int main(int argc, char** argv) {
     // Load theta and epsilon
     std::vector<f32> hTheta, hEpsilon;
     if (thetaPath.empty()) {
-        hTheta.resize(THETA_SIZE, 0.0f);
+        hTheta = initThetaXavier(thetaSeed);
     } else {
         hTheta = readFloatFile(thetaPath, THETA_SIZE);
     }
     if (epsilonPath.empty()) {
-        hEpsilon.resize(THETA_SIZE, 0.0f);
+        hEpsilon = generateEpsilon(hasEpsilonSeed ? epsilonSeed : seed);
     } else {
         hEpsilon = readFloatFile(epsilonPath, THETA_SIZE);
     }
