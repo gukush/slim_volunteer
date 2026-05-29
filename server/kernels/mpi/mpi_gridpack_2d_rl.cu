@@ -2,7 +2,7 @@
 // Multi-GPU / multi-node ES training loop.
 //
 // Build:
-//   mpicxx -x cu -O3 -arch=sm_70 -DMAX_STATE_DIM=8 -DMAX_HIDDEN_DIM=128 -DMAX_ACTION_DIM=256 \
+//   mpicxx -x cu -O3 -arch=sm_70 -DMAX_STATE_DIM=8 -DMAX_HIDDEN_DIM=32 -DMAX_ACTION_DIM=64 \
 //     -o gridpack-2d-rl-mpi gridpack_2d_rl_mpi.cu
 //
 // Run (single node, 4 GPUs):
@@ -17,6 +17,7 @@
 #include <mpi.h>
 
 #include <chrono>
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -47,16 +48,16 @@ using f32 = float;
 #define MAX_STATE_DIM 8
 #endif
 #ifndef MAX_HIDDEN_DIM
-#define MAX_HIDDEN_DIM 128
+#define MAX_HIDDEN_DIM 32
 #endif
 #ifndef MAX_ACTION_DIM
-#define MAX_ACTION_DIM 256
+#define MAX_ACTION_DIM 64
 #endif
 #ifndef MAX_BLOCKS
-#define MAX_BLOCKS 32
+#define MAX_BLOCKS 16
 #endif
 #ifndef MAX_GRID_H
-#define MAX_GRID_H 64
+#define MAX_GRID_H 32
 #endif
 
 // ------------------------------------------------------------------
@@ -318,7 +319,7 @@ EvalResult evaluateOnGPU(u32 numThreads, u32 numRollouts, u32 gw, u32 gh,
     CUDA_CHECK(cudaMemcpy(dTheta, theta, thetaSize * sizeof(f32), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dEpsilon, epsilon, thetaSize * sizeof(f32), cudaMemcpyHostToDevice));
 
-    u32 blockSize = 256;
+    u32 blockSize = 64;
     u32 gridSize = (numThreads + blockSize - 1) / blockSize;
     evalKernel<<<gridSize, blockSize>>>(numThreads, numRollouts, gw, gh, nb, ma, ar,
                                         seed, sigma, mode, stateDim, hiddenDim, actionDim,
@@ -354,7 +355,7 @@ static std::vector<BlockDef> generateBlocks(u32 numBlocks, u32 minSize, u32 maxS
         rng ^= rng << 13;
         rng ^= rng >> 17;
         rng ^= rng << 5;
-        return rng;
+        return (rng % 0x7FFFFFFFu);
     };
     u32 range = maxSize - minSize + 1;
     for (u32 i = 0; i < numBlocks; ++i) {
@@ -363,6 +364,31 @@ static std::vector<BlockDef> generateBlocks(u32 numBlocks, u32 minSize, u32 maxS
         out.push_back({w, h});
     }
     return out;
+}
+
+static void ensureFitsGrid(std::vector<BlockDef>& blocks, u32 gridW, u32 gridH) {
+    u32 maxArea = gridW * gridH;
+    u32 totalArea = 0;
+    for (const auto& b : blocks) totalArea += b.w * b.h;
+
+    if (totalArea > maxArea && totalArea > 0) {
+        f32 scale = std::sqrt(f32(maxArea) / (f32(totalArea) * 1.2f));
+        for (auto& b : blocks) {
+            b.w = std::max(1u, static_cast<u32>(std::floor(f32(b.w) * scale)));
+            b.h = std::max(1u, static_cast<u32>(std::floor(f32(b.h) * scale)));
+        }
+    }
+
+    for (auto& b : blocks) {
+        if (b.w > gridW) b.w = gridW;
+        if (b.h > gridH) b.h = gridH;
+    }
+}
+
+static u32 stringHashSum(const std::string& s) {
+    u32 sum = 0;
+    for (unsigned char c : s) sum += c;
+    return sum;
 }
 
 // ------------------------------------------------------------------
@@ -386,49 +412,39 @@ struct TaskMsg {
     u32 problemIdx;
     u32 problemSeed;
     u32 numBlocks;
+    u32 mode;
 };
 
 struct ResultMsg {
     u32 round;
     u32 problemIdx;
-    u32 validPairs;
-    f32 sumDelta;
-    f32 sumBase;
-    f32 sumPerturbed;
+    u32 mode;
+    u32 validCount;
+    f32 meanReward;
 };
 
-static ResultMsg evaluateProblem(u32 round, u32 problemIdx, u32 problemSeed,
-                                 u32 gridW, u32 gridH, u32 numBlocks,
-                                 u32 maxAttempts, u32 allowRotation,
-                                 u32 numThreads, u32 numRollouts,
-                                 f32 sigma, u32 stateDim, u32 mlpHiddenDim,
-                                 u32 actionDim, const std::vector<BlockDef>& blocks,
-                                 const f32* theta, const f32* epsilon) {
-    EvalResult base = evaluateOnGPU(numThreads, numRollouts, gridW, gridH,
+static ResultMsg evaluateTask(u32 round, u32 problemIdx, u32 problemSeed, u32 mode,
+                              u32 gridW, u32 gridH, u32 numBlocks,
+                              u32 maxAttempts, u32 allowRotation,
+                              u32 numThreads, u32 numRollouts,
+                              f32 sigma, u32 stateDim, u32 mlpHiddenDim,
+                              u32 actionDim, const std::vector<BlockDef>& blocks,
+                              const f32* theta, const f32* epsilon) {
+    EvalResult eval = evaluateOnGPU(numThreads, numRollouts, gridW, gridH,
                                     numBlocks, maxAttempts, allowRotation,
-                                    problemSeed, sigma, 0,
+                                    problemSeed + mode, sigma, mode,
                                     stateDim, mlpHiddenDim, actionDim,
                                     blocks, theta, epsilon);
-
-    EvalResult perturbed = evaluateOnGPU(numThreads, numRollouts, gridW, gridH,
-                                         numBlocks, maxAttempts, allowRotation,
-                                         problemSeed + 1, sigma, 1,
-                                         stateDim, mlpHiddenDim, actionDim,
-                                         blocks, theta, epsilon);
-
     ResultMsg result{};
     result.round = round;
     result.problemIdx = problemIdx;
-    if (base.meanReward > 0.0f && perturbed.meanReward > 0.0f) {
-        result.validPairs = 1;
-        result.sumDelta = perturbed.meanReward - base.meanReward;
-        result.sumBase = base.meanReward;
-        result.sumPerturbed = perturbed.meanReward;
-    }
+    result.mode = mode;
+    result.validCount = eval.validCount;
+    result.meanReward = eval.meanReward;
     return result;
 }
 
-static void workerLoop(u32 gridW, u32 gridH, u32 numBlocks,
+static void workerLoop(u32 gridW, u32 gridH,
                        u32 maxAttempts, u32 allowRotation,
                        u32 numThreads, u32 numRollouts, f32 sigma,
                        u32 stateDim, u32 mlpHiddenDim, u32 actionDim) {
@@ -470,13 +486,13 @@ static void workerLoop(u32 gridW, u32 gridH, u32 numBlocks,
             MPI_Recv(blocks.data(), task.numBlocks * sizeof(BlockDef), MPI_BYTE,
                      0, TAG_TASK, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-            ResultMsg result = evaluateProblem(task.round, task.problemIdx, task.problemSeed,
-                                               gridW, gridH, task.numBlocks,
-                                               maxAttempts, allowRotation,
-                                               numThreads, numRollouts,
-                                               sigma, stateDim, mlpHiddenDim,
-                                               actionDim, blocks,
-                                               theta.data(), epsilon.data());
+            ResultMsg result = evaluateTask(task.round, task.problemIdx, task.problemSeed, task.mode,
+                                            gridW, gridH, task.numBlocks,
+                                            maxAttempts, allowRotation,
+                                            numThreads, numRollouts,
+                                            sigma, stateDim, mlpHiddenDim,
+                                            actionDim, blocks,
+                                            theta.data(), epsilon.data());
             MPI_Send(&result, sizeof(result), MPI_BYTE, 0, TAG_RESULT, MPI_COMM_WORLD);
         }
     }
@@ -490,9 +506,9 @@ static void sendRoundInit(int worker, u32 round, const std::vector<f32>& theta,
     MPI_Send(epsilon.data(), init.thetaSize, MPI_FLOAT, worker, TAG_ROUND_INIT, MPI_COMM_WORLD);
 }
 
-static void sendTask(int worker, u32 round, u32 problemIdx, u32 problemSeed,
+static void sendTask(int worker, u32 round, u32 problemIdx, u32 problemSeed, u32 mode,
                      const std::vector<BlockDef>& blocks) {
-    TaskMsg task{round, problemIdx, problemSeed, static_cast<u32>(blocks.size())};
+    TaskMsg task{round, problemIdx, problemSeed, static_cast<u32>(blocks.size()), mode};
     MPI_Send(&task, sizeof(task), MPI_BYTE, worker, TAG_TASK, MPI_COMM_WORLD);
     MPI_Send(blocks.data(), task.numBlocks * sizeof(BlockDef), MPI_BYTE,
              worker, TAG_TASK, MPI_COMM_WORLD);
@@ -515,6 +531,10 @@ int main(int argc, char** argv) {
     u32 mlpHiddenDim = 32, actionRegions = 8;
     f32 sigma = 0.01f, lr = 0.001f;
     u32 baseSeed = 12345;
+    u32 epsilonSeedOverride = 0;
+    bool hasEpsilonSeedOverride = false;
+    u32 thetaSeed = 42;
+    u32 taskIdHash = 0;
     std::string thetaPath, outputPath;
 
     for (int i = 1; i < argc; ++i) {
@@ -526,6 +546,7 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--maxBlockSize=", 0) == 0) maxBlockSize = std::stoul(arg.substr(15));
         else if (arg.rfind("--numThreads=", 0) == 0) numThreads = std::stoul(arg.substr(13));
         else if (arg.rfind("--rollouts=", 0) == 0) numRollouts = std::stoul(arg.substr(11));
+        else if (arg.rfind("--rolloutsPerThread=", 0) == 0) numRollouts = std::stoul(arg.substr(20));
         else if (arg.rfind("--maxAttempts=", 0) == 0) maxAttempts = std::stoul(arg.substr(14));
         else if (arg.rfind("--allowRotation=", 0) == 0) allowRotation = std::stoul(arg.substr(16));
         else if (arg.rfind("--rounds=", 0) == 0) numRounds = std::stoul(arg.substr(9));
@@ -533,6 +554,10 @@ int main(int argc, char** argv) {
         else if (arg.rfind("--sigma=", 0) == 0) sigma = std::stof(arg.substr(8));
         else if (arg.rfind("--lr=", 0) == 0) lr = std::stof(arg.substr(5));
         else if (arg.rfind("--seed=", 0) == 0) baseSeed = std::stoul(arg.substr(7));
+        else if (arg.rfind("--epsilonSeed=", 0) == 0) { epsilonSeedOverride = std::stoul(arg.substr(14)); hasEpsilonSeedOverride = true; }
+        else if (arg.rfind("--thetaSeed=", 0) == 0) thetaSeed = std::stoul(arg.substr(12));
+        else if (arg.rfind("--taskIdHash=", 0) == 0) taskIdHash = std::stoul(arg.substr(13));
+        else if (arg.rfind("--taskId=", 0) == 0) taskIdHash = stringHashSum(arg.substr(9));
         else if (arg.rfind("--mlpHiddenDim=", 0) == 0) mlpHiddenDim = std::stoul(arg.substr(15));
         else if (arg.rfind("--actionRegions=", 0) == 0) actionRegions = std::stoul(arg.substr(16));
         else if (arg.rfind("--theta=", 0) == 0) thetaPath = arg.substr(8);
@@ -546,6 +571,14 @@ int main(int argc, char** argv) {
     }
     if (actionDim > MAX_ACTION_DIM) {
         if (rank == 0) std::cerr << "actionDim " << actionDim << " exceeds MAX_ACTION_DIM " << MAX_ACTION_DIM << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (gridW > MAX_GRID_H || gridH > MAX_GRID_H) {
+        if (rank == 0) std::cerr << "grid dimensions exceed MAX_GRID_H " << MAX_GRID_H << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (numBlocks > MAX_BLOCKS) {
+        if (rank == 0) std::cerr << "numBlocks " << numBlocks << " exceeds MAX_BLOCKS " << MAX_BLOCKS << std::endl;
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
@@ -575,7 +608,7 @@ int main(int argc, char** argv) {
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        workerLoop(gridW, gridH, numBlocks,
+        workerLoop(gridW, gridH,
                    maxAttempts, allowRotation,
                    numThreads, numRollouts, sigma,
                    stateDim, mlpHiddenDim, actionDim);
@@ -587,14 +620,15 @@ int main(int argc, char** argv) {
         std::ifstream f(thetaPath, std::ios::binary);
         f.read(reinterpret_cast<char*>(theta.data()), thetaSize * sizeof(f32));
     } else {
-        std::mt19937 gen(42);
-        std::normal_distribution<f32> dist(0.0f, std::sqrt(2.0f / (stateDim + mlpHiddenDim)));
-        for (u32 i = 0; i < thetaSize; ++i) theta[i] = dist(gen);
+        std::mt19937 gen(thetaSeed);
+        std::uniform_real_distribution<f32> dist(-1.0f, 1.0f);
+        f32 scale = std::sqrt(2.0f / f32(stateDim + mlpHiddenDim));
+        for (u32 i = 0; i < thetaSize; ++i) theta[i] = dist(gen) * scale;
     }
 
     // ES training loop (timed: includes all allocations, H2D/D2H, MPI comms)
     auto tStart = std::chrono::high_resolution_clock::now();
-    u32 epsilonSeed = baseSeed;
+    u32 epsilonSeed = hasEpsilonSeedOverride ? epsilonSeedOverride : baseSeed;
     for (u32 round = 0; round < numRounds; ++round) {
         u32 rng = epsilonSeed + round * 7919u;
         auto xorshift = [&rng]() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; };
@@ -614,16 +648,23 @@ int main(int argc, char** argv) {
         f32 globalBase = 0.0f;
         f32 globalPerturbed = 0.0f;
         u32 globalPairs = 0;
+        std::vector<f32> baseRewards(numProblems, -1.0f);
+        std::vector<f32> perturbedRewards(numProblems, -1.0f);
+        std::vector<u32> baseValid(numProblems, 0);
+        std::vector<u32> perturbedValid(numProblems, 0);
 
-        u32 nextProblem = 0;
+        u32 nextEval = 0;
         u32 activeTasks = 0;
         auto dispatchOne = [&](int worker) {
-            if (nextProblem >= numProblems) return false;
+            if (nextEval >= numProblems * 2u) return false;
+            u32 problemIdx = nextEval / 2u;
+            u32 mode = nextEval % 2u;
             std::vector<BlockDef> blocks;
-            u32 problemSeed = 123456789u + nextProblem * 747796405u + round * 104729u;
+            u32 problemSeed = 123456789u + problemIdx * 747796405u + taskIdHash;
             blocks = generateBlocks(numBlocks, minBlockSize, maxBlockSize, problemSeed);
-            sendTask(worker, round, nextProblem, problemSeed, blocks);
-            nextProblem++;
+            ensureFitsGrid(blocks, gridW, gridH);
+            sendTask(worker, round, problemIdx, problemSeed, mode, blocks);
+            nextEval++;
             activeTasks++;
             return true;
         };
@@ -639,12 +680,27 @@ int main(int argc, char** argv) {
                      MPI_COMM_WORLD, &status);
             activeTasks--;
 
-            globalDelta += result.sumDelta;
-            globalBase += result.sumBase;
-            globalPerturbed += result.sumPerturbed;
-            globalPairs += result.validPairs;
+            if (result.problemIdx < numProblems) {
+                if (result.mode == 0u) {
+                    baseRewards[result.problemIdx] = result.meanReward;
+                    baseValid[result.problemIdx] = result.validCount;
+                } else {
+                    perturbedRewards[result.problemIdx] = result.meanReward;
+                    perturbedValid[result.problemIdx] = result.validCount;
+                }
+            }
 
             dispatchOne(status.MPI_SOURCE);
+        }
+
+        for (u32 problemIdx = 0; problemIdx < numProblems; ++problemIdx) {
+            if (baseValid[problemIdx] > 0 && perturbedValid[problemIdx] > 0 &&
+                baseRewards[problemIdx] > 0.0f && perturbedRewards[problemIdx] > 0.0f) {
+                globalDelta += perturbedRewards[problemIdx] - baseRewards[problemIdx];
+                globalBase += baseRewards[problemIdx];
+                globalPerturbed += perturbedRewards[problemIdx];
+                globalPairs++;
+            }
         }
 
         for (int worker = 1; worker < nprocs; ++worker) {
