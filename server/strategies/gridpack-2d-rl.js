@@ -379,10 +379,10 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
   const numProblems = parseU32(inputArgs.numProblems ?? config.numProblems, 'numProblems', 10);
   const minBlockSize = parseU32(inputArgs.minBlockSize ?? config.minBlockSize, 'minBlockSize', 2);
   const maxBlockSize = parseU32(inputArgs.maxBlockSize ?? config.maxBlockSize, 'maxBlockSize', 6);
-  const rolloutsPerThread = parseU32(inputArgs.rolloutsPerThread ?? config.rolloutsPerThread, 'rolloutsPerThread', 64);
-  const maxAttempts = parseU32(inputArgs.maxAttempts ?? config.maxAttempts, 'maxAttempts', 50);
-  const allowRotation = parseU32(inputArgs.allowRotation ?? config.allowRotation, 'allowRotation', 1);
-  const numThreads = parseU32(inputArgs.numThreads ?? config.numThreads, 'numThreads', 256);
+    const rolloutsPerThread = parseU32(inputArgs.rolloutsPerThread ?? config.rolloutsPerThread, 'rolloutsPerThread', 128);
+    const maxAttempts = parseU32(inputArgs.maxAttempts ?? config.maxAttempts, 'maxAttempts', 50);
+    const allowRotation = parseU32(inputArgs.allowRotation ?? config.allowRotation, 'allowRotation', 1);
+    const numThreads = parseU32(inputArgs.numThreads ?? config.numThreads, 'numThreads', 1024);
 
   // MLP architecture (pass through to config for executor info)
   const arch = getArchitecture(config, inputArgs);

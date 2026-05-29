@@ -395,7 +395,7 @@ int main(int argc, char** argv) {
     u32 gridW = 16, gridH = 16, numBlocks = 6;
     u32 minBlockSize = 2, maxBlockSize = 6;
     u32 numThreads = 1024, numRollouts = 128, maxAttempts = 50;
-    u32 allowRotation = 1, numRounds = 10, numProblems = 8;
+    u32 allowRotation = 1, numRounds = 1, numProblems = 8;
     u32 mlpHiddenDim = 32, actionRegions = 8;
     f32 sigma = 0.01f, lr = 0.001f;
     u32 baseSeed = 12345;

@@ -45,7 +45,7 @@ test: gridpack-2d-rl-cuda theta.bin epsilon.bin
 	./gridpack-2d-rl-cuda \
 	  --gridW=16 --gridH=16 --numBlocks=6 \
 	  --theta=theta.bin --epsilon=epsilon.bin \
-	  --numThreads=256 --rollouts=64 --mode=0 --seed=12345 \
+	  --numThreads=1024 --rollouts=128 --mode=0 --seed=12345 \
 	  --mlpHiddenDim=32 --actionRegions=8
 
 # -----------------------------------------------------------------------------

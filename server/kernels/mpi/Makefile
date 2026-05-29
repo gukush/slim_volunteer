@@ -33,7 +33,7 @@ run-pollard:
 run-gridpack:
 	mpirun --bind-to none -np 4 ./mpi_gridpack_2d_rl \
 	  --gridW=16 --gridH=16 --numBlocks=6 \
-	  --numThreads=1024 --rollouts=128 --rounds=5 --sigma=0.01 --lr=0.001 \
+	  --numThreads=1024 --rollouts=128 --rounds=1 --sigma=0.01 --lr=0.001 \
 	  --mlpHiddenDim=32 --actionRegions=8
 
 clean:

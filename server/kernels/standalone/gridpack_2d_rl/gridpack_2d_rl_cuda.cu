@@ -352,7 +352,7 @@ static void printUsage(const char* name) {
 // ------------------------------------------------------------------
 int main(int argc, char** argv) {
     u32 gridW = 16, gridH = 16, numBlocks = 6;
-    u32 numThreads = 256, numRollouts = 64, maxAttempts = 50;
+    u32 numThreads = 1024, numRollouts = 128, maxAttempts = 50;
     u32 allowRotation = 1, mode = 0, seed = 12345;
     u32 mlpHiddenDim = 32, actionRegions = 8;
     f32 sigma = 0.01f;

@@ -91,8 +91,8 @@ async function main() {
   const gridH = Number(args.gridH || 16);
   const numBlocks = Number(args.numBlocks || 6);
   const numProblems = Number(args.numProblems || 8);
-  const rolloutsPerThread = Number(args.rolloutsPerThread || 64);
-  const numThreads = Number(args.numThreads || 256);
+  const rolloutsPerThread = Number(args.rolloutsPerThread || 128);
+  const numThreads = Number(args.numThreads || 1024);
   const maxAttempts = Number(args.maxAttempts || 50);
   const allowRotation = Number(args.allowRotation !== undefined ? args.allowRotation : 1);
   const sigma = Number(args.sigma || 0.01);
