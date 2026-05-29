@@ -1,7 +1,7 @@
 # Makefile for GridPack-2D RL standalone CUDA and MPI builds
 #
 # Adjust ARCH to match your GPU (e.g. sm_70 for V100, sm_80 for A100, sm_89 for RTX 4090)
-ARCH ?= sm_70
+ARCH ?= sm_89
 
 # Maximum MLP architecture caps (must be >= any runtime value used)
 MAX_STATE_DIM  ?= 8
