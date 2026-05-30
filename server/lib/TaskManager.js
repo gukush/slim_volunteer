@@ -679,6 +679,12 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
       tClientDoneAbs: timings?.tClientDoneAbs,
       cpuTimeMs,
       gpuTimeMs,
+      tSubmitStart: timings?.tSubmitStart,
+      tSubmitDone: timings?.tSubmitDone,
+      tMapStart: timings?.tMapStart,
+      tMapDone: timings?.tMapDone,
+      submitOverheadMs: timings?.submitOverheadMs,
+      readbackWaitMs: timings?.readbackWaitMs,
     });
 
     if(status!=='ok'){
@@ -716,7 +722,20 @@ createTask({strategyId, K=1, label='task', config={}, inputArgs={}, inputFiles=[
           }
           task.assembler.integrate({ chunkId, result: resultData, meta: entry.meta });
           const tAssembled = now();
-          task.timers.chunkRow({ chunkId, replica, tCreate: entry.tCreate, tAssembled, cpuTimeMs, gpuTimeMs });
+          task.timers.chunkRow({
+            chunkId,
+            replica,
+            tCreate: entry.tCreate,
+            tAssembled,
+            cpuTimeMs,
+            gpuTimeMs,
+            tSubmitStart: timings?.tSubmitStart,
+            tSubmitDone: timings?.tSubmitDone,
+            tMapStart: timings?.tMapStart,
+            tMapDone: timings?.tMapDone,
+            submitOverheadMs: timings?.submitOverheadMs,
+            readbackWaitMs: timings?.readbackWaitMs,
+          });
 
           await task.queueMutex.acquire();
           try {
