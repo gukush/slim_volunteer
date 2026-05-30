@@ -90,7 +90,8 @@ fn main(
   @builtin(local_invocation_id) lid: vec3<u32>
 ) {
   let idx = gid.y * config.dispatch_x * WORKGROUP_SIZE + gid.x;
-  let active = idx < config.trajectories;
+  let is_active = idx < config.trajectories;
+  let safe_idx = min(idx, config.trajectories - 1u);
 
   if (lid.x < WEIGHT_COUNT) {
     atomicStore(&wg_weights_delta[lid.x], 0);
@@ -101,104 +102,102 @@ fn main(
   }
   workgroupBarrier();
 
-  if (active) {
-    var seed = config.seed + idx * 747796405u + 2891336453u;
-    for (var warm = 0u; warm < 4u; warm = warm + 1u) {
-      let ignored = rand_u32(&seed);
+  var seed = config.seed + safe_idx * 747796405u + 2891336453u;
+  for (var warm = 0u; warm < 4u; warm = warm + 1u) {
+    let ignored = rand_u32(&seed);
+  }
+
+  var x = rand_u32(&seed) & 63u;
+  var y = rand_u32(&seed) & 63u;
+  if (is_goal(x, y)) {
+    x = (x + 17u) & 63u;
+    y = (y + 29u) & 63u;
+  }
+
+  var grad: array<f32, 24>;
+  for (var i = 0u; i < WEIGHT_COUNT; i = i + 1u) {
+    grad[i] = 0.0;
+  }
+
+  var total_reward = 0.0;
+  var steps = 0u;
+  var hit_goal = 0u;
+
+  for (var step = 0u; step < MAX_STEPS; step = step + 1u) {
+    let tile = y * GRID_W + x;
+    let reward_here = rewards[tile];
+
+    var feats: array<f32, 6>;
+    for (var f = 0u; f < FEATURE_DIM; f = f + 1u) {
+      feats[f] = feature_value(f, x, y, reward_here);
     }
 
-    var x = rand_u32(&seed) & 63u;
-    var y = rand_u32(&seed) & 63u;
-    if (is_goal(x, y)) {
-      x = (x + 17u) & 63u;
-      y = (y + 29u) & 63u;
-    }
-
-    var grad: array<f32, 24>;
-    for (var i = 0u; i < WEIGHT_COUNT; i = i + 1u) {
-      grad[i] = 0.0;
-    }
-
-    var total_reward = 0.0;
-    var steps = 0u;
-    var hit_goal = 0u;
-
-    for (var step = 0u; step < MAX_STEPS; step = step + 1u) {
-      let tile = y * GRID_W + x;
-      let reward_here = rewards[tile];
-
-      var feats: array<f32, 6>;
+    var logits: array<f32, 4>;
+    for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
+      var sum = 0.0;
       for (var f = 0u; f < FEATURE_DIM; f = f + 1u) {
-        feats[f] = feature_value(f, x, y, reward_here);
+        sum = sum + feats[f] * wg_weight_values[f * ACTION_DIM + a];
       }
+      logits[a] = sum;
+    }
 
-      var logits: array<f32, 4>;
-      for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
-        var sum = 0.0;
-        for (var f = 0u; f < FEATURE_DIM; f = f + 1u) {
-          sum = sum + feats[f] * wg_weight_values[f * ACTION_DIM + a];
-        }
-        logits[a] = sum;
-      }
+    let max_logit = max(max(logits[0], logits[1]), max(logits[2], logits[3]));
+    var probs: array<f32, 4>;
+    var prob_sum = 0.0;
+    for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
+      probs[a] = exp(logits[a] - max_logit);
+      prob_sum = prob_sum + probs[a];
+    }
+    for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
+      probs[a] = probs[a] / prob_sum;
+    }
 
-      let max_logit = max(max(logits[0], logits[1]), max(logits[2], logits[3]));
-      var probs: array<f32, 4>;
-      var prob_sum = 0.0;
-      for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
-        probs[a] = exp(logits[a] - max_logit);
-        prob_sum = prob_sum + probs[a];
-      }
-      for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
-        probs[a] = probs[a] / prob_sum;
-      }
-
-      let r = rand_f01(&seed);
-      var action = 3u;
-      var cdf = 0.0;
-      for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
-        cdf = cdf + probs[a];
-        if (r <= cdf) {
-          action = a;
-          break;
-        }
-      }
-
-      for (var f = 0u; f < FEATURE_DIM; f = f + 1u) {
-        for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
-          let chosen = select(0.0, 1.0, a == action);
-          grad[f * ACTION_DIM + a] = grad[f * ACTION_DIM + a] + feats[f] * (chosen - probs[a]);
-        }
-      }
-
-      if (action == 0u) {
-        y = (y + 63u) & 63u;
-      } else if (action == 1u) {
-        y = (y + 1u) & 63u;
-      } else if (action == 2u) {
-        x = (x + 63u) & 63u;
-      } else {
-        x = (x + 1u) & 63u;
-      }
-
-      let reward = rewards[y * GRID_W + x];
-      total_reward = total_reward + reward;
-      steps = steps + 1u;
-      if (is_goal(x, y)) {
-        hit_goal = 1u;
+    let r = rand_f01(&seed);
+    var action = 3u;
+    var cdf = 0.0;
+    for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
+      cdf = cdf + probs[a];
+      if (r <= cdf) {
+        action = a;
         break;
       }
     }
 
-    for (var i = 0u; i < WEIGHT_COUNT; i = i + 1u) {
-      let delta = clamp_i32(LEARNING_RATE * total_reward * grad[i] * WEIGHT_SCALE, -2048.0, 2048.0);
-      atomicAdd(&wg_weights_delta[i], delta);
+    for (var f = 0u; f < FEATURE_DIM; f = f + 1u) {
+      for (var a = 0u; a < ACTION_DIM; a = a + 1u) {
+        let chosen = select(0.0, 1.0, a == action);
+        grad[f * ACTION_DIM + a] = grad[f * ACTION_DIM + a] + feats[f] * (chosen - probs[a]);
+      }
     }
 
-    atomicAdd(&wg_stats[0], 1u);
-    atomicAdd(&wg_stats[1], hit_goal);
-    atomicAdd(&wg_stats[2], u32(round((total_reward + 512.0) * 1000.0)));
-    atomicAdd(&wg_stats[3], steps);
+    if (action == 0u) {
+      y = (y + 63u) & 63u;
+    } else if (action == 1u) {
+      y = (y + 1u) & 63u;
+    } else if (action == 2u) {
+      x = (x + 63u) & 63u;
+    } else {
+      x = (x + 1u) & 63u;
+    }
+
+    let reward = rewards[y * GRID_W + x];
+    total_reward = total_reward + reward;
+    steps = steps + 1u;
+    if (is_goal(x, y)) {
+      hit_goal = 1u;
+      break;
+    }
   }
+
+  for (var i = 0u; i < WEIGHT_COUNT; i = i + 1u) {
+    let delta = clamp_i32(LEARNING_RATE * total_reward * grad[i] * WEIGHT_SCALE, -2048.0, 2048.0);
+    atomicAdd(&wg_weights_delta[i], select(0, delta, is_active));
+  }
+
+  atomicAdd(&wg_stats[0], select(0u, 1u, is_active));
+  atomicAdd(&wg_stats[1], select(0u, hit_goal, is_active));
+  atomicAdd(&wg_stats[2], select(0u, u32(round((total_reward + 512.0) * 1000.0)), is_active));
+  atomicAdd(&wg_stats[3], select(0u, steps, is_active));
 
   workgroupBarrier();
 
