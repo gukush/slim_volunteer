@@ -6,6 +6,7 @@ const __WGPU_TORUS_GRID_RL_CACHE__ = (globalThis.__WGPU_TORUS_GRID_RL_CACHE__ ||
 
 const WEIGHT_COUNT = 24;
 const TILE_COUNT = 4096;
+const STATS_WORDS = 4;
 const RESULT_WORDS = 6 + WEIGHT_COUNT;
 const WEIGHT_SCALE = 65536.0;
 
@@ -164,7 +165,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
     new Int32Array(weightsBuf.getMappedRange()).set(fixedWeights);
     weightsBuf.unmap();
 
-    const stats = new Uint32Array(4);
+    const stats = new Uint32Array(STATS_WORDS);
     const statsBuf = device.createBuffer({
       label: 'torus-grid-rl-stats',
       size: stats.byteLength,
@@ -237,7 +238,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
     const mapped = readBuf.getMappedRange().slice(0);
     readBuf.unmap();
 
-    const statsOut = new Uint32Array(mapped, 0, 4);
+    const statsOut = new Uint32Array(mapped, 0, STATS_WORDS);
     const fixedOut = new Int32Array(mapped, stats.byteLength, WEIGHT_COUNT);
     const result = new Float32Array(RESULT_WORDS);
     result[0] = 20240529;

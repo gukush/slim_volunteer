@@ -120,9 +120,11 @@ export function buildChunker({ taskId, taskDir, config, inputArgs }) {
   const totalTrajectories = parseU32(inputArgs.totalTrajectories ?? config.totalTrajectories, 'totalTrajectories', 65536);
   const chunkTrajectories = parseU32(inputArgs.chunkTrajectories ?? inputArgs.chunkSize ?? config.chunkTrajectories ?? config.chunkSize, 'chunkTrajectories', 4096);
   const workgroupSize = parseU32(inputArgs.workgroupSize ?? config.workgroupSize, 'workgroupSize', 128);
+  const maxSteps = parseU32(inputArgs.maxSteps ?? config.maxSteps, 'maxSteps', 128);
   if (totalTrajectories === 0) throw new Error('totalTrajectories must be positive');
   if (chunkTrajectories === 0) throw new Error('chunkTrajectories must be positive');
   if (workgroupSize === 0 || workgroupSize > 1024) throw new Error('workgroupSize must be in [1, 1024]');
+  if (maxSteps === 0 || maxSteps > 1024) throw new Error('maxSteps must be in [1, 1024]');
 
   const { rewardMap, weights, environmentSeed } = resolveState(taskDir, config, inputArgs);
   const totalChunks = Math.ceil(totalTrajectories / chunkTrajectories);
@@ -140,6 +142,7 @@ export function buildChunker({ taskId, taskDir, config, inputArgs }) {
           workgroupSize >>> 0,
           (baseSeed + chunkIndex * 747796405) >>> 0,
           environmentSeed >>> 0,
+          maxSteps >>> 0,
         ]);
         yield {
           id: uuidv4(),
@@ -153,6 +156,7 @@ export function buildChunker({ taskId, taskDir, config, inputArgs }) {
             offset,
             trajectories: count,
             workgroupSize,
+            maxSteps,
             weightCount: WEIGHT_COUNT,
           },
           tCreate: Date.now(),

@@ -25,7 +25,7 @@ static constexpr uint32_t TILE_COUNT = GRID_W * GRID_H;
 static constexpr uint32_t FEATURE_DIM = 6;
 static constexpr uint32_t ACTION_DIM = 4;
 static constexpr uint32_t WEIGHT_COUNT = FEATURE_DIM * ACTION_DIM;
-static constexpr uint32_t MAX_STEPS = 128;
+static uint32_t g_max_steps = 128;
 static constexpr uint32_t GOAL_X0 = 28;
 static constexpr uint32_t GOAL_Y0 = 28;
 static constexpr uint32_t GOAL_SIZE = 8;
@@ -75,12 +75,24 @@ __global__ void torus_grid_rl_kernel(
     int* weights_fixed,
     uint32_t* stats,
     uint32_t trajectories,
-    uint32_t seed_base)
+    uint32_t seed_base,
+    uint32_t max_steps)
 {
   uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= trajectories) return;
+  bool active = idx < trajectories;
+  uint32_t safe_idx = active ? idx : (trajectories - 1u);
 
-  uint32_t seed = seed_base + idx * 747796405u + 2891336453u;
+  __shared__ int block_weight_delta[WEIGHT_COUNT];
+  __shared__ float block_weight_value[WEIGHT_COUNT];
+  __shared__ uint32_t block_stats[4];
+  if (threadIdx.x < WEIGHT_COUNT) {
+    block_weight_delta[threadIdx.x] = 0;
+    block_weight_value[threadIdx.x] = float(weights_fixed[threadIdx.x]) / WEIGHT_SCALE;
+  }
+  if (threadIdx.x < 4) block_stats[threadIdx.x] = 0;
+  __syncthreads();
+
+  uint32_t seed = seed_base + safe_idx * 747796405u + 2891336453u;
   for (uint32_t i = 0; i < 4; ++i) rand_u32(&seed);
 
   uint32_t x = rand_u32(&seed) & 63u;
@@ -98,7 +110,7 @@ __global__ void torus_grid_rl_kernel(
   uint32_t steps = 0;
   uint32_t hit_goal = 0;
 
-  for (uint32_t step = 0; step < MAX_STEPS; ++step) {
+  for (uint32_t step = 0; step < max_steps; ++step) {
     float reward_here = rewards[y * GRID_W + x];
     float feats[FEATURE_DIM];
     #pragma unroll
@@ -110,7 +122,7 @@ __global__ void torus_grid_rl_kernel(
       float sum = 0.0f;
       #pragma unroll
       for (uint32_t f = 0; f < FEATURE_DIM; ++f) {
-        sum += feats[f] * (float(weights_fixed[f * ACTION_DIM + a]) / WEIGHT_SCALE);
+        sum += feats[f] * block_weight_value[f * ACTION_DIM + a];
       }
       logits[a] = sum;
     }
@@ -164,13 +176,21 @@ __global__ void torus_grid_rl_kernel(
   #pragma unroll
   for (uint32_t i = 0; i < WEIGHT_COUNT; ++i) {
     int delta = clamp_i32(LEARNING_RATE * total_reward * grad[i] * WEIGHT_SCALE, -2048.0f, 2048.0f);
-    atomicAdd(&weights_fixed[i], delta);
+    atomicAdd(&block_weight_delta[i], active ? delta : 0);
   }
 
-  atomicAdd(&stats[0], 1u);
-  atomicAdd(&stats[1], hit_goal);
-  atomicAdd(&stats[2], uint32_t(rintf((total_reward + 512.0f) * 1000.0f)));
-  atomicAdd(&stats[3], steps);
+  atomicAdd(&block_stats[0], active ? 1u : 0u);
+  atomicAdd(&block_stats[1], active ? hit_goal : 0u);
+  atomicAdd(&block_stats[2], active ? uint32_t(rintf((total_reward + 512.0f) * 1000.0f)) : 0u);
+  atomicAdd(&block_stats[3], active ? steps : 0u);
+  __syncthreads();
+
+  if (threadIdx.x < WEIGHT_COUNT) {
+    atomicAdd(&weights_fixed[threadIdx.x], block_weight_delta[threadIdx.x]);
+  }
+  if (threadIdx.x < 4) {
+    atomicAdd(&stats[threadIdx.x], block_stats[threadIdx.x]);
+  }
 }
 
 static uint32_t parse_u32(const std::string& s) {
@@ -211,6 +231,7 @@ static void usage(const char* argv0) {
     << "  --totalTrajectories=N  Number of trajectories (default: 65536)\n"
     << "  --chunkSize=N          Trajectories per chunk-local network (default: 4096)\n"
     << "  --blockSize=N          CUDA block size (default: 128)\n"
+    << "  --maxSteps=N           Max steps per trajectory (default: 128)\n"
     << "  --seed=N               Trajectory seed (default: 0xabcdef01)\n"
     << "  --environmentSeed=N    Reward-map seed (default: 0x5eed1234)\n";
 }
@@ -219,6 +240,7 @@ int main(int argc, char** argv) {
   uint32_t totalTrajectories = 65536;
   uint32_t chunkSize = 4096;
   uint32_t blockSize = 128;
+  uint32_t maxSteps = 128;
   uint32_t seed = 0xabcdef01u;
   uint32_t environmentSeed = 0x5eed1234u;
 
@@ -231,6 +253,7 @@ int main(int argc, char** argv) {
     if (key == "--totalTrajectories") totalTrajectories = parse_u32(val);
     else if (key == "--chunkSize") chunkSize = parse_u32(val);
     else if (key == "--blockSize") blockSize = parse_u32(val);
+    else if (key == "--maxSteps") maxSteps = parse_u32(val);
     else if (key == "--seed") seed = parse_u32(val);
     else if (key == "--environmentSeed") environmentSeed = parse_u32(val);
     else { std::cerr << "Unknown option: " << arg << "\n"; usage(argv[0]); return 2; }
@@ -239,6 +262,11 @@ int main(int argc, char** argv) {
     std::cerr << "totalTrajectories/chunkSize must be positive and blockSize must be in [1, 1024]\n";
     return 2;
   }
+  if (maxSteps == 0 || maxSteps > 1024) {
+    std::cerr << "maxSteps must be in [1, 1024]\n";
+    return 2;
+  }
+  g_max_steps = maxSteps;
 
   auto rewards = build_reward_map(environmentSeed);
   const auto initialWeights = initial_weights_fixed();
@@ -266,7 +294,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_stats, 0, 4 * sizeof(uint32_t)));
     CUDA_CHECK(cudaEventRecord(ev0));
     uint32_t grid = (count + blockSize - 1) / blockSize;
-    torus_grid_rl_kernel<<<grid, blockSize>>>(d_rewards, d_weights, d_stats, count, seed + offset * 2654435761u);
+    torus_grid_rl_kernel<<<grid, blockSize>>>(d_rewards, d_weights, d_stats, count, seed + offset * 2654435761u, g_max_steps);
     CUDA_CHECK(cudaEventRecord(ev1));
     CUDA_CHECK(cudaEventSynchronize(ev1));
     CUDA_CHECK(cudaGetLastError());

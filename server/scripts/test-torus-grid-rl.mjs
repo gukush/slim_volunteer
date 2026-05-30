@@ -81,6 +81,7 @@ async function main() {
   const totalTrajectories = Number(args.totalTrajectories || 8192);
   const chunkTrajectories = Number(args.chunkTrajectories || args.chunkSize || 4096);
   const workgroupSize = Number(args.workgroupSize || 128);
+  const maxSteps = Number(args.maxSteps || 128);
   const Krep = Number(args.Krep || 1);
   const timeoutMs = Number(args.timeoutMs || 120000);
   const intervalMs = Number(args.intervalMs || 1000);
@@ -94,12 +95,14 @@ async function main() {
       totalTrajectories,
       chunkTrajectories,
       workgroupSize,
+      maxSteps,
     },
     config: {
       framework: 'webgpu',
       totalTrajectories,
       chunkTrajectories,
       workgroupSize,
+      maxSteps,
     },
   };
 
