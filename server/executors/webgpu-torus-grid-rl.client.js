@@ -56,23 +56,31 @@ function specializeKernel(kernelCode, workgroupSize, maxSteps) {
     .replace('const MAX_STEPS: u32 = {{MAX_STEPS}}u;', `const MAX_STEPS: u32 = ${steps}u;`);
 }
 
-function getPipeline(device, kernelCode, workgroupSize) {
+async function throwIfGpuError(device, scope, label) {
+  const error = await device.popErrorScope();
+  if (error) {
+    throw new Error(`${label}: ${error.message || error}`);
+  }
+}
+
+async function getPipeline(device, kernelCode, workgroupSize, maxSteps) {
   let perDevice = __WGPU_TORUS_GRID_RL_CACHE__.pipelinesByDevice.get(device);
   if (!perDevice) {
     perDevice = new Map();
     __WGPU_TORUS_GRID_RL_CACHE__.pipelinesByDevice.set(device, perDevice);
   }
 
-  const specialized = specializeKernel(kernelCode, workgroupSize);
+  const specialized = specializeKernel(kernelCode, workgroupSize, maxSteps);
   let hash = 2166136261;
   for (let i = 0; i < specialized.length; i++) {
     hash ^= specialized.charCodeAt(i);
     hash = Math.imul(hash, 16777619) >>> 0;
   }
-  const key = `${workgroupSize}:${specialized.length}:${hash}`;
+  const key = `${workgroupSize}:${maxSteps}:${specialized.length}:${hash}`;
   let cached = perDevice.get(key);
   if (cached) return cached;
 
+  device.pushErrorScope('validation');
   const module = device.createShaderModule({ label: 'torus-grid-rl-module', code: specialized });
   const bgl = device.createBindGroupLayout({
     label: 'torus-grid-rl-layout',
@@ -89,6 +97,7 @@ function getPipeline(device, kernelCode, workgroupSize) {
     layout,
     compute: { module, entryPoint: 'main' },
   });
+  await throwIfGpuError(device, 'validation', 'torus-grid-rl pipeline validation failed');
   cached = { pipeline, bgl };
   perDevice.set(key, cached);
   return cached;
@@ -111,7 +120,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
 
   async function prewarm() {
     const device = await getDevice();
-    getPipeline(device, kernelCode, configuredWorkgroupSize, configuredMaxSteps);
+    await getPipeline(device, kernelCode, configuredWorkgroupSize, configuredMaxSteps);
   }
 
   async function runChunk({ payload }) {
@@ -129,7 +138,7 @@ export function createExecutor({ kernels, config, inputArgs }) {
     if (maxSteps !== configuredMaxSteps) {
       throw new Error(`torus-grid-rl maxSteps changed after init: ${configuredMaxSteps} -> ${maxSteps}`);
     }
-    const { pipeline, bgl } = getPipeline(device, kernelCode, workgroupSize, maxSteps);
+    const { pipeline, bgl } = await getPipeline(device, kernelCode, workgroupSize, maxSteps);
 
     const rewards = new Float32Array(toArrayBuffer(payload.rewardMap));
     if (rewards.length !== TILE_COUNT) throw new Error(`Expected ${TILE_COUNT} reward tiles, got ${rewards.length}`);
@@ -216,9 +225,15 @@ export function createExecutor({ kernels, config, inputArgs }) {
     pass.end();
     encoder.copyBufferToBuffer(statsBuf, 0, readBuf, 0, stats.byteLength);
     encoder.copyBufferToBuffer(weightsBuf, 0, readBuf, stats.byteLength, fixedWeights.byteLength);
+    const tSubmitStart = Date.now();
+    device.pushErrorScope('validation');
     device.queue.submit([encoder.finish()]);
+    await throwIfGpuError(device, 'validation', 'torus-grid-rl dispatch validation failed');
+    const tSubmitDone = Date.now();
 
+    const tMapStart = Date.now();
     await readBuf.mapAsync(GPUMapMode.READ);
+    const tMapDone = Date.now();
     const mapped = readBuf.getMappedRange().slice(0);
     readBuf.unmap();
 
@@ -253,6 +268,12 @@ export function createExecutor({ kernels, config, inputArgs }) {
         tClientDone,
         cpuTimeMs: tClientDone - tClientRecv,
         gpuTimeMs: null,
+        tSubmitStart,
+        tSubmitDone,
+        tMapStart,
+        tMapDone,
+        submitOverheadMs: tSubmitDone - tSubmitStart,
+        readbackWaitMs: tMapDone - tMapStart,
       },
     };
   }
