@@ -185,6 +185,9 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
       const reason = words[4] >>> 0;
       const globalIndex = Number(meta.offset || 0) + localIndex;
       const expected = numbers[globalIndex];
+      if (localIndex >= Number(meta.count || 0) || globalIndex >= numbers.length) {
+        throw new Error(`Client reported Goldbach failure for out-of-range local index ${localIndex}`);
+      }
       if (expected !== n) {
         throw new Error(`Client reported Goldbach failure for unexpected number ${n}; expected ${expected}`);
       }
