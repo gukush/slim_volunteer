@@ -126,11 +126,27 @@ function readPpLenDebugTrailer(u32, dataWords) {
   if (u32.length < dataWords + 3) return null;
   if ((u32[dataWords] >>> 0) !== PP_LEN_DEBUG_MAGIC) return null;
   const version = u32[dataWords + 1] >>> 0;
-  const count = u32[dataWords + 2] >>> 0;
-  const start = dataWords + 3;
-  const end = start + count;
-  if (version !== 1 || count > u32.length - start) return null;
-  return Array.from(u32.slice(start, end));
+  if (version === 1) {
+    const count = u32[dataWords + 2] >>> 0;
+    const start = dataWords + 3;
+    const end = start + count;
+    if (count > u32.length - start) return null;
+    return { ppLenHistory: Array.from(u32.slice(start, end)) };
+  }
+  if (version === 2) {
+    if (u32.length < dataWords + 4) return null;
+    const lenCount = u32[dataWords + 2] >>> 0;
+    const timeCount = u32[dataWords + 3] >>> 0;
+    const lenStart = dataWords + 4;
+    const timeStart = lenStart + lenCount;
+    const end = timeStart + timeCount;
+    if (lenCount > u32.length - lenStart || timeCount > u32.length - timeStart || end > u32.length) return null;
+    return {
+      ppLenHistory: Array.from(u32.slice(lenStart, timeStart)),
+      ppTimeUsHistory: Array.from(u32.slice(timeStart, end)),
+    };
+  }
+  return null;
 }
 
 function normalizeInput(config, inputArgs) {
@@ -303,14 +319,14 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
       const CONST_WORDS = 8 * 3 + 4;
       const outStart = 8 + numNs * CONST_WORDS + ppCount;
       const dataWords = outStart + numNs * nBases * 12 + numNs * nBases * 8;
-      const ppLenHistory = debugPpLen ? readPpLenDebugTrailer(u32, dataWords) : null;
-      if (ppLenHistory) {
+      const ppLenDebugTrailer = debugPpLen ? readPpLenDebugTrailer(u32, dataWords) : null;
+      if (ppLenDebugTrailer) {
         ppLenDebug.push({
           chunkIndex: meta.chunkIndex,
           offset,
           numNs,
           ppCount,
-          ppLenHistory,
+          ...ppLenDebugTrailer,
         });
       }
 
