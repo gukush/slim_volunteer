@@ -592,6 +592,7 @@ int main(int argc, char** argv) {
   for (uint32_t pp : primePowers) h_io[off++] = pp;
 
   // Device memory
+  const auto total_epoch0 = std::chrono::system_clock::now();
   const auto total_wall0 = std::chrono::steady_clock::now();
   uint32_t* d_io = nullptr;
   CUDA_CHECK(cudaMalloc(&d_io, totalWords * sizeof(uint32_t)));
@@ -616,6 +617,7 @@ int main(int argc, char** argv) {
 
   CUDA_CHECK(cudaMemcpy(h_io.data(), d_io, totalWords * sizeof(uint32_t), cudaMemcpyDeviceToHost));
   const auto total_wall1 = std::chrono::steady_clock::now();
+  const auto total_epoch1 = std::chrono::system_clock::now();
 
   CUDA_CHECK(cudaFree(d_io));
   CUDA_CHECK(cudaEventDestroy(ev0));
@@ -623,6 +625,8 @@ int main(int argc, char** argv) {
 
   double old_wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
   double wall_ms = std::chrono::duration<double, std::milli>(total_wall1 - total_wall0).count();
+  int64_t start_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(total_epoch0.time_since_epoch()).count();
+  int64_t end_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(total_epoch1.time_since_epoch()).count();
 
   // Parse per-N results
   bool anyFound = false;
@@ -637,6 +641,8 @@ int main(int argc, char** argv) {
             << ",grid=" << grid
             << ",old_wall_ms=" << old_wall_ms
             << ",wall_ms=" << wall_ms
+            << ",start_epoch_ms=" << start_epoch_ms
+            << ",end_epoch_ms=" << end_epoch_ms
             << ",kernel_ms=" << kernel_ms
             << "\n";
 

@@ -289,6 +289,7 @@ int main(int argc, char** argv) {
     std::vector<double> weightedWeights(WEIGHT_COUNT, 0.0);
     std::vector<uint8_t> workerFinished(nproc, 0);
 
+    const auto epoch0 = std::chrono::system_clock::now();
     const auto wall0 = std::chrono::steady_clock::now();
     for (int dst = 1; dst < nproc && nextOffset < totalTrajectories; ++dst) {
       WorkMsg msg{ nextOffset, std::min(chunkSize, totalTrajectories - nextOffset), seed + nextOffset * 2654435761u };
@@ -325,7 +326,10 @@ int main(int argc, char** argv) {
       workerFinished[dst] = 1;
     }
     const auto wall1 = std::chrono::steady_clock::now();
+    const auto epoch1 = std::chrono::system_clock::now();
     double wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    int64_t start_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch0.time_since_epoch()).count();
+    int64_t end_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch1.time_since_epoch()).count();
     double totalReward = double(totalStats[2]) / 1000.0 - double(totalStats[0]) * 512.0;
 
     std::cout << std::fixed << std::setprecision(6)
@@ -340,6 +344,8 @@ int main(int argc, char** argv) {
               << ",chunkSize=" << chunkSize
               << ",nproc=" << nproc
               << ",wall_ms=" << wall_ms
+              << ",start_epoch_ms=" << start_epoch_ms
+              << ",end_epoch_ms=" << end_epoch_ms
               << "\nweights=";
     for (uint32_t i = 0; i < WEIGHT_COUNT; ++i) {
       if (i) std::cout << ",";

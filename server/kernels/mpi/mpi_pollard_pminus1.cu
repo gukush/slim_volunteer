@@ -528,6 +528,7 @@ static void usage(const char* argv0) {
 
 int main(int argc, char** argv) {
 
+  const auto epoch0 = std::chrono::system_clock::now();
   const auto wall0 = std::chrono::steady_clock::now();
   MPI_Init(&argc, &argv);
 
@@ -741,7 +742,10 @@ std::string machineId(hostname_buf);
     }
 
     const auto wall1 = std::chrono::steady_clock::now();
+    const auto epoch1 = std::chrono::system_clock::now();
     double wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    int64_t start_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch0.time_since_epoch()).count();
+    int64_t end_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch1.time_since_epoch()).count();
 
     /* print results */
     bool anyFound = false;
@@ -761,6 +765,8 @@ std::string machineId(hostname_buf);
               << ",sent=" << sent
               << ",nproc=" << nproc
               << ",wall_ms=" << wall_ms
+              << ",start_epoch_ms=" << start_epoch_ms
+              << ",end_epoch_ms=" << end_epoch_ms
               << ",slave_wall_ms=" << avg_slave_wall
               << ",slave_kernel_ms=" << avg_slave_kernel
               << "\n";

@@ -228,6 +228,7 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> worker_count(nproc, 0);
     std::vector<uint8_t> worker_finished(nproc, 0);
 
+    const auto epoch0 = std::chrono::system_clock::now();
     const auto wall0 = std::chrono::steady_clock::now();
 
     auto send_chunk = [&](int dst) {
@@ -280,7 +281,10 @@ int main(int argc, char** argv) {
     }
 
     const auto wall1 = std::chrono::steady_clock::now();
+    const auto epoch1 = std::chrono::system_clock::now();
     double wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+    int64_t start_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch0.time_since_epoch()).count();
+    int64_t end_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch1.time_since_epoch()).count();
 
     bool valid = (global_result[0] == 0u);
     uint32_t failedIdx = global_result[1];
@@ -297,6 +301,8 @@ int main(int argc, char** argv) {
               << ",sent=" << sent
               << ",nproc=" << nproc
               << ",wall_ms=" << wall_ms
+              << ",start_epoch_ms=" << start_epoch_ms
+              << ",end_epoch_ms=" << end_epoch_ms
               << ",valid=" << (valid ? "true" : "false");
     if (!valid) {
       std::cout << ",failedIndex=" << failedIdx

@@ -284,6 +284,7 @@ int main(int argc, char** argv) {
   cudaEvent_t ev0, ev1;
   CUDA_CHECK(cudaEventCreate(&ev0));
   CUDA_CHECK(cudaEventCreate(&ev1));
+  const auto epoch0 = std::chrono::system_clock::now();
   const auto wall0 = std::chrono::steady_clock::now();
 
   float kernel_ms = 0.0f;
@@ -314,6 +315,7 @@ int main(int argc, char** argv) {
     chunks++;
   }
   const auto wall1 = std::chrono::steady_clock::now();
+  const auto epoch1 = std::chrono::system_clock::now();
 
   CUDA_CHECK(cudaFree(d_rewards));
   CUDA_CHECK(cudaFree(d_weights));
@@ -322,6 +324,8 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaEventDestroy(ev1));
 
   double wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+  int64_t start_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch0.time_since_epoch()).count();
+  int64_t end_epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(epoch1.time_since_epoch()).count();
   double totalReward = double(totalStats[2]) / 1000.0 - double(totalStats[0]) * 512.0;
   std::cout << std::fixed << std::setprecision(6)
             << "trajectories=" << totalStats[0]
@@ -333,6 +337,8 @@ int main(int argc, char** argv) {
             << ",chunkSize=" << chunkSize
             << ",blockSize=" << blockSize
             << ",wall_ms=" << wall_ms
+            << ",start_epoch_ms=" << start_epoch_ms
+            << ",end_epoch_ms=" << end_epoch_ms
             << ",kernel_ms=" << kernel_ms
             << "\nweights=";
   for (uint32_t i = 0; i < WEIGHT_COUNT; ++i) {
