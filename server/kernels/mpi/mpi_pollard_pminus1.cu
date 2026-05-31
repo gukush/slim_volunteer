@@ -523,7 +523,8 @@ static void usage(const char* argv0) {
     << "  --batchFile=FILE          File with one number per line\n"
     << "  --B1=N                    Stage-1 bound (default: 10000)\n"
     << "  --chunkSize=N             Numbers per MPI work message (default: 1024)\n"
-    << "  --blockSize=N             CUDA block size (default: 256)\n";
+    << "  --blockSize=N             CUDA block size (default: 256)\n"
+    << "  --verboseTiming           Print per-chunk worker timing logs\n";
 }
 
 static std::string join_argv(int argc, char** argv) {
@@ -572,10 +573,12 @@ int main(int argc, char** argv) {
   uint32_t B1 = 10000;
   uint32_t chunkSize = 1024;
   uint32_t blockSize = 256;
+  uint8_t verboseTiming = 0;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
     if (arg == "--help" || arg == "-h") { usage(argv[0]); MPI_Finalize(); return 0; }
+    if (arg == "--verboseTiming") { verboseTiming = 1; continue; }
     auto eq = arg.find('=');
     std::string key = (eq == std::string::npos) ? arg : arg.substr(0, eq);
     std::string val = (eq == std::string::npos) ? std::string() : arg.substr(eq + 1);
@@ -586,6 +589,7 @@ int main(int argc, char** argv) {
     else if (key == "--chunkSize") chunkSize = parse_u32(val);
     else if (key == "--blockSize") blockSize = parse_u32(val);
   }
+  MPI_Bcast(&verboseTiming, 1, MPI_UINT8_T, 0, MPI_COMM_WORLD);
 
 /* Use actual hostname as machine identifier (works across hostfile MPI) */
 char hostname_buf[256];
@@ -970,12 +974,14 @@ std::string machineId(hostname_buf);
         };
         MPI_Send(&timing, sizeof(TimingItem), MPI_BYTE, 0, RESULT_TAG, MPI_COMM_WORLD);
 
-        std::cout << "[MPI_TIMING] epoch_start_ms=" << timing.epoch_start_ms
-                  << " epoch_end_ms=" << timing.epoch_end_ms
-                  << " slave_wall_ms=" << std::fixed << std::setprecision(3) << slave_wall_ms
-                  << " slave_kernel_ms=" << slave_kernel_ms
-                  << " chunk_size=" << cnt
-                  << " rank=" << myrank << std::endl;
+        if (verboseTiming) {
+          std::cout << "[MPI_TIMING] epoch_start_ms=" << timing.epoch_start_ms
+                    << " epoch_end_ms=" << timing.epoch_end_ms
+                    << " slave_wall_ms=" << std::fixed << std::setprecision(3) << slave_wall_ms
+                    << " slave_kernel_ms=" << slave_kernel_ms
+                    << " chunk_size=" << cnt
+                    << " rank=" << myrank << std::endl;
+        }
       } else if (status.MPI_TAG == FINISH_TAG) {
         MPI_Recv(NULL, 0, MPI_BYTE, 0, FINISH_TAG, MPI_COMM_WORLD, &status);
         break;

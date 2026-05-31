@@ -68,10 +68,11 @@ function getPipeline(device, kernelCode) {
   return cached;
 }
 
-export function createExecutor({ kernels }) {
+export function createExecutor({ kernels, config }) {
   const kernel = kernels.find((k) => k.name?.endsWith('pollard_pminus1_batched.wgsl'));
   if (!kernel) throw new Error('Pollard p-1 batched WGSL source missing');
   const kernelCode = kernel.content || kernel.code;
+  const configVerboseTiming = Boolean(config?.verboseTiming || config?.debugTiming);
 
   async function prewarm() {
     const device = await getDevice();
@@ -89,6 +90,7 @@ export function createExecutor({ kernels }) {
       const totalThreads = numNs * nBases;
       const ppCount = Number(input[2] || 0) >>> 0;
       const debugPpLen = Boolean(payload.debugPpLen);
+      const verboseTiming = configVerboseTiming || Boolean(payload.verboseTiming || payload.debugTiming);
       if (nBases === 0) throw new Error('Pollard p-1 chunk has no bases');
       if (totalThreads === 0) throw new Error('Pollard p-1 chunk has no work');
       if (ppCount === 0) throw new Error('Pollard p-1 chunk has no prime powers');
@@ -124,7 +126,9 @@ export function createExecutor({ kernels }) {
       const ppTimeHistory = debugPpLen ? [] : null;
       const overallStart = performance.now();
 
-      console.log(`Pollard p-1 starting: ${ppCount} pp, ${totalThreads} threads, initial pp_len=${pp_len}`);
+      if (verboseTiming) {
+        console.log(`Pollard p-1 starting: ${ppCount} pp, ${totalThreads} threads, initial pp_len=${pp_len}`);
+      }
 
       while (pp_start < ppCount) {
         const currentPpLen = Math.min(pp_len, ppCount - pp_start);
@@ -162,8 +166,10 @@ export function createExecutor({ kernels }) {
         pp_start += currentPpLen;
         passCount++;
 
-        const timingInfo = `CPU: ${cpuTime.toFixed(1)}ms`;
-        console.log(`Pollard p-1 pass ${passCount}: pp[${pp_start - currentPpLen}:${pp_start}]/${ppCount} - ${timingInfo}`);
+        if (verboseTiming) {
+          const timingInfo = `CPU: ${cpuTime.toFixed(1)}ms`;
+          console.log(`Pollard p-1 pass ${passCount}: pp[${pp_start - currentPpLen}:${pp_start}]/${ppCount} - ${timingInfo}`);
+        }
 
         // Adaptive tuning to stay near target time
         if (!isFinal) {
@@ -176,7 +182,9 @@ export function createExecutor({ kernels }) {
       }
 
       const totalTime = ((performance.now() - overallStart) / 1000).toFixed(2);
-      console.log(`Pollard p-1 Stage 1 complete: ${ppCount} prime powers in ${totalTime}s (${passCount} passes)`);
+      if (verboseTiming) {
+        console.log(`Pollard p-1 Stage 1 complete: ${ppCount} prime powers in ${totalTime}s (${passCount} passes)`);
+      }
 
       const KERNEL_TIMEOUT_MS = 120000;
       try {
