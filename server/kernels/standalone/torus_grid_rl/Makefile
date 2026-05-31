@@ -1,6 +1,6 @@
 NVCC ?= nvcc
 ARCH ?= sm_70
-CXXFLAGS ?= -O3 -std=c++17
+CXXFLAGS ?= -O3 -std=c++17 --use_fast_math
 
 TARGET := cuda_torus_grid_rl
 CONST_STEPS_TARGET := cuda_torus_grid_rl_const_steps

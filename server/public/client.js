@@ -213,6 +213,9 @@ socket.on('task:init', (msg)=>{
   let resolveReady;
   const placeholder = { __ready__: new Promise(res => { resolveReady = res; }), __resolved__: false };
   executors.set(msg.taskId, placeholder);
+  // Let the server assign immediately. chunk:assign already awaits the
+  // placeholder promise, so assignment can overlap executor import/prewarm.
+  socket.emit('worker:ready', { taskId: msg.taskId });
 
   (async ()=>{
     try{
@@ -232,8 +235,6 @@ socket.on('task:init', (msg)=>{
       executors.set(msg.taskId, exec);
       resolveReady(exec);
       placeholder.__resolved__ = true;
-      // Tell server we're ready so it can drain pending chunks to us
-      socket.emit('worker:ready', { taskId: msg.taskId });
     }catch(e){
       log('error', 'task:init failed', e);
       // Remove the executor mapping and resolve with null so awaiting
