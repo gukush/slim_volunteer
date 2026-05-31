@@ -5,8 +5,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -37,6 +39,10 @@ struct ResultMsg {
   uint32_t count;
   uint32_t stats[4];
   int weights[WEIGHT_COUNT];
+  double wall_ms;
+  double kernel_ms;
+  int64_t epoch_start_ms;
+  int64_t epoch_end_ms;
 };
 
 __device__ __forceinline__ uint32_t rand_u32(uint32_t* s) {
@@ -174,6 +180,40 @@ __global__ void torus_grid_rl_kernel(
 static uint32_t parse_u32(const std::string& s) { return static_cast<uint32_t>(std::stoul(s, nullptr, 0)); }
 static uint32_t xorshift(uint32_t& seed) { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return seed; }
 
+static int64_t epoch_ms_now() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string join_argv(int argc, char** argv) {
+  std::ostringstream ss;
+  for (int i = 0; i < argc; ++i) {
+    if (i) ss << ' ';
+    ss << (argv[i] ? argv[i] : "");
+  }
+  return ss.str();
+}
+
+static std::string csv_field(const std::string& value) {
+  bool needs_quotes = false;
+  for (char ch : value) {
+    if (ch == ',' || ch == '"' || ch == '\n' || ch == '\r') {
+      needs_quotes = true;
+      break;
+    }
+  }
+  if (!needs_quotes) return value;
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('"');
+  for (char ch : value) {
+    if (ch == '"') out.push_back('"');
+    out.push_back(ch);
+  }
+  out.push_back('"');
+  return out;
+}
+
 static std::vector<float> build_reward_map(uint32_t seed) {
   std::vector<float> rewards(TILE_COUNT);
   for (uint32_t y = 0; y < GRID_H; ++y) {
@@ -205,6 +245,9 @@ static ResultMsg run_chunk_cuda(
   result.count = work.count;
   if (work.count == 0) return result;
 
+  const auto wall0 = std::chrono::steady_clock::now();
+  result.epoch_start_ms = epoch_ms_now();
+
   float* d_rewards = nullptr;
   int* d_weights = nullptr;
   uint32_t* d_stats = nullptr;
@@ -215,13 +258,26 @@ static ResultMsg run_chunk_cuda(
   CUDA_CHECK(cudaMemcpy(d_weights, initialWeights.data(), initialWeights.size() * sizeof(int), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemset(d_stats, 0, sizeof(result.stats)));
 
+  cudaEvent_t ev0, ev1;
+  CUDA_CHECK(cudaEventCreate(&ev0));
+  CUDA_CHECK(cudaEventCreate(&ev1));
   uint32_t grid = (work.count + blockSize - 1) / blockSize;
+  CUDA_CHECK(cudaEventRecord(ev0));
   torus_grid_rl_kernel<<<grid, blockSize>>>(d_rewards, d_weights, d_stats, work.count, work.seed, g_max_steps);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaEventRecord(ev1));
+  CUDA_CHECK(cudaEventSynchronize(ev1));
   CUDA_CHECK(cudaGetLastError());
+  float kernel_ms = 0.0f;
+  CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev0, ev1));
 
   CUDA_CHECK(cudaMemcpy(result.stats, d_stats, sizeof(result.stats), cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(result.weights, d_weights, sizeof(result.weights), cudaMemcpyDeviceToHost));
+  const auto wall1 = std::chrono::steady_clock::now();
+  result.epoch_end_ms = epoch_ms_now();
+  result.wall_ms = std::chrono::duration<double, std::milli>(wall1 - wall0).count();
+  result.kernel_ms = static_cast<double>(kernel_ms);
+  CUDA_CHECK(cudaEventDestroy(ev0));
+  CUDA_CHECK(cudaEventDestroy(ev1));
   CUDA_CHECK(cudaFree(d_rewards));
   CUDA_CHECK(cudaFree(d_weights));
   CUDA_CHECK(cudaFree(d_stats));
@@ -240,6 +296,7 @@ static void usage(const char* argv0) {
 }
 
 int main(int argc, char** argv) {
+  const std::string command_line = join_argv(argc, argv);
   MPI_Init(&argc, &argv);
   int rank = 0, nproc = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
@@ -288,20 +345,51 @@ int main(int argc, char** argv) {
     uint64_t totalStats[4] = {};
     std::vector<double> weightedWeights(WEIGHT_COUNT, 0.0);
     std::vector<uint8_t> workerFinished(nproc, 0);
+    std::vector<size_t> workerTimingIndex(nproc, 0);
+
+    struct ChunkTiming {
+      int worker_rank;
+      uint32_t offset;
+      uint32_t count;
+      int64_t master_dispatch_ms;
+      int64_t master_recv_ms;
+      double worker_wall_ms;
+      double worker_kernel_ms;
+      int64_t worker_epoch_start_ms;
+      int64_t worker_epoch_end_ms;
+    };
+    std::vector<ChunkTiming> chunkTimings;
+    chunkTimings.reserve(totalChunks);
+
+    auto send_chunk = [&](int dst) {
+      if (nextOffset >= totalTrajectories) return false;
+      WorkMsg msg{ nextOffset, std::min(chunkSize, totalTrajectories - nextOffset), seed + nextOffset * 2654435761u };
+      int64_t dispatch_ms = epoch_ms_now();
+      MPI_Send(&msg, sizeof(msg), MPI_BYTE, dst, DATA_TAG, MPI_COMM_WORLD);
+      workerTimingIndex[dst] = chunkTimings.size();
+      chunkTimings.push_back({dst, msg.offset, msg.count, dispatch_ms, 0, 0.0, 0.0, 0, 0});
+      nextOffset += msg.count;
+      sent++;
+      return true;
+    };
 
     const auto epoch0 = std::chrono::system_clock::now();
     const auto wall0 = std::chrono::steady_clock::now();
     for (int dst = 1; dst < nproc && nextOffset < totalTrajectories; ++dst) {
-      WorkMsg msg{ nextOffset, std::min(chunkSize, totalTrajectories - nextOffset), seed + nextOffset * 2654435761u };
-      MPI_Send(&msg, sizeof(msg), MPI_BYTE, dst, DATA_TAG, MPI_COMM_WORLD);
-      nextOffset += msg.count;
-      sent++;
+      send_chunk(dst);
     }
 
     while (received < totalChunks) {
       ResultMsg result{};
       MPI_Status status;
       MPI_Recv(&result, sizeof(result), MPI_BYTE, MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &status);
+      int src = status.MPI_SOURCE;
+      size_t timingIndex = workerTimingIndex[src];
+      chunkTimings[timingIndex].master_recv_ms = epoch_ms_now();
+      chunkTimings[timingIndex].worker_wall_ms = result.wall_ms;
+      chunkTimings[timingIndex].worker_kernel_ms = result.kernel_ms;
+      chunkTimings[timingIndex].worker_epoch_start_ms = result.epoch_start_ms;
+      chunkTimings[timingIndex].worker_epoch_end_ms = result.epoch_end_ms;
       received++;
       for (int i = 0; i < 4; ++i) totalStats[i] += result.stats[i];
       for (uint32_t i = 0; i < WEIGHT_COUNT; ++i) {
@@ -309,14 +397,11 @@ int main(int argc, char** argv) {
       }
 
       if (nextOffset < totalTrajectories) {
-        WorkMsg msg{ nextOffset, std::min(chunkSize, totalTrajectories - nextOffset), seed + nextOffset * 2654435761u };
-        MPI_Send(&msg, sizeof(msg), MPI_BYTE, status.MPI_SOURCE, DATA_TAG, MPI_COMM_WORLD);
-        nextOffset += msg.count;
-        sent++;
+        send_chunk(src);
       } else {
         WorkMsg msg{};
-        MPI_Send(&msg, sizeof(msg), MPI_BYTE, status.MPI_SOURCE, FINISH_TAG, MPI_COMM_WORLD);
-        workerFinished[status.MPI_SOURCE] = 1;
+        MPI_Send(&msg, sizeof(msg), MPI_BYTE, src, FINISH_TAG, MPI_COMM_WORLD);
+        workerFinished[src] = 1;
       }
     }
     for (int dst = 1; dst < nproc; ++dst) {
@@ -352,6 +437,29 @@ int main(int argc, char** argv) {
       std::cout << ((totalStats[0] ? weightedWeights[i] / double(totalStats[0]) : 0.0) / WEIGHT_SCALE);
     }
     std::cout << "\n";
+
+    std::ostringstream csvName;
+    csvName << "chunk_timing_mpi_torus_grid_rl_" << epoch_ms_now() << ".csv";
+    std::ofstream csv(csvName.str());
+    if (csv.is_open()) {
+      csv << "chunkId,replica,client_id,t_chunk_create,t_sent,"
+          << "t_client_recv_abs,t_client_done_abs,"
+          << "duration_ms,gpu_time_ms,"
+          << "argv,totalTrajectories,chunkSize,blockSize,maxSteps,seed,environmentSeed,nproc,total_chunks\n";
+      for (size_t i = 0; i < chunkTimings.size(); ++i) {
+        const auto& ct = chunkTimings[i];
+        csv << i << "," << ct.worker_rank << ",rank_" << ct.worker_rank << ","
+            << ct.master_dispatch_ms << "," << ct.master_dispatch_ms << ","
+            << ct.worker_epoch_start_ms << "," << ct.worker_epoch_end_ms << ","
+            << std::fixed << std::setprecision(3) << ct.worker_wall_ms << ","
+            << ct.worker_kernel_ms << ","
+            << csv_field(command_line) << ","
+            << totalTrajectories << "," << chunkSize << "," << blockSize << ","
+            << maxSteps << "," << seed << "," << environmentSeed << ","
+            << nproc << "," << totalChunks << "\n";
+      }
+      std::cout << "[MPI] Wrote consolidated chunk timing CSV: " << csvName.str() << std::endl;
+    }
   } else {
     while (true) {
       WorkMsg work{};
