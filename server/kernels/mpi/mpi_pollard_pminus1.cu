@@ -526,8 +526,38 @@ static void usage(const char* argv0) {
     << "  --blockSize=N             CUDA block size (default: 256)\n";
 }
 
+static std::string join_argv(int argc, char** argv) {
+  std::ostringstream ss;
+  for (int i = 0; i < argc; ++i) {
+    if (i) ss << ' ';
+    ss << (argv[i] ? argv[i] : "");
+  }
+  return ss.str();
+}
+
+static std::string csv_field(const std::string& value) {
+  bool needs_quotes = false;
+  for (char ch : value) {
+    if (ch == ',' || ch == '"' || ch == '\n' || ch == '\r') {
+      needs_quotes = true;
+      break;
+    }
+  }
+  if (!needs_quotes) return value;
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('"');
+  for (char ch : value) {
+    if (ch == '"') out.push_back('"');
+    out.push_back(ch);
+  }
+  out.push_back('"');
+  return out;
+}
+
 int main(int argc, char** argv) {
 
+  const std::string command_line = join_argv(argc, argv);
   const auto epoch0 = std::chrono::system_clock::now();
   const auto wall0 = std::chrono::steady_clock::now();
   MPI_Init(&argc, &argv);
@@ -784,14 +814,18 @@ std::string machineId(hostname_buf);
       if (csv.is_open()) {
         csv << "chunkId,replica,client_id,t_chunk_create,t_sent,"
             << "t_client_recv_abs,t_client_done_abs,"
-            << "duration_ms,gpu_time_ms\n";
+            << "duration_ms,gpu_time_ms,"
+            << "argv,B1,chunkSize,blockSize,batch_size,nproc,total_chunks\n";
         for (size_t i = 0; i < chunk_timings.size(); ++i) {
           const auto& ct = chunk_timings[i];
           csv << i << "," << ct.worker_rank << "," << machineId << ","
               << ct.master_dispatch_ms << "," << ct.master_dispatch_ms << ","
               << ct.slave_epoch_start_ms << "," << ct.slave_epoch_end_ms << ","
               << std::fixed << std::setprecision(3) << ct.slave_wall_ms << ","
-              << ct.slave_kernel_ms << "\n";
+              << ct.slave_kernel_ms << ","
+              << csv_field(command_line) << ","
+              << B1 << "," << chunkSize << "," << blockSize << ","
+              << numNs << "," << nproc << "," << totalChunks << "\n";
         }
         std::cout << "[MPI] Wrote consolidated chunk timing CSV: " << csvName.str() << std::endl;
       }

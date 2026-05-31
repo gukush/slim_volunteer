@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -101,6 +102,40 @@ static std::vector<uint32_t> build_small_primes(uint32_t limit) {
   return primes;
 }
 
+static int64_t epoch_ms_now() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+static std::string join_argv(int argc, char** argv) {
+  std::ostringstream ss;
+  for (int i = 0; i < argc; ++i) {
+    if (i) ss << ' ';
+    ss << (argv[i] ? argv[i] : "");
+  }
+  return ss.str();
+}
+
+static std::string csv_field(const std::string& value) {
+  bool needs_quotes = false;
+  for (char ch : value) {
+    if (ch == ',' || ch == '"' || ch == '\n' || ch == '\r') {
+      needs_quotes = true;
+      break;
+    }
+  }
+  if (!needs_quotes) return value;
+  std::string out;
+  out.reserve(value.size() + 2);
+  out.push_back('"');
+  for (char ch : value) {
+    if (ch == '"') out.push_back('"');
+    out.push_back(ch);
+  }
+  out.push_back('"');
+  return out;
+}
+
 static void usage(const char* argv0) {
   std::cerr
     << "Usage: mpirun -np N " << argv0 << " [options]\n"
@@ -120,8 +155,17 @@ static void usage(const char* argv0) {
 #define DATA_TAG    0
 #define RESULT_TAG  1
 #define FINISH_TAG  2
+#define TIMING_TAG  3
+
+struct TimingMsg {
+  double wall_ms;
+  double kernel_ms;
+  int64_t epoch_start_ms;
+  int64_t epoch_end_ms;
+};
 
 int main(int argc, char** argv) {
+  const std::string command_line = join_argv(argc, argv);
   MPI_Init(&argc, &argv);
 
   int myrank, nproc;
@@ -226,7 +270,22 @@ int main(int argc, char** argv) {
     uint32_t nextOffset = 0, sent = 0, received = 0;
     std::vector<uint32_t> worker_start(nproc, 0);
     std::vector<uint32_t> worker_count(nproc, 0);
+    std::vector<size_t> worker_timing_index(nproc, 0);
     std::vector<uint8_t> worker_finished(nproc, 0);
+
+    struct ChunkTiming {
+      int worker_rank;
+      uint32_t offset;
+      uint32_t count;
+      int64_t master_dispatch_ms;
+      int64_t master_recv_ms;
+      double worker_wall_ms;
+      double worker_kernel_ms;
+      int64_t worker_epoch_start_ms;
+      int64_t worker_epoch_end_ms;
+    };
+    std::vector<ChunkTiming> chunk_timings;
+    chunk_timings.reserve(totalChunks);
 
     const auto epoch0 = std::chrono::system_clock::now();
     const auto wall0 = std::chrono::steady_clock::now();
@@ -235,8 +294,11 @@ int main(int argc, char** argv) {
       if (nextOffset >= count) return false;
       uint32_t cnt_u32 = std::min(chunkSize, count - nextOffset);
       int cnt = static_cast<int>(cnt_u32);
+      int64_t dispatch_ms = epoch_ms_now();
       worker_start[dst] = nextOffset;
       worker_count[dst] = cnt_u32;
+      worker_timing_index[dst] = chunk_timings.size();
+      chunk_timings.push_back({dst, nextOffset, cnt_u32, dispatch_ms, 0, 0.0, 0.0, 0, 0});
       MPI_Send(&numbers[nextOffset], cnt, MPI_UNSIGNED, dst, DATA_TAG, MPI_COMM_WORLD);
       nextOffset += cnt_u32;
       sent++;
@@ -254,9 +316,17 @@ int main(int argc, char** argv) {
     uint32_t global_result[8] = {};
     while (received < totalChunks) {
       uint32_t slave_result[8];
+      TimingMsg timing{};
       MPI_Status status;
       MPI_Recv(slave_result, 8, MPI_UNSIGNED, MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &status);
       int src = status.MPI_SOURCE;
+      MPI_Recv(&timing, sizeof(timing), MPI_BYTE, src, TIMING_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      size_t timingIndex = worker_timing_index[src];
+      chunk_timings[timingIndex].master_recv_ms = epoch_ms_now();
+      chunk_timings[timingIndex].worker_wall_ms = timing.wall_ms;
+      chunk_timings[timingIndex].worker_kernel_ms = timing.kernel_ms;
+      chunk_timings[timingIndex].worker_epoch_start_ms = timing.epoch_start_ms;
+      chunk_timings[timingIndex].worker_epoch_end_ms = timing.epoch_end_ms;
       received++;
 
       if (slave_result[0] != 0 && global_result[0] == 0) {
@@ -310,6 +380,28 @@ int main(int argc, char** argv) {
                 << ",reason=" << (reason == 1u ? "invalid-input" : "no-prime-pair");
     }
     std::cout << "\n";
+
+    std::ostringstream csvName;
+    csvName << "chunk_timing_mpi_goldbach_" << epoch_ms_now() << ".csv";
+    std::ofstream csv(csvName.str());
+    if (csv.is_open()) {
+      csv << "chunkId,replica,client_id,t_chunk_create,t_sent,"
+          << "t_client_recv_abs,t_client_done_abs,"
+          << "duration_ms,gpu_time_ms,"
+          << "argv,start,end,blockSize,chunkSize,count,nproc,total_chunks\n";
+      for (size_t i = 0; i < chunk_timings.size(); ++i) {
+        const auto& ct = chunk_timings[i];
+        csv << i << "," << ct.worker_rank << ",rank_" << ct.worker_rank << ","
+            << ct.master_dispatch_ms << "," << ct.master_dispatch_ms << ","
+            << ct.worker_epoch_start_ms << "," << ct.worker_epoch_end_ms << ","
+            << std::fixed << std::setprecision(3) << ct.worker_wall_ms << ","
+            << ct.worker_kernel_ms << ","
+            << csv_field(command_line) << ","
+            << start << "," << end << "," << blockSize << "," << chunkSize << ","
+            << count << "," << nproc << "," << totalChunks << "\n";
+      }
+      std::cout << "[MPI] Wrote consolidated chunk timing CSV: " << csvName.str() << std::endl;
+    }
   }
   /* ---------- Slaves (rank > 0) ---------- */
   else {
@@ -352,14 +444,26 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemcpy(d_result, h_result, 8 * sizeof(uint32_t), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_numbers, h_chunk, recvCount * sizeof(uint32_t), cudaMemcpyHostToDevice));
 
+        const auto wall0 = std::chrono::steady_clock::now();
+        int64_t epoch_start_ms = epoch_ms_now();
         int grid = (recvCount + blockSize - 1) / blockSize;
         CUDA_CHECK(cudaEventRecord(ev0));
         goldbach_verify_kernel<<<grid, blockSize>>>(d_numbers, d_result, d_primes, recvCount, primeCount);
         CUDA_CHECK(cudaEventRecord(ev1));
         CUDA_CHECK(cudaEventSynchronize(ev1));
+        float kernel_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&kernel_ms, ev0, ev1));
 
         CUDA_CHECK(cudaMemcpy(h_result, d_result, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        const auto wall1 = std::chrono::steady_clock::now();
+        TimingMsg timing{
+          std::chrono::duration<double, std::milli>(wall1 - wall0).count(),
+          static_cast<double>(kernel_ms),
+          epoch_start_ms,
+          epoch_ms_now()
+        };
         MPI_Send(h_result, 8, MPI_UNSIGNED, 0, RESULT_TAG, MPI_COMM_WORLD);
+        MPI_Send(&timing, sizeof(timing), MPI_BYTE, 0, TIMING_TAG, MPI_COMM_WORLD);
 
       } else if (status.MPI_TAG == FINISH_TAG) {
         // Consume the finish message so the queue is clean!
