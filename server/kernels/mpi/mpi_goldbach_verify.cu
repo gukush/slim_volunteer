@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -108,7 +109,8 @@ static void usage(const char* argv0) {
     << "  --numbers=N1,N2,...       Explicit comma-separated even numbers\n"
     << "  --batchRanges=S1-E1,S2-E2  Comma-separated start-end ranges\n"
     << "  --blockSize=N             CUDA block size (default: 128)\n"
-    << "  --rangeSize=N             Numbers per MPI chunk (default: 1000)\n";
+    << "  --chunkSize=N             Numbers per MPI work message (default: 1024)\n"
+    << "  --rangeSize=N             Alias for --chunkSize\n";
 }
 
 /* ------------------------------------------------------------------ */
@@ -137,7 +139,7 @@ int main(int argc, char** argv) {
   std::string numbers_arg;
   std::string batchRanges_arg;
   uint32_t blockSize = 128;
-  uint32_t rangeSize = 1000;
+  uint32_t chunkSize = 1024;
 
   for (int i = 1; i < argc; ++i) {
     std::string arg(argv[i]);
@@ -150,11 +152,16 @@ int main(int argc, char** argv) {
     else if (key == "--numbers") numbers_arg = val;
     else if (key == "--batchRanges") batchRanges_arg = val;
     else if (key == "--blockSize") blockSize = parse_u32(val);
-    else if (key == "--rangeSize") rangeSize = parse_u32(val);
+    else if (key == "--chunkSize" || key == "--rangeSize") chunkSize = parse_u32(val);
   }
 
   if (blockSize == 0 || blockSize > 1024) {
     if (!myrank) std::cerr << "blockSize must be in [1, 1024]" << std::endl;
+    MPI_Finalize();
+    return 2;
+  }
+  if (chunkSize == 0 || chunkSize > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    if (!myrank) std::cerr << "chunkSize must be in [1, INT_MAX]" << std::endl;
     MPI_Finalize();
     return 2;
   }
@@ -215,54 +222,61 @@ int main(int argc, char** argv) {
 
   /* ---------- Master (rank 0) ---------- */
   if (!myrank) {
-    int nworkers = nproc - 1;
-    if (nworkers <= 0) nworkers = 1;
-
-    /* Divide the list into nworkers contiguous slices */
-    std::vector<int> chunk_start(nworkers);
-    std::vector<int> chunk_count(nworkers);
-    int base = 0;
-    for (int w = 0; w < nworkers; ++w) {
-      chunk_start[w] = base;
-      chunk_count[w] = (int)(count / nworkers) + (w < (int)(count % nworkers) ? 1 : 0);
-      base += chunk_count[w];
-    }
+    uint32_t totalChunks = (count + chunkSize - 1) / chunkSize;
+    uint32_t nextOffset = 0, sent = 0, received = 0;
+    std::vector<uint32_t> worker_start(nproc, 0);
+    std::vector<uint32_t> worker_count(nproc, 0);
+    std::vector<uint8_t> worker_finished(nproc, 0);
 
     const auto wall0 = std::chrono::steady_clock::now();
 
-    /* send each worker its full slice once */
-    for (int w = 0; w < nworkers; ++w) {
-      int dst = w + 1;
-      if (dst >= nproc) continue;
-      int cnt = chunk_count[w];
-      if (cnt > 0) {
-        MPI_Send(&numbers[chunk_start[w]], cnt, MPI_UNSIGNED, dst, DATA_TAG, MPI_COMM_WORLD);
+    auto send_chunk = [&](int dst) {
+      if (nextOffset >= count) return false;
+      uint32_t cnt_u32 = std::min(chunkSize, count - nextOffset);
+      int cnt = static_cast<int>(cnt_u32);
+      worker_start[dst] = nextOffset;
+      worker_count[dst] = cnt_u32;
+      MPI_Send(&numbers[nextOffset], cnt, MPI_UNSIGNED, dst, DATA_TAG, MPI_COMM_WORLD);
+      nextOffset += cnt_u32;
+      sent++;
+      return true;
+    };
+
+    for (int dst = 1; dst < nproc; ++dst) {
+      if (!send_chunk(dst)) {
+        MPI_Send(NULL, 0, MPI_UNSIGNED, dst, FINISH_TAG, MPI_COMM_WORLD);
+        worker_finished[dst] = 1;
       }
     }
 
-    /* collect results */
+    /* collect results and keep workers fed */
     uint32_t global_result[8] = {};
-    for (int w = 0; w < nworkers; ++w) {
-      int dst = w + 1;
-      if (dst >= nproc) continue;
-      int cnt = chunk_count[w];
-      if (cnt <= 0) continue;
-
+    while (received < totalChunks) {
       uint32_t slave_result[8];
-      MPI_Recv(slave_result, 8, MPI_UNSIGNED, dst, RESULT_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Status status;
+      MPI_Recv(slave_result, 8, MPI_UNSIGNED, MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &status);
+      int src = status.MPI_SOURCE;
+      received++;
 
       if (slave_result[0] != 0 && global_result[0] == 0) {
         global_result[0] = 1;
-        global_result[1] = chunk_start[w] + slave_result[1];
+        global_result[1] = worker_start[src] + slave_result[1];
         global_result[2] = slave_result[2];
         global_result[3] = slave_result[3];
         global_result[4] = slave_result[4];
+      }
+
+      if (!send_chunk(src)) {
+        MPI_Send(NULL, 0, MPI_UNSIGNED, src, FINISH_TAG, MPI_COMM_WORLD);
+        worker_finished[src] = 1;
       }
     }
 
     /* send FINISH */
     for (int i = 1; i < nproc; i++) {
+      if (worker_finished[i]) continue;
       MPI_Send(NULL, 0, MPI_UNSIGNED, i, FINISH_TAG, MPI_COMM_WORLD);
+      worker_finished[i] = 1;
     }
 
     const auto wall1 = std::chrono::steady_clock::now();
@@ -278,6 +292,9 @@ int main(int argc, char** argv) {
               << ",first=" << numbers.front()
               << ",last=" << numbers.back()
               << ",blockSize=" << blockSize
+              << ",chunkSize=" << chunkSize
+              << ",chunks=" << totalChunks
+              << ",sent=" << sent
               << ",nproc=" << nproc
               << ",wall_ms=" << wall_ms
               << ",valid=" << (valid ? "true" : "false");

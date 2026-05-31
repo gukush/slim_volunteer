@@ -9,6 +9,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -521,6 +522,7 @@ static void usage(const char* argv0) {
     << "  --batch=N1,N2,...         Comma-separated list of numbers (same B1)\n"
     << "  --batchFile=FILE          File with one number per line\n"
     << "  --B1=N                    Stage-1 bound (default: 10000)\n"
+    << "  --chunkSize=N             Numbers per MPI work message (default: 1024)\n"
     << "  --blockSize=N             CUDA block size (default: 256)\n";
 }
 
@@ -537,6 +539,7 @@ int main(int argc, char** argv) {
   std::string batchArg;
   std::string batchFile;
   uint32_t B1 = 10000;
+  uint32_t chunkSize = 1024;
   uint32_t blockSize = 256;
 
   for (int i = 1; i < argc; ++i) {
@@ -549,6 +552,7 @@ int main(int argc, char** argv) {
     else if (key == "--batch") batchArg = val;
     else if (key == "--batchFile") batchFile = val;
     else if (key == "--B1") B1 = parse_u32(val);
+    else if (key == "--chunkSize") chunkSize = parse_u32(val);
     else if (key == "--blockSize") blockSize = parse_u32(val);
   }
 
@@ -562,6 +566,11 @@ std::string machineId(hostname_buf);
 
   if (blockSize == 0 || blockSize > 1024) {
     if (!myrank) std::cerr << "blockSize must be in [1, 1024]" << std::endl;
+    MPI_Finalize();
+    return 2;
+  }
+  if (chunkSize == 0 || chunkSize > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+    if (!myrank) std::cerr << "chunkSize must be in [1, INT_MAX]" << std::endl;
     MPI_Finalize();
     return 2;
   }
@@ -627,19 +636,12 @@ std::string machineId(hostname_buf);
 
 
 
-    int nworkers = nproc - 1;
-    if (nworkers <= 0) nworkers = 1;
-
-    std::vector<int> chunk_start(nworkers);
-    std::vector<int> chunk_count(nworkers);
-    int base = 0;
-    for (int w = 0; w < nworkers; ++w) {
-      chunk_start[w] = base;
-      chunk_count[w] = (numNs + nworkers - 1 - w) / nworkers;
-      if (chunk_count[w] > (int)numNs - base) chunk_count[w] = (int)numNs - base;
-      if (chunk_count[w] < 0) chunk_count[w] = 0;
-      base += chunk_count[w];
-    }
+    uint32_t totalChunks = (numNs + chunkSize - 1) / chunkSize;
+    uint32_t nextOffset = 0, sent = 0, received = 0;
+    std::vector<uint32_t> worker_start(nproc, 0);
+    std::vector<uint32_t> worker_count(nproc, 0);
+    std::vector<size_t> worker_timing_index(nproc, 0);
+    std::vector<uint8_t> worker_finished(nproc, 0);
 
     struct ChunkTiming {
       int worker_rank;
@@ -652,28 +654,39 @@ std::string machineId(hostname_buf);
       int64_t slave_epoch_end_ms;
     };
     std::vector<ChunkTiming> chunk_timings;
-    chunk_timings.reserve(nworkers);
+    chunk_timings.reserve(totalChunks);
 
     auto epoch_ms = [](auto tp) {
       return std::chrono::duration_cast<std::chrono::milliseconds>(
         tp.time_since_epoch()).count();
     };
 
-    /* send chunks */
-    for (int w = 0; w < nworkers; ++w) {
-      int dst = w + 1;
-      if (dst >= nproc) continue;
-      int cnt = chunk_count[w];
+    auto send_chunk = [&](int dst) {
+      if (nextOffset >= numNs) return false;
+      uint32_t cnt_u32 = std::min(chunkSize, numNs - nextOffset);
+      int cnt = static_cast<int>(cnt_u32);
       int64_t dispatch_ms = epoch_ms(std::chrono::system_clock::now());
       MPI_Send(&cnt, 1, MPI_INT, dst, DATA_TAG, MPI_COMM_WORLD);
-      if (cnt > 0) {
-        std::vector<WorkItem> chunk(cnt);
-        for (int i = 0; i < cnt; ++i) {
-          for (int j = 0; j < 8; ++j) chunk[i].N_limbs[j] = numbers[chunk_start[w] + i].limbs[j];
-        }
-        MPI_Send(chunk.data(), cnt * sizeof(WorkItem), MPI_BYTE, dst, DATA_TAG, MPI_COMM_WORLD);
+      std::vector<WorkItem> chunk(cnt);
+      for (int i = 0; i < cnt; ++i) {
+        for (int j = 0; j < 8; ++j) chunk[i].N_limbs[j] = numbers[nextOffset + i].limbs[j];
       }
+      MPI_Send(chunk.data(), cnt * sizeof(WorkItem), MPI_BYTE, dst, DATA_TAG, MPI_COMM_WORLD);
+
+      worker_start[dst] = nextOffset;
+      worker_count[dst] = cnt_u32;
+      worker_timing_index[dst] = chunk_timings.size();
       chunk_timings.push_back({dst, cnt, dispatch_ms, 0, 0.0, 0.0, 0, 0});
+      nextOffset += cnt_u32;
+      sent++;
+      return true;
+    };
+
+    for (int dst = 1; dst < nproc; ++dst) {
+      if (!send_chunk(dst)) {
+        MPI_Send(NULL, 0, MPI_BYTE, dst, FINISH_TAG, MPI_COMM_WORLD);
+        worker_finished[dst] = 1;
+      }
     }
 
     /* receive results */
@@ -682,38 +695,49 @@ std::string machineId(hostname_buf);
     double total_slave_kernel_ms = 0.0;
     int processed = 0;
     int nextPrint = 1000;
-    for (int w = 0; w < nworkers; ++w) {
-      int dst = w + 1;
-      if (dst >= nproc) continue;
-      int cnt = chunk_count[w];
-      if (cnt <= 0) continue;
+    while (received < totalChunks) {
+      MPI_Status result_status;
+      MPI_Status timing_status;
+      MPI_Probe(MPI_ANY_SOURCE, RESULT_TAG, MPI_COMM_WORLD, &result_status);
+      int dst = result_status.MPI_SOURCE;
+      uint32_t chunkStart = worker_start[dst];
+      int cnt = static_cast<int>(worker_count[dst]);
       std::vector<ResultItem> chunk_res(cnt);
-      MPI_Recv(chunk_res.data(), cnt * sizeof(ResultItem), MPI_BYTE, dst, RESULT_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(chunk_res.data(), cnt * sizeof(ResultItem), MPI_BYTE, dst, RESULT_TAG, MPI_COMM_WORLD, &result_status);
       for (int i = 0; i < cnt; ++i) {
-        results[chunk_start[w] + i] = chunk_res[i];
+        results[chunkStart + i] = chunk_res[i];
       }
       TimingItem timing;
-      MPI_Recv(&timing, sizeof(TimingItem), MPI_BYTE, dst, RESULT_TAG, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+      MPI_Recv(&timing, sizeof(TimingItem), MPI_BYTE, dst, RESULT_TAG, MPI_COMM_WORLD, &timing_status);
       int64_t recv_ms = epoch_ms(std::chrono::system_clock::now());
       total_slave_wall_ms += timing.wall_ms;
       total_slave_kernel_ms += timing.kernel_ms;
-      chunk_timings[w].master_recv_ms = recv_ms;
-      chunk_timings[w].slave_wall_ms = timing.wall_ms;
-      chunk_timings[w].slave_kernel_ms = timing.kernel_ms;
-      chunk_timings[w].slave_epoch_start_ms = timing.epoch_start_ms;
-      chunk_timings[w].slave_epoch_end_ms = timing.epoch_end_ms;
+      size_t timingIndex = worker_timing_index[dst];
+      chunk_timings[timingIndex].master_recv_ms = recv_ms;
+      chunk_timings[timingIndex].slave_wall_ms = timing.wall_ms;
+      chunk_timings[timingIndex].slave_kernel_ms = timing.kernel_ms;
+      chunk_timings[timingIndex].slave_epoch_start_ms = timing.epoch_start_ms;
+      chunk_timings[timingIndex].slave_epoch_end_ms = timing.epoch_end_ms;
+      received++;
       processed += cnt;
       if (processed >= nextPrint) {
         std::cout << "[progress] " << processed << "/" << numNs << " done ("
                   << (100.0 * processed / numNs) << "%)\n";
         nextPrint += 1000;
       }
+
+      if (!send_chunk(dst)) {
+        MPI_Send(NULL, 0, MPI_BYTE, dst, FINISH_TAG, MPI_COMM_WORLD);
+        worker_finished[dst] = 1;
+      }
     }
     std::cout << "[progress] " << processed << "/" << numNs << " done (100%)\n";
 
     /* send FINISH */
     for (int i = 1; i < nproc; ++i) {
+      if (worker_finished[i]) continue;
       MPI_Send(NULL, 0, MPI_BYTE, i, FINISH_TAG, MPI_COMM_WORLD);
+      worker_finished[i] = 1;
     }
 
     const auto wall1 = std::chrono::steady_clock::now();
@@ -723,15 +747,18 @@ std::string machineId(hostname_buf);
     bool anyFound = false;
     double avg_slave_wall = 0.0;
     double avg_slave_kernel = 0.0;
-    if (nworkers > 0) {
-      avg_slave_wall = total_slave_wall_ms / nworkers;
-      avg_slave_kernel = total_slave_kernel_ms / nworkers;
+    if (received > 0) {
+      avg_slave_wall = total_slave_wall_ms / received;
+      avg_slave_kernel = total_slave_kernel_ms / received;
     }
     std::cout << std::fixed << std::setprecision(3)
               << "batchSize=" << numNs
               << ",B1=" << B1
               << ",ppCount=" << primePowers.size()
               << ",blockSize=" << blockSize
+              << ",chunkSize=" << chunkSize
+              << ",chunks=" << totalChunks
+              << ",sent=" << sent
               << ",nproc=" << nproc
               << ",wall_ms=" << wall_ms
               << ",slave_wall_ms=" << avg_slave_wall
@@ -792,7 +819,7 @@ std::string machineId(hostname_buf);
   /* ---------- Slaves ---------- */
   else {
     MPI_Status status;
-    do {
+    while (true) {
       MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
       if (status.MPI_TAG == DATA_TAG) {
         int cnt = 0;
@@ -909,8 +936,11 @@ std::string machineId(hostname_buf);
                   << " slave_kernel_ms=" << slave_kernel_ms
                   << " chunk_size=" << cnt
                   << " rank=" << myrank << std::endl;
+      } else if (status.MPI_TAG == FINISH_TAG) {
+        MPI_Recv(NULL, 0, MPI_BYTE, 0, FINISH_TAG, MPI_COMM_WORLD, &status);
+        break;
       }
-    } while (status.MPI_TAG != FINISH_TAG);
+    }
   }
 
   MPI_Finalize();

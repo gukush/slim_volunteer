@@ -26,7 +26,7 @@ mpi_gridpack_2d_rl: mpi_gridpack_2d_rl.cu
 	$(NVCC) $(NVCCFLAGS) $(MPICC_FLAGS) $(RL_DEFS) $< -o $@ -lmpi
 
 mpi_torus_grid_rl: mpi_torus_grid_rl.cu
-	$(NVCC) $(NVCCFLAGS) $(MPICC_FLAGS) $< -o $@ -lmpi
+	$(NVCC) $(NVCCFLAGS) --use_fast_math $(MPICC_FLAGS) $< -o $@ -lmpi
 
 # Convenience run targets (edit -np and args for your cluster)
 run-goldbach:
