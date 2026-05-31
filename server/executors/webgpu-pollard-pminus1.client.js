@@ -113,10 +113,10 @@ export function createExecutor({ kernels }) {
       });
 
       // ----- RESUMABLE COMPUTATION LOOP (avoids browser TDR) -----
-      const TARGET_MS = 2000; // target time per GPU submit
+      const TARGET_MS = 4000; // target time per GPU submit
       // Conservative initial pp_len: ~80 µs per prime power per thread on typical GPUs.
-      // Budget ~10 seconds for the first pass so larger chunks ramp up faster.
-      const initialPpLen = Math.max(1, Math.min(5000, Math.floor(10000000 / (totalThreads * 80))));
+      // Start with a larger batch and let adaptive tuning shrink it if needed.
+      const initialPpLen = Math.max(4096, Math.min(5000, Math.floor(10000000 / (totalThreads * 80))));
       let pp_len = Math.min(initialPpLen, ppCount);
       let pp_start = 0;
       let passCount = 0;
