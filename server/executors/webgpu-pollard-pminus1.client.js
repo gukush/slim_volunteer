@@ -4,6 +4,8 @@ const __WGPU_PM1_CACHE__ = (globalThis.__WGPU_PM1_CACHE__ ||= {
   lostReason: null,
 });
 
+const PP_LEN_DEBUG_MAGIC = 0x504c5044; // "DPLP" little-endian marker.
+
 function toArrayBuffer(x) {
   if (x instanceof ArrayBuffer) return x;
   if (ArrayBuffer.isView(x)) return x.buffer.slice(x.byteOffset, x.byteOffset + x.byteLength);
@@ -86,6 +88,7 @@ export function createExecutor({ kernels }) {
       const numNs = Number(input[5] || 1) >>> 0;
       const totalThreads = numNs * nBases;
       const ppCount = Number(input[2] || 0) >>> 0;
+      const debugPpLen = Boolean(payload.debugPpLen);
       if (nBases === 0) throw new Error('Pollard p-1 chunk has no bases');
       if (totalThreads === 0) throw new Error('Pollard p-1 chunk has no work');
       if (ppCount === 0) throw new Error('Pollard p-1 chunk has no prime powers');
@@ -112,17 +115,19 @@ export function createExecutor({ kernels }) {
       // ----- RESUMABLE COMPUTATION LOOP (avoids browser TDR) -----
       const TARGET_MS = 2000; // target time per GPU submit
       // Conservative initial pp_len: ~80 µs per prime power per thread on typical GPUs.
-      // Budget ~1 second for the first pass so we survive the TDR even on large chunks.
-      const initialPpLen = Math.max(1, Math.min(500, Math.floor(1000000 / (totalThreads * 80))));
+      // Budget ~10 seconds for the first pass so larger chunks ramp up faster.
+      const initialPpLen = Math.max(1, Math.min(5000, Math.floor(10000000 / (totalThreads * 80))));
       let pp_len = Math.min(initialPpLen, ppCount);
       let pp_start = 0;
       let passCount = 0;
+      const ppLenHistory = debugPpLen ? [] : null;
       const overallStart = performance.now();
 
       console.log(`Pollard p-1 starting: ${ppCount} pp, ${totalThreads} threads, initial pp_len=${pp_len}`);
 
       while (pp_start < ppCount) {
         const currentPpLen = Math.min(pp_len, ppCount - pp_start);
+        if (ppLenHistory) ppLenHistory.push(currentPpLen >>> 0);
         input[6] = pp_start >>> 0;
         input[7] = currentPpLen >>> 0;
         device.queue.writeBuffer(ioBuf, 0, input.buffer, 0, 32); // update header only
@@ -184,8 +189,19 @@ export function createExecutor({ kernels }) {
         }
         throw e;
       }
-      const result = readBuf.getMappedRange().slice(0);
+      let result = readBuf.getMappedRange().slice(0);
       readBuf.unmap();
+
+      if (ppLenHistory) {
+        const base = new Uint32Array(result);
+        const withDebug = new Uint32Array(base.length + 3 + ppLenHistory.length);
+        withDebug.set(base, 0);
+        withDebug[base.length] = PP_LEN_DEBUG_MAGIC;
+        withDebug[base.length + 1] = 1;
+        withDebug[base.length + 2] = ppLenHistory.length >>> 0;
+        withDebug.set(ppLenHistory, base.length + 3);
+        result = withDebug.buffer;
+      }
 
       try { ioBuf.destroy?.(); } catch {}
       try { readBuf.destroy?.(); } catch {}

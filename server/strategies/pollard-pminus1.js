@@ -7,6 +7,7 @@ export const id = 'pollard-pminus1';
 export const name = 'Pollard p-1 Factorization (WebGPU)';
 
 const MAGIC = 0x314d5031; // "1MP1" little-endian marker for PM1.
+const PP_LEN_DEBUG_MAGIC = 0x504c5044; // "DPLP" little-endian marker.
 
 export function getClientExecutorInfo(config) {
   const framework = (config?.framework || 'webgpu').toLowerCase();
@@ -121,9 +122,21 @@ function readResultU32(result) {
   throw new Error('Unsupported pollard-pminus1 result buffer type');
 }
 
+function readPpLenDebugTrailer(u32, dataWords) {
+  if (u32.length < dataWords + 3) return null;
+  if ((u32[dataWords] >>> 0) !== PP_LEN_DEBUG_MAGIC) return null;
+  const version = u32[dataWords + 1] >>> 0;
+  const count = u32[dataWords + 2] >>> 0;
+  const start = dataWords + 3;
+  const end = start + count;
+  if (version !== 1 || count > u32.length - start) return null;
+  return Array.from(u32.slice(start, end));
+}
+
 function normalizeInput(config, inputArgs) {
   const B1 = Number(inputArgs.B1 ?? config.B1 ?? 10000);
   const chunkSize = Number(inputArgs.chunkSize ?? config.chunkSize ?? 1024);
+  const debugPpLen = Boolean(inputArgs.debugPpLen ?? config.debugPpLen ?? false);
   if (!Number.isInteger(chunkSize) || chunkSize <= 0 || chunkSize > 0xffffffff) {
     throw new Error('chunkSize must be an integer in [1, 2^32-1]');
   }
@@ -169,10 +182,10 @@ function normalizeInput(config, inputArgs) {
     if (ns0[i] < 4n) throw new Error(`N[${i}] must be >= 4`);
     if (ns0[i] >= (1n << 256n)) throw new Error(`N[${i}] must fit in 256 bits`);
   }
-  return { ns0, B1, startBase, totalBases, chunkSize };
+  return { ns0, B1, startBase, totalBases, chunkSize, debugPpLen };
 }
 
-function buildPayload({ ns, B1, baseStart, nBases }) {
+function buildPayload({ ns, B1, baseStart, nBases, debugPpLen }) {
   const primePowers = generatePrimePowers(B1);
   const HEADER_WORDS = 8;
   const CONST_WORDS = 8 * 3 + 4;
@@ -205,11 +218,12 @@ function buildPayload({ ns, B1, baseStart, nBases }) {
     numNs,
     ppCount: primePowers.length,
     totalWords,
+    debugPpLen,
   };
 }
 
 export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
-  const { ns0, B1, startBase, totalBases, chunkSize } = normalizeInput(config, inputArgs);
+  const { ns0, B1, startBase, totalBases, chunkSize, debugPpLen } = normalizeInput(config, inputArgs);
   const ns = [];
   const evenFactors = [];
   for (let i = 0; i < ns0.length; i++) {
@@ -235,7 +249,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
         const chunkNs0 = ns0.slice(offset, offset + chunkSize);
         const nBases = totalBases; // 1
         const baseStart = startBase; // 2
-        const payload = buildPayload({ ns: chunkNs, B1, baseStart, nBases });
+        const payload = buildPayload({ ns: chunkNs, B1, baseStart, nBases, debugPpLen });
         yield {
           id: uuidv4(),
           payload,
@@ -258,7 +272,7 @@ export function buildChunker({ taskId, taskDir, K, config, inputArgs }) {
 }
 
 export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
-  const { ns0, B1, startBase, totalBases, chunkSize } = normalizeInput(config, inputArgs);
+  const { ns0, B1, startBase, totalBases, chunkSize, debugPpLen } = normalizeInput(config, inputArgs);
   const outPath = path.join(taskDir, 'output.json');
   const perN = ns0.map((N0) => {
     const found = [];
@@ -274,6 +288,7 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
   });
   let chunksProcessed = 0;
   let basesProcessed = 0;
+  const ppLenDebug = [];
 
   return {
     integrate({ result, meta }) {
@@ -287,6 +302,17 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
       const numNs = u32[5] >>> 0;
       const CONST_WORDS = 8 * 3 + 4;
       const outStart = 8 + numNs * CONST_WORDS + ppCount;
+      const dataWords = outStart + numNs * nBases * 12 + numNs * nBases * 8;
+      const ppLenHistory = debugPpLen ? readPpLenDebugTrailer(u32, dataWords) : null;
+      if (ppLenHistory) {
+        ppLenDebug.push({
+          chunkIndex: meta.chunkIndex,
+          offset,
+          numNs,
+          ppCount,
+          ppLenHistory,
+        });
+      }
 
       for (let n = 0; n < numNs; n++) {
         const globalIndex = offset + n;
@@ -329,6 +355,7 @@ export function buildAssembler({ taskId, taskDir, config, inputArgs }) {
         chunkSize,
         chunksProcessed,
         basesProcessed,
+        ...(debugPpLen ? { ppLenDebug } : {}),
         completedAt: new Date().toISOString(),
       };
       console.log(`[POLLARD DEBUG] finalize writing to: ${outPath}`);

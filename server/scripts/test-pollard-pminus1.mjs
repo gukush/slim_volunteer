@@ -20,7 +20,16 @@ const Krep = Number(args.Krep ?? args.K ?? 1);
 const timeoutMs = args.timeoutMs !== undefined ? Number(args.timeoutMs) : 0;
 const intervalMs = Number(args.intervalMs ?? 1000);
 const skipOutput = args.skipOutput || args.noOutput || false;
+const debugPpLen = Boolean(args.debugPpLen);
 const outDir = args.outDir || `/app/pollard-pminus1-results-${Date.now()}`;
+
+function formatPpLenHistory(values) {
+  if (!Array.isArray(values)) return String(values);
+  if (values.length <= 1000) return JSON.stringify(values);
+  const head = values.slice(0, 500);
+  const tail = values.slice(-500);
+  return `[${head.join(',')},"...",${tail.join(',')}]`;
+}
 
 async function api(pathname, options = {}) {
   const url = new URL(pathname, host).toString();
@@ -58,6 +67,10 @@ async function main() {
 
   const input = { B1, startBase, totalBases, chunkSize };
   const config = { framework: 'webgpu', B1, startBase, totalBases, chunkSize };
+  if (debugPpLen) {
+    input.debugPpLen = true;
+    config.debugPpLen = true;
+  }
 
   if (batchFile) {
     input.batchFile = batchFile;
@@ -123,6 +136,20 @@ async function main() {
   }
   fs.writeFileSync(path.join(outDir, 'output.json'), JSON.stringify(summary, null, 2));
 
+  if (debugPpLen) {
+    const rows = Array.isArray(summary.ppLenDebug) ? summary.ppLenDebug : [];
+    if (rows.length === 0) {
+      console.log('pp_len debug: no history found in output.json');
+    } else {
+      console.log(`pp_len debug: ${rows.length} chunk(s)`);
+      for (const row of rows) {
+        const values = row.ppLenHistory || [];
+        console.log(`chunk=${row.chunkIndex} offset=${row.offset} numNs=${row.numNs} ppCount=${row.ppCount} passes=${values.length}`);
+        console.log(`ppLenHistory=${formatPpLenHistory(values)}`);
+      }
+    }
+  }
+
   // Print found factors
   if (summary.results) {
     const foundLines = [];
@@ -147,7 +174,10 @@ async function main() {
     console.log(`Total Pollard p-1 factors found: ${totalFound}`);
   }
 
-  console.log('Summary:', JSON.stringify(summary, null, 2));
+  const printableSummary = debugPpLen && summary.ppLenDebug
+    ? { ...summary, ppLenDebug: summary.ppLenDebug.map((row) => ({ ...row, ppLenHistory: `[${row.ppLenHistory?.length || 0} values; see pp_len debug output above]` })) }
+    : summary;
+  console.log('Summary:', JSON.stringify(printableSummary, null, 2));
   console.log(`Pollard p-1 artifacts saved to ${outDir}`);
 }
 
