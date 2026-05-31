@@ -121,6 +121,7 @@ export function createExecutor({ kernels }) {
       let pp_start = 0;
       let passCount = 0;
       const ppLenHistory = debugPpLen ? [] : null;
+      const ppTimeHistory = debugPpLen ? [] : null;
       const overallStart = performance.now();
 
       console.log(`Pollard p-1 starting: ${ppCount} pp, ${totalThreads} threads, initial pp_len=${pp_len}`);
@@ -156,6 +157,7 @@ export function createExecutor({ kernels }) {
           throw e;
         });
         const cpuTime = performance.now() - t0;
+        if (ppTimeHistory) ppTimeHistory.push(Math.max(0, Math.round(cpuTime * 1000)) >>> 0);
 
         pp_start += currentPpLen;
         passCount++;
@@ -194,12 +196,14 @@ export function createExecutor({ kernels }) {
 
       if (ppLenHistory) {
         const base = new Uint32Array(result);
-        const withDebug = new Uint32Array(base.length + 3 + ppLenHistory.length);
+        const withDebug = new Uint32Array(base.length + 4 + ppLenHistory.length + ppTimeHistory.length);
         withDebug.set(base, 0);
         withDebug[base.length] = PP_LEN_DEBUG_MAGIC;
-        withDebug[base.length + 1] = 1;
+        withDebug[base.length + 1] = 2;
         withDebug[base.length + 2] = ppLenHistory.length >>> 0;
-        withDebug.set(ppLenHistory, base.length + 3);
+        withDebug[base.length + 3] = ppTimeHistory.length >>> 0;
+        withDebug.set(ppLenHistory, base.length + 4);
+        withDebug.set(ppTimeHistory, base.length + 4 + ppLenHistory.length);
         result = withDebug.buffer;
       }
 

@@ -31,6 +31,15 @@ function formatPpLenHistory(values) {
   return `[${head.join(',')},"...",${tail.join(',')}]`;
 }
 
+function formatPpTimeHistory(values) {
+  if (!Array.isArray(values)) return String(values);
+  const ms = values.map((us) => Math.round(us) / 1000);
+  if (ms.length <= 1000) return JSON.stringify(ms);
+  const head = ms.slice(0, 500);
+  const tail = ms.slice(-500);
+  return `[${head.join(',')},"...",${tail.join(',')}]`;
+}
+
 async function api(pathname, options = {}) {
   const url = new URL(pathname, host).toString();
   const response = await fetch(url, {
@@ -144,8 +153,10 @@ async function main() {
       console.log(`pp_len debug: ${rows.length} chunk(s)`);
       for (const row of rows) {
         const values = row.ppLenHistory || [];
+        const timings = row.ppTimeUsHistory || [];
         console.log(`chunk=${row.chunkIndex} offset=${row.offset} numNs=${row.numNs} ppCount=${row.ppCount} passes=${values.length}`);
         console.log(`ppLenHistory=${formatPpLenHistory(values)}`);
+        if (timings.length > 0) console.log(`ppTimeMsHistory=${formatPpTimeHistory(timings)}`);
       }
     }
   }
@@ -175,7 +186,11 @@ async function main() {
   }
 
   const printableSummary = debugPpLen && summary.ppLenDebug
-    ? { ...summary, ppLenDebug: summary.ppLenDebug.map((row) => ({ ...row, ppLenHistory: `[${row.ppLenHistory?.length || 0} values; see pp_len debug output above]` })) }
+    ? { ...summary, ppLenDebug: summary.ppLenDebug.map((row) => ({
+      ...row,
+      ppLenHistory: `[${row.ppLenHistory?.length || 0} values; see pp_len debug output above]`,
+      ...(row.ppTimeUsHistory ? { ppTimeUsHistory: `[${row.ppTimeUsHistory.length} values; see pp_len debug output above]` } : {}),
+    })) }
     : summary;
   console.log('Summary:', JSON.stringify(printableSummary, null, 2));
   console.log(`Pollard p-1 artifacts saved to ${outDir}`);
