@@ -1,4 +1,4 @@
-# Volunteer Compute
+# [OUTDATED DESCRIPTION] Volunteer Compute
 
 Minimal, readable volunteer computing system: Node.js server + browser clients (WebGPU).
 
